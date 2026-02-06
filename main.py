@@ -3,16 +3,15 @@ import psycopg2
 from dotenv import load_dotenv
 from faker import Faker
 
-# Load environment variables (DB credentials and config)
+# Load environment variables
 load_dotenv()
 
-# Konfiguracija lokalizacije: Mozes dodati ili ukloniti jezike po potrebi
-# de_DE (Nemacka), sr_RS (Srbija), en_US (USA)
+# Localization for DACH and US markets
 SUPPORTED_LOCALES = ['de_DE', 'en_US']
 fake = Faker(SUPPORTED_LOCALES)
 
 def get_db_connection():
-    """Abstraction for database connection using environment variables."""
+    """Abstraction for database connection."""
     try:
         return psycopg2.connect(
             user=os.getenv("DB_USER"),
@@ -22,14 +21,25 @@ def get_db_connection():
             database=os.getenv("DB_NAME")
         )
     except Exception as e:
-        print(f"[ERROR] Could not establish connection: {e}")
+        print(f"[ERROR] Connection failed: {e}")
         return None
 
+def setup_target_table(cur):
+    """Creates the masked table if it doesn't exist."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users_masked (
+            id SERIAL PRIMARY KEY,
+            full_name VARCHAR(255),
+            email VARCHAR(255),
+            salary_status VARCHAR(50),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    # Brisanje starih podataka kako bismo uvek imali svez test (opciono)
+    cur.execute("TRUNCATE TABLE users_masked;")
+
 def anonify_engine():
-    """
-    Core engine for database anonymization.
-    Features: Multi-locale support (DE, SRB, EN), Secure DB handling.
-    """
+    """Core engine for fetching, transforming, and saving data."""
     conn = get_db_connection()
     if not conn:
         return
@@ -37,36 +47,46 @@ def anonify_engine():
     try:
         cur = conn.cursor()
 
-        # SQL query to fetch production-like data
-        query = "SELECT full_name, email, salary FROM users_raw;"
-        cur.execute(query)
+        # Step 1: Prepare the target table
+        setup_target_table(cur)
+
+        # Step 2: Fetch raw data
+        cur.execute("SELECT full_name, email, salary FROM users_raw;")
         rows = cur.fetchall()
 
-        # Professional Terminal Output
-        print(f"\n{'--- ANONIFY DB | LOCALIZED MULTI-DB ENGINE ---':^65}")
-        print(f"{'SOURCE DATA':<25} | {'ANONYMIZED (DE/SRB/EN)':<30}")
-        print("-" * 70)
+        print(f"\n{'--- ANONIFY DB | TRANSFORM & LOAD MODE ---':^65}")
+        print(f"{'STATUS':<15} | {'TARGET TABLE: users_masked'}")
+        print("-" * 65)
 
+        # Step 3: Process and Insert
         for row in rows:
             real_name, real_email, real_salary = row
 
-            # Faker randomly picks identity from SUPPORTED_LOCALES
+            # Transformation Logic
             fake_name = fake.name()
             fake_email = fake.free_email()
+            salary_label = "[PROTECTED]" # Sakrivamo cifre, ostavljamo labelu
 
-            # Formatting the output for a clean engineering report
-            print(f"{real_name:<25} | {fake_name:<30}")
-            print(f"{real_email:<25} | {fake_email:<30}")
-            print(f"{str(real_salary) + ' EUR':<25} | {'[PROTECTED]':<30}")
-            print("-" * 70)
+            # Execute Insert
+            cur.execute("""
+                INSERT INTO users_masked (full_name, email, salary_status)
+                VALUES (%s, %s, %s);
+            """, (fake_name, fake_email, salary_label))
 
+            print(f"{'[MAPPING]':<15} | {real_name} -> {fake_name}")
+
+        # Step 4: Commit changes
+        conn.commit()
         cur.close()
+        print("\n[SUCCESS] Data transformation complete. Check DBeaver for results.")
+
     except Exception as e:
-        print(f"[ERROR] Anonymization process failed: {e}")
+        if conn:
+            conn.rollback() # Ako nesto pukne, nista se ne upisuje (Data Integrity)
+        print(f"[ERROR] Process failed: {e}")
     finally:
         if conn:
             conn.close()
-            print("\n[SUCCESS] Security session finished. Connection closed.")
 
 if __name__ == "__main__":
     anonify_engine()
