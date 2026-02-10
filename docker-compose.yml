@@ -1,0 +1,10 @@
+services:
+  db:
+    image: postgres:latest
+    container_name: anonify_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: anonify_db
+    ports:
+      - "5433:5432"
