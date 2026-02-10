@@ -1,0 +1,7 @@
+database:
+  source_table: "users_raw"
+  target_table: "users_masked"
+
+anonymization:
+  locale: "de_DE"  # Ovde ?emo kontrolisati jezik
+  use_ascii: true
