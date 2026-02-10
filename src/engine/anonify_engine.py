@@ -13,6 +13,19 @@ def load_config():
 
 config = load_config()
 
+def get_salary_bucket(salary_str):
+    """Pretvara ta?an iznos u opseg radi analiti?ke privatnosti."""
+    try:
+        # ?istimo string (npr. '120k' -> 120)
+        amount = int(''.join(filter(str.isdigit, salary_str)))
+        
+        if amount < 50: return "< 50k"
+        if amount < 100: return "50k - 100k"
+        if amount < 150: return "100k - 150k"
+        return "150k+"
+    except:
+        return "[INVALID DATA]"
+
 # 2. Funkcija koja ti je nedostajala
 def get_deterministic_name(user_id):
     """Generise stabilno ime na osnovu ID-a koristeci locale iz YAML-a."""
@@ -57,12 +70,18 @@ def process_data(conn, setup_target_table):
 
             if method == "fake_name":
                 masked_values[col_target] = get_deterministic_name(user_id)
+            # ... unutar for m in mappings: ...
+            elif method == "salary_bucket":
+                raw_salary = data[col_source]
+                masked_values[col_target] = get_salary_bucket(raw_salary)
             elif method == "fake_email":
                 # Koristimo isto deterministi?ko ime da bi email bio konzistentan
                 clean_name = get_deterministic_name(user_id).lower().replace(' ', '.')
                 masked_values[col_target] = f"{clean_name}@example.com"
             elif method == "mask_constant":
                 masked_values[col_target] = m.get('value', '[MASKED]')
+
+
 
         # Dinami?ki INSERT upit
         cols_to_insert = list(masked_values.keys())
@@ -75,6 +94,7 @@ def process_data(conn, setup_target_table):
         cur.execute(insert_query, masked_values)
 
         print(f"Mapped ID {user_id:3}: {data['full_name']} -> {masked_values['full_name']}")
+        print(f"Mapped ID {user_id:3}: {data['full_name']} -> {masked_values['full_name']} | Salary: {masked_values['salary_status']}")
 
     conn.commit()
     cur.close()
