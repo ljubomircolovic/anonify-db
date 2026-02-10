@@ -2,6 +2,11 @@ database:
   source_table: "users_raw"
   target_table: "users_masked"
 
+# Ensure 'generator' is at the top level, not indented under 'database'
+generator:
+  num_rows: 1000
+  batch_size: 100
+
 mappings:
   - source: "full_name"
     target: "full_name"
@@ -11,7 +16,7 @@ mappings:
     method: "fake_email"
   - source: "salary"
     target: "salary_status"
-    method: "salary_bucket"  # NOVI METOD
+    method: "salary_bucket"
 
 anonymization:
   locale: "de_DE"
