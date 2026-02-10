@@ -2,6 +2,19 @@ database:
   source_table: "users_raw"
   target_table: "users_masked"
 
+# Dinami?ko mapiranje kolona
+mappings:
+  - source: "full_name"
+    target: "full_name"
+    method: "fake_name"
+  - source: "email"
+    target: "email"
+    method: "fake_email"
+  - source: "salary"
+    target: "salary_status"
+    method: "mask_constant"
+    value: "[PROTECTED]"
+
 anonymization:
-  locale: "de_DE"  # Ovde ?emo kontrolisati jezik
+  locale: "de_DE"
   use_ascii: true

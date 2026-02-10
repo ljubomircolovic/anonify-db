@@ -3,42 +3,78 @@ import os
 from faker import Faker
 from unidecode import unidecode
 
-# U?itavanje konfiguracije
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), '../../config/settings.yaml')
-with open(CONFIG_PATH, 'r') as f:
-    config = yaml.safe_load(f)
+# 1. U?itavanje konfiguracije
+current_dir = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(current_dir, '../../config/settings.yaml')
 
+def load_config():
+    with open(CONFIG_PATH, 'r') as f:
+        return yaml.safe_load(f)
+
+config = load_config()
+
+# 2. Funkcija koja ti je nedostajala
 def get_deterministic_name(user_id):
-    # Koristimo locale iz YAML-a
+    """Generise stabilno ime na osnovu ID-a koristeci locale iz YAML-a."""
     locale = config['anonymization']['locale']
     local_fake = Faker(locale)
     local_fake.seed_instance(user_id)
 
     raw_name = local_fake.name()
-    return unidecode(raw_name) if config['anonymization']['use_ascii'] else raw_name
 
+    # Ako je u YAML-u use_ascii: true, ?istimo ime
+    if config['anonymization'].get('use_ascii', True):
+        return unidecode(raw_name)
+    return raw_name
+
+# 3. Glavna logika za procesiranje
 def process_data(conn, setup_target_table):
     cur = conn.cursor()
     setup_target_table(cur)
 
-    # Koristimo ime tabele iz YAML-a
     source_table = config['database']['source_table']
     target_table = config['database']['target_table']
+    mappings = config['mappings']
 
-    cur.execute(f"SELECT id, full_name, email, salary FROM {source_table};")
+    # Dinami?ki pravimo listu kolona za SELECT
+    source_cols = ["id"] + [m['source'] for m in mappings]
+    query = f"SELECT {', '.join(source_cols)} FROM {source_table};"
+
+    cur.execute(query)
     rows = cur.fetchall()
 
-    print(f"\n{'--- ANONIFY DB | CONFIG MODE ---':^65}")
+    print(f"\n{'--- ANONIFY DB | DYNAMIC MAPPING MODE ---':^65}")
+
     for row in rows:
-        user_id, real_name, _, _ = row
-        fake_name = get_deterministic_name(user_id)
+        data = dict(zip(source_cols, row))
+        user_id = data['id']
+        masked_values = {"id": user_id}
 
-        cur.execute(f"""
-            INSERT INTO {target_table} (id, full_name, email, salary_status)
-            VALUES (%s, %s, %s, %s);
-        """, (user_id, fake_name, f"{fake_name.lower().replace(' ', '.')}@example.com", "[PROTECTED]"))
+        for m in mappings:
+            col_source = m['source']
+            col_target = m['target']
+            method = m['method']
 
-        print(f"Mapped ID {user_id:3}: {real_name} -> {fake_name}")
+            if method == "fake_name":
+                masked_values[col_target] = get_deterministic_name(user_id)
+            elif method == "fake_email":
+                # Koristimo isto deterministi?ko ime da bi email bio konzistentan
+                clean_name = get_deterministic_name(user_id).lower().replace(' ', '.')
+                masked_values[col_target] = f"{clean_name}@example.com"
+            elif method == "mask_constant":
+                masked_values[col_target] = m.get('value', '[MASKED]')
+
+        # Dinami?ki INSERT upit
+        cols_to_insert = list(masked_values.keys())
+        placeholders = [f"%({c})s" for c in cols_to_insert]
+
+        insert_query = f"""
+            INSERT INTO {target_table} ({', '.join(cols_to_insert)})
+            VALUES ({', '.join(placeholders)});
+        """
+        cur.execute(insert_query, masked_values)
+
+        print(f"Mapped ID {user_id:3}: {data['full_name']} -> {masked_values['full_name']}")
 
     conn.commit()
     cur.close()
