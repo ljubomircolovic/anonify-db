@@ -1,16 +1,19 @@
-
+import logging
 from faker import Faker
 import random
 
+# Get the logger inherited from main
+logger = logging.getLogger(__name__)
+
 def generate_bulk_data(conn, num_rows, batch_size):
     """
-    Generates synthetic test data.
-    Added: Check if table exists, create if not.
+    Generates synthetic test data and inserts it into the users_raw table.
+    Ensures table existence and uses batch insertion.
     """
     fake = Faker('de_DE')
     cur = conn.cursor()
 
-    # Create the source table if it's missing (Postgres 18 fresh start)
+    # Ensure source table exists
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users_raw (
             id SERIAL PRIMARY KEY,
@@ -20,22 +23,19 @@ def generate_bulk_data(conn, num_rows, batch_size):
         );
     """)
 
-    print(f"?? Starting Stress Test Generator: Creating {num_rows} rows...")
+    logger.info(f"?? Starting Stress Test Generator: Creating {num_rows} rows...")
 
-    # Clean the source table and reset IDs
+    # Clean the source table and reset auto-incrementing IDs
     cur.execute("TRUNCATE TABLE users_raw RESTART IDENTITY CASCADE;")
 
     rows = []
     for i in range(1, num_rows + 1):
         full_name = fake.name()
-        # Generate a simple email based on the name
         email = f"{full_name.lower().replace(' ', '.')}@example.com"
-        # Random salary between 30k and 200k for realistic distribution
         salary = f"{random.randint(30, 200)}k"
 
         rows.append((full_name, email, salary))
 
-        # Batch insert when reaching batch_size
         if i % batch_size == 0:
             cur.executemany(
                 "INSERT INTO users_raw (full_name, email, salary) VALUES (%s, %s, %s)",
@@ -43,12 +43,11 @@ def generate_bulk_data(conn, num_rows, batch_size):
             )
             conn.commit()
             rows = []
-            print(f"? Inserted {i} rows...")
+            logger.info(f"? Batch inserted: {i} rows so far...")
 
-    # Insert remaining rows if any
     if rows:
         cur.executemany("INSERT INTO users_raw (full_name, email, salary) VALUES (%s, %s, %s)", rows)
         conn.commit()
 
     cur.close()
-    print(f"?? Success! users_raw now contains {num_rows} synthetic records.")
+    logger.info(f"?? Database populated with {num_rows} synthetic records.")

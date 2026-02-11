@@ -10,3 +10,20 @@
 2026-02-11 13:03:12,914 - INFO - ==================================================
 2026-02-11 13:03:12,914 - INFO - ? Anonymization process completed successfully.
 2026-02-11 13:03:12,914 - INFO - Database connection closed.
+2026-02-11 13:04:34,204 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 13:04:34,223 - INFO - Step 1: Generating 100 synthetic records...
+2026-02-11 13:04:34,261 - INFO - ?? Starting Stress Test Generator: Creating 100 rows...
+2026-02-11 13:04:34,295 - INFO - ? Batch inserted: 100 rows so far...
+2026-02-11 13:04:34,295 - INFO - ?? Database populated with 100 synthetic records.
+2026-02-11 13:04:34,295 - INFO - Step 2: Starting transformation of 100 records...
+2026-02-11 13:04:34,297 - INFO - Transforming data from 'users_raw' to 'users_masked'...
+2026-02-11 13:04:34,744 - INFO - Transformation completed successfully.
+2026-02-11 13:04:34,744 - INFO - Step 3: Exporting data to CSV...
+2026-02-11 13:04:34,748 - INFO - ==================================================
+2026-02-11 13:04:34,748 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-11 13:04:34,748 - INFO - Total Rows Processed: 100
+2026-02-11 13:04:34,748 - INFO - Total Time Taken:     0.53 seconds
+2026-02-11 13:04:34,748 - INFO - Throughput:           190.37 rows/sec
+2026-02-11 13:04:34,748 - INFO - ==================================================
+2026-02-11 13:04:34,748 - INFO - ? Anonymization process completed successfully.
+2026-02-11 13:04:34,755 - INFO - Database connection closed.
