@@ -2,10 +2,15 @@ database:
   source_table: "users_raw"
   target_table: "users_masked"
 
-# Ensure 'generator' is at the top level, not indented under 'database'
 generator:
-  num_rows: 1000
+  num_rows: 100
   batch_size: 100
+
+export:
+  enabled: true
+  format: "csv"
+  output_dir: "exports"
+  file_name: "anonymized_users.csv"
 
 mappings:
   - source: "full_name"

@@ -3,6 +3,7 @@ import os
 import yaml
 import time
 from dotenv import load_dotenv
+from database.exporter import export_to_csv
 
 # Ensure the src directory is in the system path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -52,6 +53,15 @@ def main():
         print(f"Throughput:           {rows_per_second:.2f} rows/sec")
         print(f"{'='*50}")
         print(f"[SUCCESS] Anonymization completed!")
+
+        # 3. Step 3: Export Data if enabled
+        if config.get('export', {}).get('enabled'):
+            export_to_csv(
+                conn,
+                config['database']['target_table'],
+                config['export']['output_dir'],
+                config['export']['file_name']
+            )
 
     finally:
         conn.close()
