@@ -2,6 +2,11 @@ database:
   source_table: "users_raw"
   target_table: "users_masked"
 
+file_mode:
+  enabled: true
+  input_path: "data/input/sample_users.json"
+  output_path: "exports/anonymized_from_file.json"
+
 generator:
   num_rows: 100
   batch_size: 100

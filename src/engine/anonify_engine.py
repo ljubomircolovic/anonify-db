@@ -30,15 +30,32 @@ def get_deterministic_name(user_id):
     return raw_name
 
 def get_salary_bucket(salary_str):
-    """Categorize exact salary strings into ranges."""
+    """Categorize exact salary strings into ranges, handling EU and US formats."""
     try:
-        amount = int(''.join(filter(str.isdigit, salary_str)))
-        if amount < 50: return "< 50k"
-        if amount < 100: return "50k - 100k"
-        if amount < 150: return "100k - 150k"
+        if not salary_str or salary_str == 'None':
+            return "[NO DATA]"
+
+        # ?istimo sve što nije broj (uklanjamo ., €, USD, k, razmake...)
+        # "125.000 €" -> "125000"
+        # "160k" -> "160" (ovde moramo paziti na 'k')
+
+        clean_numeric = ''.join(filter(str.isdigit, salary_str))
+
+        if not clean_numeric:
+            return "[INVALID FORMAT]"
+
+        amount = int(clean_numeric)
+
+        # Ako je neko napisao "160" (misle?i na k), a mi o?ekujemo pun iznos
+        if amount < 1000:
+            amount = amount * 1000
+
+        if amount < 50000: return "< 50k"
+        if amount < 100000: return "50k - 100k"
+        if amount < 150000: return "100k - 150k"
         return "150k+"
     except (ValueError, TypeError):
-        return "[INVALID DATA]"
+        return "[ERROR]"
 
 def process_data(conn, setup_target_table):
     """Core transformation engine with integrated logging."""

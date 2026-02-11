@@ -13,6 +13,8 @@ from database.generator import generate_bulk_data
 from engine.anonify_engine import process_data
 from database.exporter import export_to_csv
 
+from engine.file_engine import process_file
+
 # Setup logging configuration
 if not os.path.exists("logs"):
     os.makedirs("logs")
@@ -37,7 +39,7 @@ with open(CONFIG_PATH, 'r') as f:
 
 def main():
     logging.info("--- Starting AnonifyDB Engine ---")
-    
+
     conn = get_db_connection()
     if not conn:
         logging.error("Database connection could not be established. Exiting.")
@@ -49,23 +51,35 @@ def main():
 
         start_time = time.time()
 
-        # Step 1: Bulk Data Generation
-        logging.info(f"Step 1: Generating {num_rows} synthetic records...")
-        generate_bulk_data(conn, num_rows, batch_size)
 
-        # Step 2: Anonymization Process
-        logging.info(f"Step 2: Starting transformation of {num_rows} records...")
-        process_data(conn, setup_target_table)
-        
-        # Step 3: Export Data if enabled
-        if config.get('export', {}).get('enabled'):
-            logging.info("Step 3: Exporting data to CSV...")
-            export_to_csv(
-                conn, 
-                config['database']['target_table'],
-                config['export']['output_dir'],
-                config['export']['file_name']
+        # NEW: File Processing Mode
+        if config.get('file_mode', {}).get('enabled'):
+            logging.info("--- File Processing Mode Activated ---")
+            process_file(
+                config['file_mode']['input_path'],
+                config['file_mode']['output_path'],
+                config['mappings']
             )
+        else:
+
+
+            # Step 1: Bulk Data Generation
+            logging.info(f"Step 1: Generating {num_rows} synthetic records...")
+            generate_bulk_data(conn, num_rows, batch_size)
+
+            # Step 2: Anonymization Process
+            logging.info(f"Step 2: Starting transformation of {num_rows} records...")
+            process_data(conn, setup_target_table)
+
+            # Step 3: Export Data if enabled
+            if config.get('export', {}).get('enabled'):
+                logging.info("Step 3: Exporting data to CSV...")
+                export_to_csv(
+                    conn,
+                    config['database']['target_table'],
+                    config['export']['output_dir'],
+                    config['export']['file_name']
+                )
 
         # Performance Summary
         end_time = time.time()

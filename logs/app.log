@@ -61,3 +61,57 @@
 2026-02-11 12:15:32,811 - INFO - ==================================================
 2026-02-11 12:15:32,811 - INFO - ? Anonymization process completed successfully.
 2026-02-11 12:15:32,812 - INFO - Database connection closed.
+2026-02-11 12:30:59,041 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:30:59,059 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:30:59,059 - INFO - ?? Reading input file: data/input/sample_users.xlsx
+2026-02-11 12:30:59,059 - ERROR - ? An unexpected error occurred: [Errno 2] No such file or directory: 'data/input/sample_users.xlsx'
+2026-02-11 12:30:59,060 - INFO - Database connection closed.
+2026-02-11 12:33:40,951 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:33:40,966 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:33:40,966 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-11 12:33:40,967 - ERROR - ? An unexpected error occurred: 'utf-8' codec can't decode byte 0xfc in position 53: invalid start byte
+2026-02-11 12:33:40,967 - INFO - Database connection closed.
+2026-02-11 12:38:03,526 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:38:03,552 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:38:03,552 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-11 12:38:03,552 - ERROR - ? An unexpected error occurred: 'utf-8' codec can't decode byte 0xfc in position 53: invalid start byte
+2026-02-11 12:38:03,554 - INFO - Database connection closed.
+2026-02-11 12:43:36,322 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:43:36,339 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:43:36,339 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-11 12:43:36,340 - ERROR - ? An unexpected error occurred: 'utf-8' codec can't decode byte 0xfc in position 53: invalid start byte
+2026-02-11 12:43:36,340 - INFO - Database connection closed.
+2026-02-11 12:45:59,132 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:45:59,147 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:45:59,147 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-11 12:45:59,148 - ERROR - ? An unexpected error occurred: 'utf-8' codec can't decode byte 0xfc in position 53: invalid start byte
+2026-02-11 12:45:59,148 - INFO - Database connection closed.
+2026-02-11 12:46:53,616 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:46:53,639 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:46:53,639 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-11 12:46:53,642 - WARNING - ?? Failed to read with encoding utf-8, trying next...
+2026-02-11 12:46:53,660 - INFO - ??  Anonymizing 4 rows...
+2026-02-11 12:46:53,730 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-11 12:46:53,731 - INFO - ? File anonymization completed.
+2026-02-11 12:46:53,731 - INFO - ==================================================
+2026-02-11 12:46:53,731 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-11 12:46:53,731 - INFO - Total Rows Processed: 100
+2026-02-11 12:46:53,732 - INFO - Total Time Taken:     0.09 seconds
+2026-02-11 12:46:53,732 - INFO - Throughput:           1085.07 rows/sec
+2026-02-11 12:46:53,732 - INFO - ==================================================
+2026-02-11 12:46:53,732 - INFO - ? Anonymization process completed successfully.
+2026-02-11 12:46:53,732 - INFO - Database connection closed.
+2026-02-11 12:58:21,923 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 12:58:21,940 - INFO - --- File Processing Mode Activated ---
+2026-02-11 12:58:21,940 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-11 12:58:21,947 - INFO - ??  Anonymizing 4 rows...
+2026-02-11 12:58:22,019 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-11 12:58:22,020 - INFO - ? File anonymization completed.
+2026-02-11 12:58:22,020 - INFO - ==================================================
+2026-02-11 12:58:22,020 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-11 12:58:22,020 - INFO - Total Rows Processed: 100
+2026-02-11 12:58:22,021 - INFO - Total Time Taken:     0.08 seconds
+2026-02-11 12:58:22,021 - INFO - Throughput:           1244.32 rows/sec
+2026-02-11 12:58:22,021 - INFO - ==================================================
+2026-02-11 12:58:22,021 - INFO - ? Anonymization process completed successfully.
+2026-02-11 12:58:22,024 - INFO - Database connection closed.

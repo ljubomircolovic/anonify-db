@@ -1,0 +1,30 @@
+[
+    {
+        "id":1,
+        "full_name":"Karsten Wieloch-Bolnbach",
+        "email":"karsten.wieloch-bolnbach@example.com",
+        "salary":"125.000 €",
+        "salary_status":"100k - 150k"
+    },
+    {
+        "id":2,
+        "full_name":"Bartholomaus Caspar",
+        "email":"bartholomaus.caspar@example.com",
+        "salary":"85000",
+        "salary_status":"50k - 100k"
+    },
+    {
+        "id":3,
+        "full_name":"Prof. Jorgen Ehlert B.Eng.",
+        "email":"prof..jorgen.ehlert.b.eng.@example.com",
+        "salary":"160k",
+        "salary_status":"150k+"
+    },
+    {
+        "id":4,
+        "full_name":"Ing. Bernd-Dieter Ullmann MBA.",
+        "email":"ing..bernd-dieter.ullmann.mba.@example.com",
+        "salary":"45000 USD",
+        "salary_status":"< 50k"
+    }
+]

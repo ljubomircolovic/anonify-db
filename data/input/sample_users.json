@@ -1,0 +1,26 @@
+[
+    {
+        "id": 1,
+        "full_name": "Hans Müller",
+        "email": "hans.mueller@company.de",
+        "salary": "125.000 €"
+    },
+    {
+        "id": 2,
+        "full_name": "Petra Schmidt",
+        "email": "p.schmidt@berlin-tech.com",
+        "salary": "85000"
+    },
+    {
+        "id": 3,
+        "full_name": "Ljubomir Colovic",
+        "email": "ljubomir@example.com",
+        "salary": "160k"
+    },
+    {
+        "id": 4,
+        "full_name": "Erik Weber",
+        "email": "e.weber@web.de",
+        "salary": "45000 USD"
+    }
+]
