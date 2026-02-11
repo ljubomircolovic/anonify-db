@@ -1,0 +1,12 @@
+2026-02-11 13:03:12,320 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-11 13:03:12,343 - INFO - Step 1: Generating 100 synthetic records...
+2026-02-11 13:03:12,426 - INFO - Step 2: Starting transformation of 100 records...
+2026-02-11 13:03:12,911 - INFO - Step 3: Exporting data to CSV...
+2026-02-11 13:03:12,913 - INFO - ==================================================
+2026-02-11 13:03:12,913 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-11 13:03:12,914 - INFO - Total Rows Processed: 100
+2026-02-11 13:03:12,914 - INFO - Total Time Taken:     0.57 seconds
+2026-02-11 13:03:12,914 - INFO - Throughput:           175.23 rows/sec
+2026-02-11 13:03:12,914 - INFO - ==================================================
+2026-02-11 13:03:12,914 - INFO - ? Anonymization process completed successfully.
+2026-02-11 13:03:12,914 - INFO - Database connection closed.
