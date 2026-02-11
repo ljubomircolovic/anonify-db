@@ -4,15 +4,25 @@ import random
 
 def generate_bulk_data(conn, num_rows, batch_size):
     """
-    Generates synthetic test data and inserts it into the users_raw table.
-    Uses batch insertion for better performance and memory management.
+    Generates synthetic test data.
+    Added: Check if table exists, create if not.
     """
     fake = Faker('de_DE')
     cur = conn.cursor()
 
+    # Create the source table if it's missing (Postgres 18 fresh start)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users_raw (
+            id SERIAL PRIMARY KEY,
+            full_name VARCHAR(255),
+            email VARCHAR(255),
+            salary VARCHAR(50)
+        );
+    """)
+
     print(f"?? Starting Stress Test Generator: Creating {num_rows} rows...")
 
-    # Clean the source table and reset auto-incrementing IDs
+    # Clean the source table and reset IDs
     cur.execute("TRUNCATE TABLE users_raw RESTART IDENTITY CASCADE;")
 
     rows = []
