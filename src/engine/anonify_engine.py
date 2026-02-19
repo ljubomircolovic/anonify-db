@@ -57,7 +57,122 @@ def get_salary_bucket(salary_str):
     except (ValueError, TypeError):
         return "[ERROR]"
 
+# ... (tvoji postoje?i importi i funkcije: get_deterministic_name, get_salary_bucket)
+
+def anonymize_dataframe(df):
+    """Bridge for Streamlit: Applies transformation logic to a Pandas DataFrame."""
+    mappings = config['mappings']
+
+    # Kreiramo kopiju da ne menjamo originalni upload
+    processed_df = df.copy()
+
+    # Pretpostavljamo da DataFrame ima 'id' kolonu kao i tvoja baza
+    if 'id' not in processed_df.columns:
+        # Ako nema ID, generišemo ga za potrebe deterministi?kog pseudonimizovanja
+        processed_df['id'] = range(1, len(processed_df) + 1)
+
+    for m in mappings:
+        col_source = m['source']
+        col_target = m['target']
+        method = m['method']
+
+        if col_source not in processed_df.columns:
+            logger.warning(f"Column {col_source} not found in uploaded file. Skipping.")
+            continue
+
+        if method == "fake_name":
+            processed_df[col_target] = processed_df['id'].apply(get_deterministic_name)
+
+        elif method == "fake_email":
+            def make_email(uid):
+                clean_name = get_deterministic_name(uid).lower().replace(' ', '.')
+                return f"{clean_name}@example.com"
+            processed_df[col_target] = processed_df['id'].apply(make_email)
+
+        elif method == "salary_bucket":
+            processed_df[col_target] = processed_df[col_source].astype(str).apply(get_salary_bucket)
+
+    return processed_df
+
+# Tvoj originalni process_data ostaje nepromenjen za rad sa bazom
+
+# ... zadrži sve tvoje postoje?e importe i funkcije (get_salary_bucket, get_deterministic_name, itd.)
+
+def anonymize_dataframe(df):
+    """
+    Bridge for Streamlit: Applies the transformation logic to a Pandas DataFrame.
+    Uses the same logic as the database process_data function.
+    """
+    mappings = config['mappings']
+    processed_df = df.copy()
+
+    # Ensure we have an ID for deterministic seeding
+    if 'id' not in processed_df.columns:
+        logger.info("No 'id' column found, generating temporary index for seeding.")
+        processed_df['id'] = range(1, len(processed_df) + 1)
+
+    for m in mappings:
+        col_source = m['source']
+        col_target = m['target']
+        method = m['method']
+
+        if col_source not in processed_df.columns:
+            logger.warning(f"Column {col_source} missing in uploaded file.")
+            continue
+
+        if method == "fake_name":
+            processed_df[col_target] = processed_df['id'].apply(get_deterministic_name)
+        
+        elif method == "fake_email":
+            def make_email(uid):
+                name = get_deterministic_name(uid).lower().replace(' ', '.')
+                return f"{name}@example.com"
+            processed_df[col_target] = processed_df['id'].apply(make_email)
+            
+        elif method == "salary_bucket":
+            # Convert to string to ensure get_salary_bucket handles it correctly
+            processed_df[col_target] = processed_df[col_source].astype(str).apply(get_salary_bucket)
+
+    return processed_df
+
 def process_data(conn, setup_target_table):
+
+
+    """
+    Bridge for Streamlit: Applies the transformation logic to a Pandas DataFrame.
+    Uses the same logic as the database process_data function.
+    """
+    mappings = config['mappings']
+    processed_df = df.copy()
+
+    # Ensure we have an ID for deterministic seeding
+    if 'id' not in processed_df.columns:
+        logger.info("No 'id' column found, generating temporary index for seeding.")
+        processed_df['id'] = range(1, len(processed_df) + 1)
+
+    for m in mappings:
+        col_source = m['source']
+        col_target = m['target']
+        method = m['method']
+
+        if col_source not in processed_df.columns:
+            logger.warning(f"Column {col_source} missing in uploaded file.")
+            continue
+
+        if method == "fake_name":
+            processed_df[col_target] = processed_df['id'].apply(get_deterministic_name)
+        
+        elif method == "fake_email":
+            def make_email(uid):
+                name = get_deterministic_name(uid).lower().replace(' ', '.')
+                return f"{name}@example.com"
+            processed_df[col_target] = processed_df['id'].apply(make_email)
+            
+        elif method == "salary_bucket":
+            # Convert to string to ensure get_salary_bucket handles it correctly
+            processed_df[col_target] = processed_df[col_source].astype(str).apply(get_salary_bucket)
+
+    return processed_df
     """Core transformation engine with integrated logging."""
     cur = conn.cursor()
     setup_target_table(cur)
