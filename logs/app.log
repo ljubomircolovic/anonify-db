@@ -115,3 +115,77 @@
 2026-02-11 12:58:22,021 - INFO - ==================================================
 2026-02-11 12:58:22,021 - INFO - ? Anonymization process completed successfully.
 2026-02-11 12:58:22,024 - INFO - Database connection closed.
+2026-02-19 08:25:14,467 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 08:25:14,495 - INFO - --- File Processing Mode Activated ---
+2026-02-19 08:25:14,495 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-19 08:25:14,505 - INFO - ??  Anonymizing 4 rows...
+2026-02-19 08:25:14,573 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-19 08:25:14,575 - INFO - ? File anonymization completed.
+2026-02-19 08:25:14,575 - INFO - ==================================================
+2026-02-19 08:25:14,575 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-19 08:25:14,575 - INFO - Total Rows Processed: 100
+2026-02-19 08:25:14,575 - INFO - Total Time Taken:     0.08 seconds
+2026-02-19 08:25:14,575 - INFO - Throughput:           1252.51 rows/sec
+2026-02-19 08:25:14,576 - INFO - ==================================================
+2026-02-19 08:25:14,576 - INFO - ? Anonymization process completed successfully.
+2026-02-19 08:25:14,576 - INFO - Database connection closed.
+2026-02-19 08:34:30,657 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 08:34:30,673 - INFO - --- File Processing Mode Activated ---
+2026-02-19 08:34:30,674 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-19 08:34:30,682 - INFO - ??  Anonymizing 4 rows...
+2026-02-19 08:34:30,732 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-19 08:34:30,734 - INFO - ? File anonymization completed.
+2026-02-19 08:34:30,734 - INFO - ==================================================
+2026-02-19 08:34:30,734 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-19 08:34:30,734 - INFO - Total Rows Processed: 100
+2026-02-19 08:34:30,734 - INFO - Total Time Taken:     0.06 seconds
+2026-02-19 08:34:30,734 - INFO - Throughput:           1658.48 rows/sec
+2026-02-19 08:34:30,734 - INFO - ==================================================
+2026-02-19 08:34:30,735 - INFO - ? Anonymization process completed successfully.
+2026-02-19 08:34:30,735 - INFO - Database connection closed.
+2026-02-19 08:38:37,030 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 08:38:37,047 - INFO - --- File Processing Mode Activated ---
+2026-02-19 08:38:37,047 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-19 08:38:37,053 - INFO - ??  Anonymizing 4 rows...
+2026-02-19 08:38:37,113 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-19 08:38:37,115 - INFO - ? File anonymization completed.
+2026-02-19 08:38:37,115 - INFO - ==================================================
+2026-02-19 08:38:37,115 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-19 08:38:37,115 - INFO - Total Rows Processed: 100
+2026-02-19 08:38:37,115 - INFO - Total Time Taken:     0.07 seconds
+2026-02-19 08:38:37,115 - INFO - Throughput:           1468.54 rows/sec
+2026-02-19 08:38:37,115 - INFO - ==================================================
+2026-02-19 08:38:37,116 - INFO - ? Anonymization process completed successfully.
+2026-02-19 08:38:37,116 - INFO - Database connection closed.
+2026-02-19 09:24:40,602 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 09:24:40,604 - ERROR - Database connection could not be established. Exiting.
+2026-02-19 09:28:01,665 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 09:28:01,670 - ERROR - Database connection could not be established. Exiting.
+2026-02-19 09:28:43,447 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 09:28:43,474 - INFO - --- File Processing Mode Activated ---
+2026-02-19 09:28:43,474 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-19 09:28:43,484 - INFO - ??  Anonymizing 4 rows...
+2026-02-19 09:28:43,566 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-19 09:28:43,567 - INFO - ? File anonymization completed.
+2026-02-19 09:28:43,567 - INFO - ==================================================
+2026-02-19 09:28:43,567 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-19 09:28:43,568 - INFO - Total Rows Processed: 100
+2026-02-19 09:28:43,568 - INFO - Total Time Taken:     0.09 seconds
+2026-02-19 09:28:43,568 - INFO - Throughput:           1072.54 rows/sec
+2026-02-19 09:28:43,568 - INFO - ==================================================
+2026-02-19 09:28:43,568 - INFO - ? Anonymization process completed successfully.
+2026-02-19 09:28:43,568 - INFO - Database connection closed.
+2026-02-19 09:45:24,882 - INFO - --- Starting AnonifyDB Engine ---
+2026-02-19 09:45:24,902 - INFO - --- File Processing Mode Activated ---
+2026-02-19 09:45:24,903 - INFO - ?? Reading input file: data/input/sample_users.json
+2026-02-19 09:45:24,909 - INFO - ??  Anonymizing 4 rows...
+2026-02-19 09:45:24,965 - INFO - ?? Saving anonymized data to: exports/anonymized_from_file.json
+2026-02-19 09:45:24,966 - INFO - ? File anonymization completed.
+2026-02-19 09:45:24,966 - INFO - ==================================================
+2026-02-19 09:45:24,966 - INFO - ?? PERFORMANCE SUMMARY
+2026-02-19 09:45:24,966 - INFO - Total Rows Processed: 100
+2026-02-19 09:45:24,966 - INFO - Total Time Taken:     0.06 seconds
+2026-02-19 09:45:24,967 - INFO - Throughput:           1574.16 rows/sec
+2026-02-19 09:45:24,967 - INFO - ==================================================
+2026-02-19 09:45:24,967 - INFO - ? Anonymization process completed successfully.
+2026-02-19 09:45:24,970 - INFO - Database connection closed.

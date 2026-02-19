@@ -1,31 +1,36 @@
+version: '3.8'
+
 services:
-  # --- DATABASE SERVICE ---
+  # Baza podataka na koju se engine oslanja
   db:
-    image: postgres:18-bookworm
+    image: postgres:15
     container_name: anonify_db
-    restart: always
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
       POSTGRES_DB: anonify_db
     ports:
       - "5433:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d anonify_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-  # --- YOUR APPLICATION SERVICE ---
+  # Batch/Script servis
   app:
     build: .
     container_name: anonify_app
     volumes:
-      - ./config:/app/config
-      - ./logs:/app/logs
-      - ./exports:/app/exports
-      - ./data:/app/data
-      - ./.env:/app/.env
+      - .:/app
+    environment:
+      - DB_HOST=db
     depends_on:
-      db:
-        condition: service_healthy
+      - db
+
+  # Streamlit Web UI
+  ui:
+    build: .
+    container_name: anonify_ui
+    command: streamlit run app_ui.py --server.port=8501 --server.address=0.0.0.0
+    volumes:
+      - .:/app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - db

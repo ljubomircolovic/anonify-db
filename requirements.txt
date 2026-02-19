@@ -5,3 +5,4 @@ PyYAML==6.0.3
 Unidecode==1.4.0
 pandas
 openpyxl
+streamlit
