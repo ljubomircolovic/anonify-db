@@ -4,111 +4,137 @@ import os
 import sys
 import psycopg2
 
-# Add the root directory to sys.path to ensure 'src' is discoverable as a package
+# Add the project root to sys.path to ensure modules in 'src' are importable
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
-# Import the core transformation logic from your engine
+# Import the core engine logic
 from src.engine.anonify_engine import anonymize_dataframe
 
-# Page configuration for the Streamlit Web UI
-st.set_page_config(page_title="AnonifyDB UI", layout="wide")
+# Basic Streamlit page configuration
+st.set_page_config(page_title="AnonifyDB Dashboard", layout="wide")
 
 # --- DATABASE HEALTH CHECK ---
 def check_db_connection():
     """
-    Attempts to connect to the PostgreSQL service defined in docker-compose.
-    Returns True if successful, False otherwise.
+    Check if the PostgreSQL database is reachable.
+    Uses credentials compatible with the Docker environment.
     """
     try:
-        # 'host="db"' maps to the container name in the Docker network
+        # 'db' is the hostname of the database container in docker-compose
         conn = psycopg2.connect(
             host="db",
             database="anonify_db",
             user="user",
             password="password",
-            connect_timeout=2
+            connect_timeout=1
         )
         conn.close()
         return True
     except Exception:
         return False
 
-# --- SIDEBAR: STATUS & CONFIGURATION ---
-st.sidebar.title("System Status")
+# --- SIDEBAR: SYSTEM STATUS & CONFIGURATION ---
+st.sidebar.title("AnonifyDB Settings")
 
-# Real-time Database connectivity indicator
+# Database Status Indicator
 if check_db_connection():
-    st.sidebar.success("? Database Online")
+    st.sidebar.success("Database Online")
 else:
-    st.sidebar.error("? Database Offline")
+    st.sidebar.error("Database Offline")
 
-# Define path for local data input (mapped via Docker volumes)
+st.sidebar.markdown("---")
+
+# --- OPTION B: ANONYMIZATION RULES ---
+st.sidebar.header("Processing Rules")
+
+# Select the Faker locale (localization for fake names)
+selected_locale = st.sidebar.selectbox(
+    "Target Locale",
+    ["en_US", "de_DE"],
+    index=1,
+    help="Select the region for synthetic data generation. Using Latin script for Serbian."
+)
+
+# Toggle for ASCII conversion
+ascii_mode = st.sidebar.toggle(
+    "Convert to ASCII",
+    value=True,
+    help="Remove special characters (e.g., accents) from generated names."
+)
+
+# Toggle for Deterministic vs Random mapping
+is_deterministic = st.sidebar.toggle(
+    "Deterministic Mapping",
+    value=True,
+    help="If ON, the same ID will always result in the same fake name."
+)
+
+st.sidebar.markdown("---")
+
+# --- FILE SELECTION ---
 data_dir = "/app/data/input"
-
-# List all supported files in the input directory
-if os.path.exists(data_dir):
-    available_files = [f for f in os.listdir(data_dir) if f.endswith(('.json', '.csv'))]
-else:
-    available_files = []
-
-selected_file = st.sidebar.selectbox("Select file from /data/input:", ["None"] + available_files)
+available_files = [f for f in os.listdir(data_dir) if f.endswith(('.json', '.csv'))] if os.path.exists(data_dir) else []
+selected_file = st.sidebar.selectbox("Choose a source file:", ["None"] + available_files)
 
 # --- MAIN INTERFACE ---
 st.title("AnonifyDB - Data Engineering Tool")
-st.markdown("---")
-
-df = None
+st.info("Upload or select a file to preview and anonymize sensitive data.")
 
 if selected_file != "None":
     file_path = os.path.join(data_dir, selected_file)
 
     try:
-        # Load logic based on file extension
+        # Load the file with encoding fallback for robust CSV handling
         if file_path.endswith('.json'):
             df = pd.read_json(file_path)
         else:
-            # ROBUST CSV LOADING: Handles encoding issues like the 0x9e byte error
             try:
-                # Standard UTF-8 attempt
+                # Primary attempt with standard UTF-8
                 df = pd.read_csv(file_path, encoding='utf-8')
             except UnicodeDecodeError:
-                # Fallback to ISO-8859-1 for ANSI/Excel-exported files
+                # Fallback for ANSI/Excel/Windows encoded files
                 df = pd.read_csv(file_path, encoding='iso-8859-1')
 
-        # UI Preview of the source data
-        st.write(f"### Raw Data Preview: {selected_file}")
+        # Display Source Data Preview
+        st.write(f"### Source Preview: `{selected_file}`")
         st.dataframe(df.head(10), use_container_width=True)
 
-        # Execution trigger
-        if st.button("?? Process & Anonymize"):
-            with st.spinner('Engine is processing data...'):
+        # Trigger the Anonymization Engine
+        if st.button("Run Anonymization Engine"):
+            with st.spinner('Processing data according to rules...'):
                 try:
-                    # Execute the anonymization logic from src/engine/anonify_engine.py
-                    result_df = anonymize_dataframe(df)
+                    # Execute transformation using settings from the sidebar
+                    result_df = anonymize_dataframe(
+                        df,
+                        locale=selected_locale,
+                        use_ascii=ascii_mode,
+                        is_deterministic=is_deterministic
+                    )
 
-                    st.success("Transformation Complete!")
+                    st.success(f"Successfully processed! (Mode: {'Deterministic' if is_deterministic else 'Randomized'})")
 
-                    # UI Preview of the processed data
-                    st.write("### Anonymized Data Preview")
+                    # Display Resulting Data Preview
+                    st.write("### Anonymized Output Preview")
                     st.dataframe(result_df.head(10), use_container_width=True)
 
-                    # Prepare the processed data for user download
+                    # Generate Download Link
                     output_filename = f"anon_{selected_file.replace('.json', '.csv')}"
-                    csv_output = result_df.to_csv(index=False).encode('utf-8')
+                    csv_data = result_df.to_csv(index=False).encode('utf-8')
 
                     st.download_button(
-                        label="?? Download Results (CSV)",
-                        data=csv_output,
+                        label="Download Resulting CSV",
+                        data=csv_data,
                         file_name=output_filename,
                         mime="text/csv"
                     )
                 except Exception as e:
-                    st.error(f"Engine Processing Error: {e}")
+                    st.error(f"Engine Error: {e}")
 
     except Exception as e:
-        st.error(f"File Access Error: {e}")
+        st.error(f"Failed to read file: {e}")
 else:
-    st.info("Select a file from the sidebar to begin processing.")
+    st.warning("Please select a file from the sidebar to begin.")
 
 # Application Footer
-st.caption("AnonifyDB Framework | Developed for Secure Data Engineering")
+st.markdown("---")
+st.caption("AnonifyDB v1.0 | Data Engineering Portfolio | Built by Ljubomir")

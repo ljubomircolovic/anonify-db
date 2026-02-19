@@ -1,10 +1,11 @@
 import yaml
 import os
 import logging
+import random
 from faker import Faker
 from unidecode import unidecode
 
-# Get the logger inherited from main
+# Initialize logger
 logger = logging.getLogger(__name__)
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12,211 +13,98 @@ CONFIG_PATH = os.path.join(current_dir, '../../config/settings.yaml')
 
 def load_config():
     """Load application settings from the YAML configuration file."""
-    with open(CONFIG_PATH, 'r') as f:
-        return yaml.safe_load(f)
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"Error loading config: {e}")
+        return {}
 
 config = load_config()
 
-def get_deterministic_name(user_id):
-    """Generate a consistent fake name based on user_id."""
-    locale = config['anonymization']['locale']
-    local_fake = Faker(locale)
-    local_fake.seed_instance(user_id)
-
-    raw_name = local_fake.name()
-
-    if config['anonymization'].get('use_ascii', True):
-        return unidecode(raw_name)
-    return raw_name
-
 def get_salary_bucket(salary_str):
-    """Categorize exact salary strings into ranges, handling EU and US formats."""
+    """
+    Categorize exact salary strings into ranges.
+    Defined before anonymize_dataframe to avoid import errors.
+    """
     try:
-        if not salary_str or salary_str == 'None':
+        if not salary_str or str(salary_str).lower() in ['none', 'nan', '']:
             return "[NO DATA]"
-
-        # ?istimo sve što nije broj (uklanjamo ., €, USD, k, razmake...)
-        # "125.000 €" -> "125000"
-        # "160k" -> "160" (ovde moramo paziti na 'k')
-
-        clean_numeric = ''.join(filter(str.isdigit, salary_str))
-
+        
+        clean_numeric = ''.join(filter(str.isdigit, str(salary_str)))
         if not clean_numeric:
             return "[INVALID FORMAT]"
-
+            
         amount = int(clean_numeric)
-
-        # Ako je neko napisao "160" (misle?i na k), a mi o?ekujemo pun iznos
         if amount < 1000:
-            amount = amount * 1000
-
+            amount *= 1000
+            
         if amount < 50000: return "< 50k"
         if amount < 100000: return "50k - 100k"
         if amount < 150000: return "100k - 150k"
         return "150k+"
-    except (ValueError, TypeError):
+    except Exception:
         return "[ERROR]"
 
-# ... (tvoji postoje?i importi i funkcije: get_deterministic_name, get_salary_bucket)
+def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
+    """
+    Generate a fake name with fixed seeds for deterministic mapping.
+    Supports en_US and de_DE.
+    """
+    local_fake = Faker(locale)
+    
+    if is_deterministic:
+        # Re-seeding both ensures maximum stability across different Faker providers
+        random.seed(user_id)
+        local_fake.seed_instance(user_id)
+    else:
+        # Use a high-range random seed for variety on each run
+        random.seed(random.randint(0, 10**6))
+        local_fake.seed_instance(random.randint(0, 10**6))
+        
+    raw_name = local_fake.name()
 
-def anonymize_dataframe(df):
-    """Bridge for Streamlit: Applies transformation logic to a Pandas DataFrame."""
-    mappings = config['mappings']
+    if use_ascii:
+        return unidecode(raw_name)
+    return raw_name
 
-    # Kreiramo kopiju da ne menjamo originalni upload
+def anonymize_dataframe(df, locale=None, use_ascii=None, is_deterministic=True):
+    """
+    Main entry point for data anonymization.
+    English comments as requested.
+    """
+    mappings = config.get('mappings', [])
     processed_df = df.copy()
+    
+    # Resolve parameters: UI > Config > Default
+    target_locale = locale if locale else config.get('anonymization', {}).get('locale', 'en_US')
+    target_ascii = use_ascii if use_ascii is not None else config.get('anonymization', {}).get('use_ascii', True)
 
-    # Pretpostavljamo da DataFrame ima 'id' kolonu kao i tvoja baza
     if 'id' not in processed_df.columns:
-        # Ako nema ID, generišemo ga za potrebe deterministi?kog pseudonimizovanja
         processed_df['id'] = range(1, len(processed_df) + 1)
 
     for m in mappings:
-        col_source = m['source']
-        col_target = m['target']
-        method = m['method']
+        col_source = m.get('source')
+        col_target = m.get('target')
+        method = m.get('method')
 
         if col_source not in processed_df.columns:
-            logger.warning(f"Column {col_source} not found in uploaded file. Skipping.")
             continue
 
         if method == "fake_name":
-            processed_df[col_target] = processed_df['id'].apply(get_deterministic_name)
-
-        elif method == "fake_email":
-            def make_email(uid):
-                clean_name = get_deterministic_name(uid).lower().replace(' ', '.')
-                return f"{clean_name}@example.com"
-            processed_df[col_target] = processed_df['id'].apply(make_email)
-
-        elif method == "salary_bucket":
-            processed_df[col_target] = processed_df[col_source].astype(str).apply(get_salary_bucket)
-
-    return processed_df
-
-# Tvoj originalni process_data ostaje nepromenjen za rad sa bazom
-
-# ... zadrži sve tvoje postoje?e importe i funkcije (get_salary_bucket, get_deterministic_name, itd.)
-
-def anonymize_dataframe(df):
-    """
-    Bridge for Streamlit: Applies the transformation logic to a Pandas DataFrame.
-    Uses the same logic as the database process_data function.
-    """
-    mappings = config['mappings']
-    processed_df = df.copy()
-
-    # Ensure we have an ID for deterministic seeding
-    if 'id' not in processed_df.columns:
-        logger.info("No 'id' column found, generating temporary index for seeding.")
-        processed_df['id'] = range(1, len(processed_df) + 1)
-
-    for m in mappings:
-        col_source = m['source']
-        col_target = m['target']
-        method = m['method']
-
-        if col_source not in processed_df.columns:
-            logger.warning(f"Column {col_source} missing in uploaded file.")
-            continue
-
-        if method == "fake_name":
-            processed_df[col_target] = processed_df['id'].apply(get_deterministic_name)
+            processed_df[col_target] = processed_df['id'].apply(
+                lambda x: get_name_dynamic(x, target_locale, target_ascii, is_deterministic)
+            )
         
         elif method == "fake_email":
             def make_email(uid):
-                name = get_deterministic_name(uid).lower().replace(' ', '.')
+                # Using dynamic name generation with ASCII forced for emails
+                name = get_name_dynamic(uid, target_locale, True, is_deterministic).lower().replace(' ', '.')
                 return f"{name}@example.com"
             processed_df[col_target] = processed_df['id'].apply(make_email)
             
         elif method == "salary_bucket":
-            # Convert to string to ensure get_salary_bucket handles it correctly
-            processed_df[col_target] = processed_df[col_source].astype(str).apply(get_salary_bucket)
+            # Calling the locally defined function
+            processed_df[col_target] = processed_df[col_source].apply(get_salary_bucket)
 
     return processed_df
-
-def process_data(conn, setup_target_table):
-
-
-    """
-    Bridge for Streamlit: Applies the transformation logic to a Pandas DataFrame.
-    Uses the same logic as the database process_data function.
-    """
-    mappings = config['mappings']
-    processed_df = df.copy()
-
-    # Ensure we have an ID for deterministic seeding
-    if 'id' not in processed_df.columns:
-        logger.info("No 'id' column found, generating temporary index for seeding.")
-        processed_df['id'] = range(1, len(processed_df) + 1)
-
-    for m in mappings:
-        col_source = m['source']
-        col_target = m['target']
-        method = m['method']
-
-        if col_source not in processed_df.columns:
-            logger.warning(f"Column {col_source} missing in uploaded file.")
-            continue
-
-        if method == "fake_name":
-            processed_df[col_target] = processed_df['id'].apply(get_deterministic_name)
-        
-        elif method == "fake_email":
-            def make_email(uid):
-                name = get_deterministic_name(uid).lower().replace(' ', '.')
-                return f"{name}@example.com"
-            processed_df[col_target] = processed_df['id'].apply(make_email)
-            
-        elif method == "salary_bucket":
-            # Convert to string to ensure get_salary_bucket handles it correctly
-            processed_df[col_target] = processed_df[col_source].astype(str).apply(get_salary_bucket)
-
-    return processed_df
-    """Core transformation engine with integrated logging."""
-    cur = conn.cursor()
-    setup_target_table(cur)
-
-    source_table = config['database']['source_table']
-    target_table = config['database']['target_table']
-    mappings = config['mappings']
-
-    source_cols = ["id"] + [m['source'] for m in mappings]
-    query = f"SELECT {', '.join(source_cols)} FROM {source_table};"
-
-    cur.execute(query)
-    rows = cur.fetchall()
-
-    logger.info(f"Transforming data from '{source_table}' to '{target_table}'...")
-
-    for row in rows:
-        data = dict(zip(source_cols, row))
-        user_id = data['id']
-        masked_values = {"id": user_id}
-
-        for m in mappings:
-            col_source = m['source']
-            col_target = m['target']
-            method = m['method']
-
-            if method == "fake_name":
-                masked_values[col_target] = get_deterministic_name(user_id)
-            elif method == "fake_email":
-                clean_name = get_deterministic_name(user_id).lower().replace(' ', '.')
-                masked_values[col_target] = f"{clean_name}@example.com"
-            elif method == "salary_bucket":
-                raw_salary = data[col_source]
-                masked_values[col_target] = get_salary_bucket(raw_salary)
-
-        cols_to_insert = list(masked_values.keys())
-        placeholders = [f"%({c})s" for c in cols_to_insert]
-
-        insert_query = f"""
-            INSERT INTO {target_table} ({', '.join(cols_to_insert)})
-            VALUES ({', '.join(placeholders)});
-        """
-        cur.execute(insert_query, masked_values)
-
-    conn.commit()
-    cur.close()
-    logger.info("Transformation completed successfully.")
