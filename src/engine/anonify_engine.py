@@ -2,109 +2,114 @@ import yaml
 import os
 import logging
 import random
+import pandas as pd
 from faker import Faker
 from unidecode import unidecode
 
 # Initialize logger
 logger = logging.getLogger(__name__)
 
+# Configuration path setup
 current_dir = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(current_dir, '../../config/settings.yaml')
 
 def load_config():
-    """Load application settings from the YAML configuration file."""
+    """Load transformation rules from YAML config."""
     try:
-        with open(CONFIG_PATH, 'r') as f:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     except Exception as e:
-        logger.error(f"Error loading config: {e}")
+        logger.error(f"Failed to load config: {e}")
         return {}
 
 config = load_config()
 
-def get_salary_bucket(salary_str):
-    """
-    Categorize exact salary strings into ranges.
-    Defined before anonymize_dataframe to avoid import errors.
-    """
+def get_salary_bucket(salary_val, locale="de_DE"):
     try:
-        if not salary_str or str(salary_str).lower() in ['none', 'nan', '']:
+        if pd.isna(salary_val) or str(salary_val).strip() == "":
             return "[NO DATA]"
+
+        # 1. Standardize to lowercase for easier check
+        raw_str = str(salary_val).lower().strip()
         
-        clean_numeric = ''.join(filter(str.isdigit, str(salary_str)))
+        # 2. Handle the "k" suffix BEFORE stripping digits
+        # If it finds 'k', it multiplies by 1000
+        multiplier = 1
+        if 'k' in raw_str:
+            multiplier = 1000
+        
+        # 3. Now clean everything except digits
+        clean_numeric = "".join(c for c in raw_str if c.isdigit())
+        
         if not clean_numeric:
-            return "[INVALID FORMAT]"
-            
-        amount = int(clean_numeric)
-        if amount < 1000:
-            amount *= 1000
-            
-        if amount < 50000: return "< 50k"
-        if amount < 100000: return "50k - 100k"
-        if amount < 150000: return "100k - 150k"
-        return "150k+"
-    except Exception:
-        return "[ERROR]"
-
-def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
-    """
-    Generate a fake name with fixed seeds for deterministic mapping.
-    Supports en_US and de_DE.
-    """
-    local_fake = Faker(locale)
-    
-    if is_deterministic:
-        # Re-seeding both ensures maximum stability across different Faker providers
-        random.seed(user_id)
-        local_fake.seed_instance(user_id)
-    else:
-        # Use a high-range random seed for variety on each run
-        random.seed(random.randint(0, 10**6))
-        local_fake.seed_instance(random.randint(0, 10**6))
+            return "[INVALID]"
         
-    raw_name = local_fake.name()
+        # 4. Final calculation
+        amount = int(clean_numeric) * multiplier
+        
+        # Formatting helper
+        def fmt_curr(val):
+            if locale == "de_DE":
+                return f"{val:,.0f}".replace(",", ".") + " \u20ac"
+            return f"${val // 1000}k"
 
-    if use_ascii:
-        return unidecode(raw_name)
-    return raw_name
+        # 5. Corrected ranges
+        if amount >= 150000: return f"> {fmt_curr(150000)}"
+        if amount >= 100000: return f"{fmt_curr(100000)} - {fmt_curr(150000)}"
+        if amount >= 50000:  return f"{fmt_curr(50000)} - {fmt_curr(100000)}"
+        return f"< {fmt_curr(50000)}"
+        
+    except Exception as e:
+        return f"[ERROR]"
+def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
+    """Generate localized fake names using deterministic seeds."""
+    fake = Faker(locale)
+    if is_deterministic:
+        random.seed(user_id)
+        fake.seed_instance(user_id)
+    
+    raw_name = fake.name()
+    return unidecode(raw_name) if use_ascii else raw_name
 
-def anonymize_dataframe(df, locale=None, use_ascii=None, is_deterministic=True):
+def anonymize_dataframe(df, locale='en_US', use_ascii=True, is_deterministic=True):
     """
     Main entry point for data anonymization.
-    English comments as requested.
+    Forces clean target columns to prevent data leakage/concatenation.
     """
-    mappings = config.get('mappings', [])
     processed_df = df.copy()
     
-    # Resolve parameters: UI > Config > Default
-    target_locale = locale if locale else config.get('anonymization', {}).get('locale', 'en_US')
-    target_ascii = use_ascii if use_ascii is not None else config.get('anonymization', {}).get('use_ascii', True)
-
+    # Ensure ID exists for deterministic seeding
     if 'id' not in processed_df.columns:
         processed_df['id'] = range(1, len(processed_df) + 1)
-
+    
+    mappings = config.get('mappings', [])
     for m in mappings:
-        col_source = m.get('source')
-        col_target = m.get('target')
+        src = m.get('source')
+        tgt = m.get('target')
         method = m.get('method')
-
-        if col_source not in processed_df.columns:
+        
+        if src not in processed_df.columns:
+            logger.warning(f"Source column {src} not found in dataframe.")
             continue
+        
+        # CLEANUP: If target exists and is not source, drop it to prevent string 'ghosting'
+        if tgt in processed_df.columns and src != tgt:
+            processed_df.drop(columns=[tgt], inplace=True)
 
         if method == "fake_name":
-            processed_df[col_target] = processed_df['id'].apply(
-                lambda x: get_name_dynamic(x, target_locale, target_ascii, is_deterministic)
+            processed_df[tgt] = processed_df['id'].apply(
+                lambda x: get_name_dynamic(x, locale, use_ascii, is_deterministic)
             )
         
         elif method == "fake_email":
-            def make_email(uid):
-                # Using dynamic name generation with ASCII forced for emails
-                name = get_name_dynamic(uid, target_locale, True, is_deterministic).lower().replace(' ', '.')
-                return f"{name}@example.com"
-            processed_df[col_target] = processed_df['id'].apply(make_email)
-            
+            # Emails always use ASCII version of the dynamic name
+            processed_df[tgt] = processed_df['id'].apply(
+                lambda x: get_name_dynamic(x, locale, True, is_deterministic).lower().replace(' ', '.') + "@example.com"
+            )
+        
         elif method == "salary_bucket":
-            # Calling the locally defined function
-            processed_df[col_target] = processed_df[col_source].apply(get_salary_bucket)
-
+            # Apply bucket logic and force cast to values to break Series link
+            bucket_series = processed_df[src].apply(lambda x: get_salary_bucket(x, locale))
+            processed_df[tgt] = bucket_series.values
+            
     return processed_df

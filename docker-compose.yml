@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Baza podataka na koju se engine oslanja
   db:
