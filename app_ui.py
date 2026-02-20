@@ -4,23 +4,18 @@ import os
 import sys
 import psycopg2
 
-# Add the project root to sys.path to ensure modules in 'src' are importable
+# 1. OVO MORA BITI PRVA STREAMLIT KOMANDA
+st.set_page_config(page_title="AnonifyDB Dashboard", layout="wide")
+
+# Add the project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
 # Import the core engine logic
 from src.engine.anonify_engine import anonymize_dataframe
 
-# Basic Streamlit page configuration
-st.set_page_config(page_title="AnonifyDB Dashboard", layout="wide")
-
 # --- DATABASE HEALTH CHECK ---
 def check_db_connection():
-    """
-    Check if the PostgreSQL database is reachable.
-    Uses credentials compatible with the Docker environment.
-    """
     try:
-        # 'db' is the hostname of the database container in docker-compose
         conn = psycopg2.connect(
             host="db",
             database="anonify_db",
@@ -36,38 +31,17 @@ def check_db_connection():
 # --- SIDEBAR: SYSTEM STATUS & CONFIGURATION ---
 st.sidebar.title("AnonifyDB Settings")
 
-# Database Status Indicator
 if check_db_connection():
     st.sidebar.success("Database Online")
 else:
     st.sidebar.error("Database Offline")
 
 st.sidebar.markdown("---")
-
-# --- OPTION B: ANONYMIZATION RULES ---
 st.sidebar.header("Processing Rules")
 
-# Select the Faker locale (localization for fake names)
-selected_locale = st.sidebar.selectbox(
-    "Target Locale",
-    ["en_US", "de_DE"],
-    index=1,
-    help="Select the region for synthetic data generation. Using Latin script for Serbian."
-)
-
-# Toggle for ASCII conversion
-ascii_mode = st.sidebar.toggle(
-    "Convert to ASCII",
-    value=True,
-    help="Remove special characters (e.g., accents) from generated names."
-)
-
-# Toggle for Deterministic vs Random mapping
-is_deterministic = st.sidebar.toggle(
-    "Deterministic Mapping",
-    value=True,
-    help="If ON, the same ID will always result in the same fake name."
-)
+selected_locale = st.sidebar.selectbox("Target Locale", ["en_US", "de_DE"], index=1)
+ascii_mode = st.sidebar.toggle("Convert to ASCII", value=True)
+is_deterministic = st.sidebar.toggle("Deterministic Mapping", value=True)
 
 st.sidebar.markdown("---")
 
@@ -78,63 +52,88 @@ selected_file = st.sidebar.selectbox("Choose a source file:", ["None"] + availab
 
 # --- MAIN INTERFACE ---
 st.title("AnonifyDB - Data Engineering Tool")
-st.info("Upload or select a file to preview and anonymize sensitive data.")
+
+# Initialize result_df in session state so it persists between clicks
+if 'result_df' not in st.session_state:
+    st.session_state.result_df = None
 
 if selected_file != "None":
     file_path = os.path.join(data_dir, selected_file)
 
     try:
-        # Load the file with encoding fallback for robust CSV handling
         if file_path.endswith('.json'):
             df = pd.read_json(file_path)
         else:
-            try:
-                # Primary attempt with standard UTF-8
-                df = pd.read_csv(file_path, encoding='utf-8')
-            except UnicodeDecodeError:
-                # Fallback for ANSI/Excel/Windows encoded files
-                df = pd.read_csv(file_path, encoding='iso-8859-1')
+            df = pd.read_csv(file_path, encoding='utf-8')
 
-        # Display Source Data Preview
         st.write(f"### Source Preview: `{selected_file}`")
         st.dataframe(df.head(10), use_container_width=True)
 
-        # Trigger the Anonymization Engine
         if st.button("Run Anonymization Engine"):
-            with st.spinner('Processing data according to rules...'):
+            with st.spinner('Processing data...'):
                 try:
-                    # Execute transformation using settings from the sidebar
-                    result_df = anonymize_dataframe(
+                    # Run engine and save to session state
+                    st.session_state.result_df = anonymize_dataframe(
                         df,
                         locale=selected_locale,
                         use_ascii=ascii_mode,
                         is_deterministic=is_deterministic
                     )
-
-                    st.success(f"Successfully processed! (Mode: {'Deterministic' if is_deterministic else 'Randomized'})")
-
-                    # Display Resulting Data Preview
-                    st.write("### Anonymized Output Preview")
-                    st.dataframe(result_df.head(10), use_container_width=True)
-
-                    # Generate Download Link
-                    output_filename = f"anon_{selected_file.replace('.json', '.csv')}"
-                    csv_data = result_df.to_csv(index=False).encode('utf-8')
-
-                    st.download_button(
-                        label="Download Resulting CSV",
-                        data=csv_data,
-                        file_name=output_filename,
-                        mime="text/csv"
-                    )
+                    st.success("Successfully processed!")
                 except Exception as e:
                     st.error(f"Engine Error: {e}")
 
+        # Show results if they exist in session state
+        if st.session_state.result_df is not None:
+            res_df = st.session_state.result_df
+            
+            st.write("### Anonymized Output Preview")
+            # DEBUG ISPIS - Sada je na sigurnom mestu
+            st.write("DEBUG - Columns generated:", res_df.columns.tolist())
+            st.dataframe(res_df.head(10), use_container_width=True)
+
+            # --- DATABASE EXPORT & DASHBOARD ---
+            st.markdown("---")
+            st.subheader("?? Data Warehouse & Insights")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("?? Export to PostgreSQL"):
+                    try:
+                        conn = psycopg2.connect(host="db", database="anonify_db", user="user", password="password")
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS anonymized_data (
+                                id SERIAL PRIMARY KEY,
+                                full_name TEXT, email TEXT, salary_range TEXT,
+                                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            );
+                        """)
+                        for _, row in res_df.iterrows():
+                            # Koristimo .get() da spre?imo pucanje ako kolona fali
+                            s_bucket = row.get('salary_bucket', row.get('salary_status', 'N/A'))
+                            cursor.execute("""
+                                INSERT INTO anonymized_data (full_name, email, salary_range)
+                                VALUES (%s, %s, %s)
+                            """, (row['full_name'], row['email'], s_bucket))
+                        conn.commit()
+                        st.success("Data saved to DB!")
+                        conn.close()
+                    except Exception as e:
+                        st.error(f"DB Error: {e}")
+
+            with col2:
+                st.write("Salary Distribution")
+                # Proveravamo obe varijante imena kolone
+                col_name = 'salary_bucket' if 'salary_bucket' in res_df.columns else 'salary_status'
+                if col_name in res_df.columns:
+                    st.bar_chart(res_df[col_name].value_counts())
+                else:
+                    st.warning("No salary column found for chart.")
+
     except Exception as e:
         st.error(f"Failed to read file: {e}")
-else:
-    st.warning("Please select a file from the sidebar to begin.")
 
-# Application Footer
 st.markdown("---")
 st.caption("AnonifyDB v1.0 | Data Engineering Portfolio | Built by Ljubomir")

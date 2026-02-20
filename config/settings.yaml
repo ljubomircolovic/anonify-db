@@ -25,7 +25,7 @@ mappings:
     target: "email"
     method: "fake_email"
   - source: "salary"
-    target: "salary_status"
+    target: "salary_bucket"
     method: "salary_bucket"
 
 anonymization:
