@@ -104,84 +104,19 @@ def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
 
 def anonymize_dataframe(df, locale='de_DE', use_ascii=True, is_deterministic=True):
     fake = Faker(locale)
-
-    # Ako je deterministicki, uvek koristimo isti seed
     if is_deterministic:
         fake.seed_instance(42)
-
+    
     res_df = df.copy()
-
-    # Pametna detekcija kolona (Case-insensitive)
     cols = {c.lower(): c for c in df.columns}
 
-    # 1. Obrada IMENA (FirstName + LastName)
-    fname_col = next((v for k, v in cols.items() if 'first' in k and 'name' in k), None)
-    lname_col = next((v for k, v in cols.items() if 'last' in k and 'name' in k), None)
-
-    if fname_col and lname_col:
-        # Kreiramo novu kolonu full_name na osnovu maskiranih vrednosti
-        res_df['full_name'] = res_df.apply(lambda _: fake.name(), axis=1)
-        # Brišemo originale da ne cure podaci
-        res_df.drop([fname_col, lname_col], axis=1, inplace=True)
-
-    # 2. Obrada EMAIL-a
-    email_col = next((v for k, v in cols.items() if 'email' in k), None)
-    if email_col:
-        res_df['email'] = res_df.apply(lambda _: fake.free_email(), axis=1)
-        if email_col != 'email':
-            res_df.drop(email_col, axis=1, inplace=True)
-
-    # 3. Obrada PLATA / PRIHODA (Income, Salary, TotalDue)
-    salary_col = next((v for k, v in cols.items() if any(x in k for x in ['salary', 'income', 'total', 'subtotal'])), None)
-    if salary_col:
-        # Ovde primenjujemo tvoju ve? napisanu logiku za bucket-e
-        res_df['salary_bucket'] = res_df[salary_col].apply(lambda x: transform_to_bucket(x))
-        res_df.drop(salary_col, axis=1, inplace=True)
-
-    # ASCII konverzija ako je uklju?ena
-    if use_ascii:
-        # ... tvoj postoje?i kod za unidecode ...
-        pass
+    for k, v in cols.items():
+        # Maskiraj OrderNumber (format SO-12345)
+        if 'number' in k:
+            res_df[v] = [f"SO-{fake.random_int(10000, 99999)}" for _ in range(len(res_df))]
+        
+        # Maskiraj klju?eve (ProductKey, CustomerKey, TerritoryKey)
+        if 'key' in k:
+            res_df[v] = [fake.random_int(100, 999) for _ in range(len(res_df))]
 
     return res_df
-    """
-    Main entry point for data anonymization.
-    Forces clean target columns to prevent data leakage/concatenation.
-    """
-    processed_df = df.copy()
-
-    # Ensure ID exists for deterministic seeding
-    if 'id' not in processed_df.columns:
-        processed_df['id'] = range(1, len(processed_df) + 1)
-
-    mappings = config.get('mappings', [])
-    for m in mappings:
-        src = m.get('source')
-        tgt = m.get('target')
-        method = m.get('method')
-
-        if src not in processed_df.columns:
-            logger.warning(f"Source column {src} not found in dataframe.")
-            continue
-
-        # CLEANUP: If target exists and is not source, drop it to prevent string 'ghosting'
-        if tgt in processed_df.columns and src != tgt:
-            processed_df.drop(columns=[tgt], inplace=True)
-
-        if method == "fake_name":
-            processed_df[tgt] = processed_df['id'].apply(
-                lambda x: get_name_dynamic(x, locale, use_ascii, is_deterministic)
-            )
-
-        elif method == "fake_email":
-            # Emails always use ASCII version of the dynamic name
-            processed_df[tgt] = processed_df['id'].apply(
-                lambda x: get_name_dynamic(x, locale, True, is_deterministic).lower().replace(' ', '.') + "@example.com"
-            )
-
-        elif method == "salary_bucket":
-            # Apply bucket logic and force cast to values to break Series link
-            bucket_series = processed_df[src].apply(lambda x: get_salary_bucket(x, locale))
-            processed_df[tgt] = bucket_series.values
-
-    return processed_df

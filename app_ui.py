@@ -18,7 +18,7 @@ from src.engine.anonify_engine import anonymize_dataframe
 
 # --- Helper Functions ---
 
-@st.cache_data
+# @st.cache_data
 def convert_df_to_csv(df):
     """Cache the conversion to prevent browser crashes on re-renders."""
     return df.to_csv(index=False).encode('utf-8')
@@ -44,14 +44,14 @@ LANG_MAP = {
         "metrics_total": "Total Processed",
         "metrics_market": "Target Market",
         "chart_title": "Salary Distribution",
-        "db_btn": "?? Export to PostgreSQL",
+        "db_btn": "Export to PostgreSQL",
         "success_msg": "Data successfully saved!"
     },
     "de_DE": {
         "metrics_total": "Gesamt verarbeitet",
         "metrics_market": "Zielmarkt",
         "chart_title": "Gehaltsverteilung",
-        "db_btn": "?? Export nach PostgreSQL",
+        "db_btn": "Export nach PostgreSQL",
         "success_msg": "Daten erfolgreich gespeichert!"
     }
 }
@@ -101,14 +101,10 @@ if selected_file != "None":
 
 
         if st.button("Run Anonymization Engine"):
-            with st.spinner('Anonymizing data...'):
-                st.session_state.result_df = anonymize_dataframe(
-                    df,
-                    locale=selected_locale,
-                    use_ascii=ascii_mode,
-                    is_deterministic=is_deterministic
-                )
-                st.success("Processing complete!")
+            # Pozivamo engine direktno bez kesa za ovaj test
+            st.session_state.result_df = anonymize_dataframe(df, selected_locale, ascii_mode, is_deterministic)
+            # Forsiramo Streamlit da ponovo iscrta sve sa novim podacima
+            st.rerun()
 
         # Display dashboard if data exists
         if st.session_state.result_df is not None:
@@ -116,17 +112,20 @@ if selected_file != "None":
             ui_text = LANG_MAP.get(selected_locale, LANG_MAP["en_US"])
             
             # --- TABS SECTION ---
-            tab1, tab2 = st.tabs(["?? Anonymized Data", "?? Original Data"])
-            
+            tab1, tab2 = st.tabs(["Original Input", "Anonymized Data"])
+
             with tab1:
-                st.write("### Processed Output (Ready for DB)")
-                display_cols = ['full_name', 'email', 'salary_bucket'] 
-                available_display = [c for c in display_cols if c in res_df.columns]
-                st.dataframe(res_df[available_display].head(10), use_container_width=True)
-            
+                st.dataframe(df)
+
             with tab2:
-                st.write("### Original Input (Source)")
-                st.dataframe(df.head(10), use_container_width=True)
+                # Proveravamo da li rezultat uopste postoji u session_state
+                if "result_df" in st.session_state and st.session_state.result_df is not None:
+                    if not st.session_state.result_df.empty:
+                        st.dataframe(st.session_state.result_df)
+                    else:
+                        st.warning("The anonymized dataframe is empty.")
+                else:
+                    st.info("Click 'Run Anonymization Engine' to see results.")
 
             # --- DOWNLOAD SECTION ---
             st.divider()
