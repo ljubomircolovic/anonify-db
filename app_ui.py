@@ -81,10 +81,24 @@ if 'result_df' not in st.session_state:
 if selected_file != "None":
     file_path = os.path.join(data_dir, selected_file)
     try:
+        # Load file with robust encoding handling
         if file_path.endswith('.json'):
             df = pd.read_json(file_path)
         else:
-            df = pd.read_csv(file_path, encoding='utf-8', errors='replace')
+            # Pandas koristi 'encoding_errors' umesto 'errors' u novijim verzijama
+            # 'on_bad_lines' preskace redove koji su strukturno neispravni
+            df = pd.read_csv(
+                file_path, 
+                encoding='utf-8', 
+                encoding_errors='replace', 
+                on_bad_lines='warn'
+            )
+
+        @st.cache_data
+        def get_anonymized_data(df, locale, ascii_mode, is_deterministic):
+            # Ova funkcija ce se izvrsiti SAMO ako se promeni fajl ili neki od parametara
+            return anonymize_dataframe(df, locale, ascii_mode, is_deterministic)
+
 
         if st.button("Run Anonymization Engine"):
             with st.spinner('Anonymizing data...'):
