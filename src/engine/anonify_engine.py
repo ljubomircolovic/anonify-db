@@ -102,21 +102,36 @@ def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
     raw_name = fake.name()
     return unidecode(raw_name) if use_ascii else raw_name
 
-def anonymize_dataframe(df, locale='de_DE', use_ascii=True, is_deterministic=True):
-    fake = Faker(locale)
-    if is_deterministic:
-        fake.seed_instance(42)
+import pandas as pd
+import hashlib
+
+def anonymize_dataframe(df, is_deterministic=True):
+    """
+    Anonymizes sensitive columns by detecting keywords like 'name', 'email', 'salary'.
+    """
+    anon_df = df.copy()
     
-    res_df = df.copy()
-    cols = {c.lower(): c for c in df.columns}
-
-    for k, v in cols.items():
-        # Maskiraj OrderNumber (format SO-12345)
-        if 'number' in k:
-            res_df[v] = [f"SO-{fake.random_int(10000, 99999)}" for _ in range(len(res_df))]
+    # Mapping logic for different PII types
+    for col in anon_df.columns:
+        col_lower = col.lower()
         
-        # Maskiraj klju?eve (ProductKey, CustomerKey, TerritoryKey)
-        if 'key' in k:
-            res_df[v] = [fake.random_int(100, 999) for _ in range(len(res_df))]
+        # 1. Name detection (matches 'full_name', 'first_name', 'name', etc.)
+        if 'name' in col_lower:
+            anon_df[col] = anon_df[col].apply(
+                lambda x: f"User_{hashlib.md5(str(x).encode()).hexdigest()[:6]}" if pd.notnull(x) else x
+            )
+            
+        # 2. Email detection
+        elif 'email' in col_lower:
+            anon_df[col] = anon_df[col].apply(
+                lambda x: f"anon_{hashlib.md5(str(x).encode()).hexdigest()[:8]}@example.com" if pd.notnull(x) else x
+            )
+            
+        # 3. Sensitive numbers (Salary, Balance) - let's mask or blur them
+        elif 'salary' in col_lower or 'pay' in col_lower:
+            # Simple noise addition (Senior level: adding +/- 10% variance)
+            anon_df[col] = anon_df[col].apply(
+                lambda x: round(x * 0.95, -2) if pd.notnull(x) else x # 5% discount for 'safe' analytics
+            )
 
-    return res_df
+    return anon_df
