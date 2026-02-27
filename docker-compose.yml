@@ -9,6 +9,9 @@ services:
       POSTGRES_DB: anonify_db
     ports:
       - "5433:5432"
+    volumes:
+      # This mapping is the key to loading data automatically
+      - ./01_adventureworks.sql:/docker-entrypoint-initdb.d/01_adventureworks.sql
 
   # Batch/Script servis
   app:

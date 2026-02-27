@@ -1,198 +1,139 @@
 import streamlit as st
 import pandas as pd
-import os
-import sys
-import psycopg2
-import logging
-
-# 1. Page configuration must be the first Streamlit command
-st.set_page_config(page_title="AnonifyDB Dashboard", layout="wide")
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Add project root to sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
+from src.database.db_manager import DBManager
 from src.engine.anonify_engine import anonymize_dataframe
+from src.database.db_manager import DBManager
+import os
 
-# --- Helper Functions ---
+# Initialize DB Manager
+db = DBManager()
 
-# @st.cache_data
-def convert_df_to_csv(df):
-    """Cache the conversion to prevent browser crashes on re-renders."""
-    return df.to_csv(index=False).encode('utf-8')
-
-def check_db_connection():
-    """Check if PostgreSQL container is reachable."""
-    try:
-        conn = psycopg2.connect(
-            host="db",
-            database="anonify_db",
-            user="user",
-            password="password",
-            connect_timeout=1
-        )
-        conn.close()
-        return True
-    except:
-        return False
-
-# Localization mapping
-LANG_MAP = {
-    "en_US": {
-        "metrics_total": "Total Processed",
-        "metrics_market": "Target Market",
-        "chart_title": "Salary Distribution",
-        "db_btn": "Export to PostgreSQL",
-        "success_msg": "Data successfully saved!"
-    },
-    "de_DE": {
-        "metrics_total": "Gesamt verarbeitet",
-        "metrics_market": "Zielmarkt",
-        "chart_title": "Gehaltsverteilung",
-        "db_btn": "Export nach PostgreSQL",
-        "success_msg": "Daten erfolgreich gespeichert!"
-    }
-}
-
-# --- Sidebar ---
-st.sidebar.title("AnonifyDB Settings")
-if check_db_connection():
-    st.sidebar.success("Database Online")
-else:
-    st.sidebar.error("Database Offline")
-
-selected_locale = st.sidebar.selectbox("Target Locale", ["en_US", "de_DE"], index=1)
-ascii_mode = st.sidebar.toggle("Convert to ASCII", value=True)
-is_deterministic = st.sidebar.toggle("Deterministic Mapping", value=True)
-
-# File selection
-data_dir = "/app/data/input"
-available_files = [f for f in os.listdir(data_dir) if f.endswith(('.json', '.csv'))] if os.path.exists(data_dir) else []
-selected_file = st.sidebar.selectbox("Choose a source file:", ["None"] + available_files)
-
-# --- Main UI ---
+st.set_page_config(page_title="AnonifyDB", layout="wide")
 st.title("AnonifyDB - Data Engineering Tool")
 
-if 'result_df' not in st.session_state:
-    st.session_state.result_df = None
+# --- SIDEBAR: Data Source Selection ---
+st.sidebar.header("Data Source Settings")
+source_mode = st.sidebar.radio("Select Input Type:", ["CSV Files", "PostgreSQL Database"])
 
-if selected_file != "None":
-    file_path = os.path.join(data_dir, selected_file)
-    try:
-        # Load file with robust encoding handling
-        if file_path.endswith('.json'):
-            df = pd.read_json(file_path)
+df = None # Initializing the dataframe holder
+DATA_FOLDER = "data/input"
+
+if source_mode == "CSV Files":
+    st.sidebar.subheader("Local Container Files")
+
+    # Check if directory exists inside the container
+    if os.path.exists(DATA_FOLDER):
+        # List only CSV files from the container's directory
+        files = [f for f in os.listdir(DATA_FOLDER) if f.endswith('.csv')]
+
+        if files:
+            # Create a dropdown menu with available files
+            selected_file = st.sidebar.selectbox("Select a file from /data/input:", files)
+
+            # Full path for pandas to read
+            file_path = os.path.join(DATA_FOLDER, selected_file)
+
+            if st.sidebar.button("Load Selected File"):
+                # Load the file directly into session state
+                st.session_state['current_df'] = pd.read_csv(file_path, encoding_errors='replace')
+                st.sidebar.success(f"Loaded: {selected_file}")
         else:
-            # Pandas koristi 'encoding_errors' umesto 'errors' u novijim verzijama
-            # 'on_bad_lines' preskace redove koji su strukturno neispravni
-            df = pd.read_csv(
-                file_path, 
-                encoding='utf-8', 
-                encoding_errors='replace', 
-                on_bad_lines='warn'
-            )
+            st.sidebar.warning("No CSV files found in /app/data/input")
+    else:
+        st.sidebar.error(f"Directory not found: {DATA_FOLDER}")
+else:
+    # --- DATABASE MODE LOGIC ---
+    if source_mode == "PostgreSQL Database":
+        st.sidebar.subheader("Database Explorer")
 
-        @st.cache_data
-        def get_anonymized_data(df, locale, ascii_mode, is_deterministic):
-            # Ova funkcija ce se izvrsiti SAMO ako se promeni fajl ili neki od parametara
-            return anonymize_dataframe(df, locale, ascii_mode, is_deterministic)
+        try:
+            # 1. Get all schemas (Person, Sales, Production, etc.)
+            schemas = db.get_all_schemas()
 
+            # Pre-select 'public' or 'person' if they exist
+            default_schema_index = schemas.index('person') if 'person' in schemas else 0
+            selected_schema = st.sidebar.selectbox("Choose Schema:", schemas, index=default_schema_index)
+
+            # 2. Get tables for the selected schema
+            tables = db.get_tables_in_schema(selected_schema)
+
+            if tables:
+                selected_table = st.sidebar.selectbox("Choose Table:", tables)
+
+                if st.sidebar.button("Load Table Data"):
+                    with st.spinner(f"Fetching data from {selected_schema}.{selected_table}..."):
+                        # Load directly into session state
+                        st.session_state['current_df'] = db.read_table(selected_table, selected_schema)
+                        st.sidebar.success(f"Loaded {len(st.session_state['current_df'])} rows!")
+            else:
+                st.sidebar.warning("No tables found in this schema.")
+
+        except Exception as e:
+            st.sidebar.error("Could not connect to database.")
+            st.sidebar.info("Make sure the 'db' container is running and healthy.")
+
+# --- MAIN CONTENT AREA ---
+if 'current_df' in st.session_state:
+    working_df = st.session_state['current_df']
+
+    tab1, tab2 = st.tabs(["Original Data", "Anonymized Preview"])
+
+    with tab1:
+        st.subheader("Raw Data Preview")
+        st.dataframe(working_df.head(100))
+
+    with tab2:
+        col1, col2 = st.columns(2)
+        with col1:
+            is_deterministic = st.checkbox("Deterministic Mode", value=True)
+        with col2:
+            st.write("") # Placeholder for alignment
 
         if st.button("Run Anonymization Engine"):
-            # Pozivamo engine direktno bez kesa za ovaj test
-            st.session_state.result_df = anonymize_dataframe(df, selected_locale, ascii_mode, is_deterministic)
-            # Forsiramo Streamlit da ponovo iscrta sve sa novim podacima
+            # The same engine you built!
+            result = anonymize_dataframe(working_df, is_deterministic=is_deterministic)
+            st.session_state['result_df'] = result
             st.rerun()
 
-        # Display dashboard if data exists
-        if st.session_state.result_df is not None:
-            res_df = st.session_state.result_df
-            ui_text = LANG_MAP.get(selected_locale, LANG_MAP["en_US"])
-            
-            # --- TABS SECTION ---
-            tab1, tab2 = st.tabs(["Original Input", "Anonymized Data"])
+        if 'result_df' in st.session_state:
+            st.subheader("Anonymized Results")
+            st.dataframe(st.session_state['result_df'].head(100))
 
-            with tab1:
-                st.dataframe(df)
+            # Additional DB functionality if in Database mode
+            if source_mode == "PostgreSQL Database":
+                st.divider()
+                st.subheader("Database Export")
+                if st.button("Push Anonymized Data to 'anon' Schema"):
+                    success = db.save_anonymized_table(
+                        st.session_state['result_df'],
+                        f"anon_{selected_table}"
+                    )
+                    if success:
+                        st.success(f"Table 'anon_{selected_table}' created successfully!")
 
-            with tab2:
-                # Proveravamo da li rezultat uopste postoji u session_state
-                if "result_df" in st.session_state and st.session_state.result_df is not None:
-                    if not st.session_state.result_df.empty:
-                        st.dataframe(st.session_state.result_df)
-                    else:
-                        st.warning("The anonymized dataframe is empty.")
-                else:
-                    st.info("Click 'Run Anonymization Engine' to see results.")
-
-            # --- DOWNLOAD SECTION ---
-            st.divider()
-            csv_data = convert_df_to_csv(res_df)
-            
-            d_col1, d_col2 = st.columns([1, 2])
-            with d_col1:
-                st.download_button(
-                    label="?? Download CSV Export",
-                    data=csv_data,
-                    file_name="anonify_export.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key="download_action_btn"
+# Check if we have results to save
+if 'result_df' in st.session_state and source_mode == "PostgreSQL Database":
+    st.divider()
+    st.subheader("?? Database Export")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        target_table_name = st.text_input("Target Table Name:", f"anon_{selected_table}")
+    
+    with col2:
+        st.write("##") # Spacer
+        if st.button("Push to Database", use_container_width=True):
+            with st.spinner("Writing to 'anon' schema..."):
+                # Call our DBManager to save the data
+                success = db.save_anonymized_table(
+                    st.session_state['result_df'], 
+                    target_table_name,
+                    target_schema='anon' # This is where the magic happens
                 )
-            with d_col2:
-                st.info("Download includes all masked columns. Conversion is cached for performance.")
-
-            # --- ANALYTICS SECTION ---
-            st.subheader(f"?? {ui_text['chart_title']}")
-            m_col1, m_col2, m_col3 = st.columns(3)
-            m_col1.metric(ui_text["metrics_total"], f"{len(res_df)}")
-            m_col2.metric(ui_text["metrics_market"], selected_locale)
-            m_col3.metric("DB Status", "Online" if check_db_connection() else "Offline")
-
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button(ui_text["db_btn"]):
-                    try:
-                        conn = psycopg2.connect(host="db", database="anonify_db", user="user", password="password")
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            CREATE TABLE IF NOT EXISTS anonymized_data (
-                                id SERIAL PRIMARY KEY,
-                                full_name TEXT,
-                                email TEXT,
-                                salary_range TEXT,
-                                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                            );
-                        """)
-                        for _, row in res_df.iterrows():
-                            s_bucket = row.get('salary_bucket', row.get('salary_status', 'N/A'))
-                            cursor.execute("""
-                                INSERT INTO anonymized_data (full_name, email, salary_range)
-                                VALUES (%s, %s, %s)
-                            """, (row['full_name'], row['email'], s_bucket))
-                        conn.commit()
-                        conn.close()
-                        st.success(ui_text["success_msg"])
-                    except Exception as e:
-                        st.error(f"DB Export Error: {e}")
-
-            with col2:
-                # Standardized order for DACH salary buckets
-                order = [
-                    f"< 50.000 \u20ac",
-                    f"50.000 \u20ac - 100.000 \u20ac",
-                    f"100.000 \u20ac - 150.000 \u20ac",
-                    f"> 150.000 \u20ac"
-                ]
-                target_col = 'salary_bucket' if 'salary_bucket' in res_df.columns else 'salary_status'
-                if target_col in res_df.columns:
-                    st.bar_chart(res_df[target_col].value_counts().reindex(order).fillna(0))
-
-    except Exception as e:
-        st.error(f"Application Error: {e}")
-
-st.markdown("---")
-st.caption("AnonifyDB v1.0 | Data Engineering Portfolio | Built by Ljubomir")
+                
+                if success:
+                    st.success(f"? Success! Table '{target_table_name}' is now in 'anon' schema.")
+                    st.balloons()
+                else:
+                    st.error("? Failed to save data to database.")
