@@ -1,5 +1,7 @@
+version: '3.8'
+
 services:
-  # Baza podataka na koju se engine oslanja
+  # 1. PostgreSQL Database
   db:
     image: postgres:15
     container_name: anonify_db
@@ -10,21 +12,16 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      # This mapping is the key to loading data automatically
-      - ./01_adventureworks.sql:/docker-entrypoint-initdb.d/01_adventureworks.sql
+      # Putanja potvrdjena sa slike tvoje strukture foldera
+      - ./docker/db/init/01_adventureworks.sql:/docker-entrypoint-initdb.d/01_adventureworks.sql
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d anonify_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  # Batch/Script servis
-  app:
-    build: .
-    container_name: anonify_app
-    volumes:
-      - .:/app
-    environment:
-      - DB_HOST=db
-    depends_on:
-      - db
-
-  # Streamlit Web UI
+  # 2. Streamlit Web UI
   ui:
     build: .
     container_name: anonify_ui
@@ -33,5 +30,18 @@ services:
       - .:/app
     ports:
       - "8501:8501"
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=anonify_db
+      - DB_USER=user
+      - DB_PASS=password
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    # Crucial for local AI (Ollama) connectivity
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  postgres_data:

@@ -1,7 +1,9 @@
+venv/
 __pycache__/
 *.pyc
+postgres_data/
 .env
-venv/
-.vscode/
-data/output/*
-!data/output/.gitkeep
+*.tar.gz
+*.zip
+data/input/*
+!data/input/.gitkeep

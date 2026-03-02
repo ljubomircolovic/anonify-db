@@ -1,10 +1,21 @@
-Faker==40.1.2
-python-dotenv==1.2.1
-PyYAML==6.0.3
-Unidecode==1.4.0
+# --- Core Application ---
+streamlit
 pandas
 openpyxl
-streamlit
-sqlalchemy
+python-dotenv
+PyYAML
+
+# --- Database ---
 sqlalchemy
 psycopg2-binary
+
+# --- AI & Agents ---
+langchain
+langchain-community
+langchain-core
+langchain-openai
+pydantic
+
+# --- Data Generation & Processing ---
+Faker
+Unidecode
