@@ -2,7 +2,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 import os
 import re
-
+import json
 class DBManager:
     """
     Handles database connections and operations for reading source data
@@ -14,6 +14,9 @@ class DBManager:
             "postgresql://user:password@db:5432/anonify_db"
         )
         self.engine = create_engine(self.db_url)
+
+        # Pozivamo kreiranje metadata tabele pri svakom paljenju aplikacije
+        self._init_metadata_table()
 
     def get_all_schemas(self):
         inspector = inspect(self.engine)
@@ -105,14 +108,14 @@ class DBManager:
         import numpy as np
 
         anonymized_df = df.copy()
-        
+
         for item in plan:
             col = item['column']
             strategy = item['strategy'].lower()
-            
+
             if col not in anonymized_df.columns:
                 continue
-                
+
             if strategy == 'hash':
                 # Deterministic hashing with Salt
                 anonymized_df[col] = anonymized_df[col].apply(
@@ -127,32 +130,48 @@ class DBManager:
                     # Apply +/- 10% random noise
                     noise = np.random.uniform(0.9, 1.1, size=len(anonymized_df))
                     anonymized_df[col] = (anonymized_df[col] * noise).round(2)
-        
-        return anonymized_df
-        import hashlib
-        import numpy as np
-
-        anonymized_df = df.copy()
-
-        for item in plan:
-            col = item['column']
-            strategy = item['strategy'].lower()
-
-            if col not in anonymized_df.columns:
-                continue
-
-            if strategy == 'hash':
-                anonymized_df[col] = anonymized_df[col].apply(
-                    lambda x: hashlib.sha256(str(x).encode()).hexdigest()[:12] if x else x
-                )
-            elif strategy == 'mask':
-                anonymized_df[col] = anonymized_df[col].apply(
-                    lambda x: self.mask_value(x) if x else x
-                )
-            elif strategy == 'noise':
-                # Dodaje +/- 10% varijacije na numericke podatke (plata)
-                if pd.api.types.is_numeric_dtype(anonymized_df[col]):
-                    noise = np.random.uniform(0.9, 1.1, size=len(anonymized_df))
-                    anonymized_df[col] = (anonymized_df[col] * noise).round(2)
 
         return anonymized_df
+
+    def _init_metadata_table(self):
+        """Creates the metadata schema and ai_plans table."""
+        from sqlalchemy import text # Ensure 'sqlalchemy' is spelled correctly
+
+        query = """
+        CREATE SCHEMA IF NOT EXISTS metadata;
+        CREATE TABLE IF NOT EXISTS metadata.ai_plans (
+            schema_name TEXT,
+            table_name TEXT,
+            plan_json JSONB,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (schema_name, table_name)
+        );
+        """
+        with self.engine.connect() as conn:
+            conn.execute(text(query))
+            conn.commit()
+
+
+    def save_ai_plan(self, schema, table, plan):
+        """Saves the plan. Ensure 'plan' is converted to list of dicts before calling."""
+        query = text("""
+            INSERT INTO metadata.ai_plans (schema_name, table_name, plan_json, last_updated)
+            VALUES (:schema, :table, :plan, CURRENT_TIMESTAMP)
+            ON CONFLICT (schema_name, table_name)
+            DO UPDATE SET plan_json = EXCLUDED.plan_json, last_updated = CURRENT_TIMESTAMP;
+        """)
+        with self.engine.connect() as conn:
+            conn.execute(query, {"schema": schema, "table": table, "plan": json.dumps(plan)})
+            conn.commit()
+
+    def get_saved_plan(self, schema, table):
+        """Retrieves a saved plan."""
+        query = text("""
+            SELECT plan_json FROM metadata.ai_plans
+            WHERE schema_name = :schema AND table_name = :table;
+        """)
+        with self.engine.connect() as conn:
+            result = conn.execute(query, {"schema": schema, "table": table}).fetchone()
+            if result:
+                return result[0]
+            return None
