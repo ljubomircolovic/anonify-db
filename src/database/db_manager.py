@@ -66,6 +66,8 @@ class DBManager:
         return metadata_package
 
     def apply_anonymization(self, df, plan, salt="default_secret"):
+
+        import hashlib
         import numpy as np
         from faker.providers.person.de_DE import Provider as PersonProvider
         all_names = list(PersonProvider.first_names)
@@ -81,7 +83,9 @@ class DBManager:
                     lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
                 )
             elif strategy == 'mask':
-                anonymized_df[col] = anonymized_df[col].apply(lambda x: self.mask_value(x) if pd.notnull(x) else x)
+                anonymized_df[col] = anonymized_df[col].apply(
+                    lambda x: self.mask_value(x) if pd.notnull(x) else x
+                )
             elif strategy == 'synthetic':
                 def get_fiksni_hans(val):
                     if pd.isnull(val): return val
@@ -91,11 +95,37 @@ class DBManager:
                         return all_names[hash_idx % len(all_names)]
                     return f"anon_{hash_idx % 1000}"
                 anonymized_df[col] = anonymized_df[col].apply(get_fiksni_hans)
+
+            # --- NOVO: DETERMINISTI?KI NOISE ---
             elif strategy == 'noise':
                 if pd.api.types.is_numeric_dtype(anonymized_df[col]):
-                    noise = np.random.uniform(0.9, 1.1, size=len(anonymized_df))
-                    anonymized_df[col] = (anonymized_df[col] * noise).round(2)
+                    def get_stable_noise(val):
+                        if pd.isnull(val): return val
+                        # Pravimo procenat šuma na osnovu hasha (izme?u -10% i +10%)
+                        combined = f"{val}{salt}".encode()
+                        h = int(hashlib.md5(combined).hexdigest()[:8], 16)
+                        noise_percent = 0.9 + (h % 200) / 1000.0 # 0.900 do 1.100
+                        return round(val * noise_percent, 2)
+                    anonymized_df[col] = anonymized_df[col].apply(get_stable_noise)
+
+            # --- NOVO: DATE SHIFTING ---
+            elif strategy == 'date_shift' or (strategy == 'keep' and "date" in col.lower()):
+                try:
+                    anonymized_df[col] = pd.to_datetime(anonymized_df[col])
+                    def shift_date(val):
+                        if pd.isnull(val): return val
+                        combined = f"{val}{salt}".encode()
+                        h = int(hashlib.md5(combined).hexdigest()[:8], 16)
+                        days_to_shift = (h % 7) - 3 # Pomera od -3 do +3 dana
+                        return val + pd.Timedelta(days=days_to_shift)
+                    anonymized_df[col] = anonymized_df[col].apply(shift_date)
+                except:
+                    pass # Ako nije pravi datum, ostavi kako jeste
+
         return anonymized_df
+
+
+
 
     def _init_metadata_table(self):
         query = """

@@ -17,5 +17,5 @@ langchain-openai
 pydantic
 
 # --- Data Generation & Processing ---
-Faker
 Unidecode
+faker==24.0.0
