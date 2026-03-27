@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 from src.database.db_manager import DBManager
@@ -111,14 +112,14 @@ if 'current_df' in st.session_state:
 
 
 
-        tab1, tab2, tab3 = st.tabs(["Data Explorer", "Execution", "Comparison"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Data Explorer", "Execution", "Comparison", "Audit Log"])
 
         with tab1:
             st.dataframe(st.session_state['current_df'].head(100))
 
         with tab2:
             if 'ai_analysis' in st.session_state:
-                st.subheader("??? Review & Finalize Plan")
+                st.subheader("🛠️ Review & Finalize Plan")
 
                 # 1. PRIPREMA PODATAKA ZA EDITOR
                 if isinstance(st.session_state['ai_analysis'], dict):
@@ -159,21 +160,21 @@ if 'current_df' in st.session_state:
 
                 st.write(f"**Current Privacy Score: {privacy_score}%**")
                 if privacy_score < 40:
-                    st.error(f"?? **Low Protection** - Sensitive data might be exposed! Score: {privacy_score}%")
+                    st.error(f"🔴 **Low Protection** - Sensitive data might be exposed! Score: {privacy_score}%")
                 elif privacy_score < 75:
-                    st.warning(f"?? **Balanced Protection** - Good for internal testing. Score: {privacy_score}%")
+                    st.warning(f"🟡 **Balanced Protection** - Good for internal testing. Score: {privacy_score}%")
                 else:
-                    st.success(f"?? **High Protection** - Data is well obfuscated. Score: {privacy_score}%")
+                    st.success(f"🟢 **High Protection** - Data is well obfuscated. Score: {privacy_score}%")
 
                 st.progress(privacy_score / 100)
 
                 st.divider()
 
-                # 5. AKCIONI DUGMI?I
+                # 5. AKCIONI DUGMIÄ†I
                 col_exec, col_save = st.columns(2)
 
                 with col_exec:
-                    if st.button("?? Run Anonymization", width="stretch"):
+                    if st.button("🚀 Run Anonymization", width="stretch"):
                         with st.spinner("Processing data..."):
                             table_name, schema_name = st.session_state['selected_table_info']
                             current_salt = st.session_state.get('salt_input', 'default_salt')
@@ -185,14 +186,24 @@ if 'current_df' in st.session_state:
                             st.session_state['last_run_notes'] = list(set(notes))
 
                             db.save_anonymized_table(anon_df, table_name, target_schema='anon')
-                            st.success(f"? Data processed and saved to 'anon.{table_name}'")
+
+                            st.success(f"✅ Data processed and saved to 'anon.{table_name}'")
+
+                            db.log_action(
+                                user="Ljubomir (Admin)",
+                                schema=schema_name,
+                                table=table_name,
+                                score=privacy_score,
+                                salt=current_salt
+                            )
+                            st.success(f"✅ Data processed and logged!")
 
                 with col_save:
-                    if st.button("?? Save Plan in DB", width="stretch", type="primary"):
+                    if st.button("💾 Save Plan in DB", width="stretch", type="primary"):
                         with st.spinner("Saving configuration..."):
                             table_name, schema_name = st.session_state['selected_table_info']
                             db.save_ai_plan(schema_name, table_name, plan_data)
-                            st.success(f"? Configuration for '{table_name}' saved to metadata!")
+                            st.success(f"✅ Configuration for '{table_name}' saved to metadata!")
 
                 # 6. PRIKAZ NOTIFIKACIJA (Referencijalni integritet)
                 if 'last_run_notes' in st.session_state:
@@ -201,12 +212,12 @@ if 'current_df' in st.session_state:
                         st.info(n)
 
             else:
-                st.warning("?? Please load columns in Tab 1 (Manual or AI Scan) first.")
+                st.warning("âš ï¸� Please load columns in Tab 1 (Manual or AI Scan) first.")
 
 
 
         with tab3:
-            st.subheader("Comparison View")
+            st.subheader("🔍 Side-by-Side Comparison")
 
             current_salt = st.session_state.get('salt_input', 'default_salt')
 
@@ -228,25 +239,24 @@ if 'current_df' in st.session_state:
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.write("**Original Data**")
+                        st.write("**📄 Original Data**")
                         st.dataframe(raw_sample)
                     with col2:
-                        st.write(f"**Anonymized (Salt: {current_salt})**")
-                        # Sada je anonymized_sample ?ist DataFrame
+                        st.write(f"**🛡️ Anonymized (Salt: {current_salt})**")
+                        # Sada je anonymized_sample Ä�ist DataFrame
                         st.dataframe(anonymized_sample)
 
                     # --- NOVO: EXPORT SEKCIJA ---
                     st.divider()
                     st.subheader("Export Result")
 
-                    # Dugme za procesiranje CELE tabele za download (ne samo head(10))
                     if st.button("Prepare Full Download (CSV)"):
                         with st.spinner("Generating full anonymized file..."):
                             full_df = db.read_table(table_name, schema_name)
                             # --- IZMENA 3: Ponovo otpakivanje za punu tabelu ---
                             full_anon, _ = db.apply_anonymization(full_df, current_plan_data, salt=current_salt)
 
-                            csv = full_anon.to_csv(index=False).encode('utf-8')
+                            csv = full_anon.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
 
                             st.download_button(
                                 label="Download Anonymized CSV",
@@ -256,7 +266,11 @@ if 'current_df' in st.session_state:
                             )
 
 
-
+        with tab4:
+            st.subheader("📜 Audit History")
+            query = "SELECT * FROM metadata.audit_log ORDER BY execution_time DESC LIMIT 50"
+            log_df = pd.read_sql(query, db.engine)
+            st.dataframe(log_df, width="stretch")
 
 
     else:

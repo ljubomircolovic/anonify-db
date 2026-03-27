@@ -11,6 +11,12 @@ class DBManager:
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
         )
+
+        self.engine = create_engine(
+        self.db_url,
+        connect_args={'client_encoding': 'utf8'}
+        )
+
         self.engine = create_engine(self.db_url)
         self.fake = Faker(['de_DE', 'en_US'])
         self._init_metadata_table()
@@ -68,7 +74,7 @@ class DBManager:
     def get_global_mapping(self, col_name, orig_val, salt):
         """Proverava da li vec imamo anonimizovanu vrednost za ovaj ID i Salt."""
         query = text("""
-            SELECT anonymized_value FROM metadata.global_id_mapping 
+            SELECT anonymized_value FROM metadata.global_id_mapping
             WHERE column_name = :c AND original_value = :o AND salt_used = :s
         """)
         try:
@@ -192,6 +198,16 @@ class DBManager:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (column_name, original_value, salt_used)
         );
+        CREATE TABLE IF NOT EXISTS metadata.audit_log (
+            id SERIAL PRIMARY KEY,
+            execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_name TEXT,
+            schema_name TEXT,
+            table_name TEXT,
+            privacy_score INTEGER,
+            salt_used TEXT,
+            status TEXT
+        );
         """
         try:
             with self.engine.connect() as conn:
@@ -238,3 +254,19 @@ class DBManager:
                 result = conn.execute(query, {"s": schema, "t": table}).fetchone()
                 return result[0] if result else None
         except: return None
+
+    def log_action(self, user, schema, table, score, salt, status="SUCCESS"):
+        """Upisuje detalje o izvrsenoj anonimizaciji u bazu."""
+        query = text("""
+            INSERT INTO metadata.audit_log (user_name, schema_name, table_name, privacy_score, salt_used, status)
+            VALUES (:u, :s, :t, :score, :salt, :status)
+        """)
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(query, {
+                    "u": user, "s": schema, "t": table,
+                    "score": score, "salt": salt, "status": status
+                })
+                conn.commit()
+        except Exception as e:
+            print(f"Logging error: {e}")
