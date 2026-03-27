@@ -14,6 +14,7 @@ langchain
 langchain-community
 langchain-core
 langchain-openai
+langchain-ollama
 pydantic
 
 # --- Data Generation & Processing ---

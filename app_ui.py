@@ -74,7 +74,7 @@ if source_mode == "PostgreSQL Database":
 # --- MAIN CONTENT ---
 if 'current_df' in st.session_state:
     if 'ai_analysis' in st.session_state:
-        plan_df = pd.DataFrame([p.dict() for p in st.session_state['ai_analysis'].plan])
+        plan_df = pd.DataFrame([p.model_dump() for p in st.session_state['ai_analysis'].plan])
 
         st.write("### Anonymization Plan Editor")
 
@@ -104,7 +104,7 @@ if 'current_df' in st.session_state:
         edited_plan_df = st.data_editor(
             plan_df,
             column_config=column_config,
-            use_container_width=True,
+            width="stretch",
             key=unique_key,  # <--- Ovo je klju?na promena
             hide_index=True
         )
@@ -118,13 +118,19 @@ if 'current_df' in st.session_state:
 
         with tab2:
             if 'ai_analysis' in st.session_state:
-                st.subheader("Review & Finalize Plan")
+                st.subheader("??? Review & Finalize Plan")
 
-                plan_df = pd.DataFrame([p.dict() for p in st.session_state['ai_analysis'].plan])
+                # 1. PRIPREMA PODATAKA ZA EDITOR
+                if isinstance(st.session_state['ai_analysis'], dict):
+                    plan_df = pd.DataFrame(st.session_state['ai_analysis'].get('plan', []))
+                else:
+                    plan_df = pd.DataFrame([p.model_dump() for p in st.session_state['ai_analysis'].plan])
+
                 edited_plan_df = st.data_editor(
                     plan_df,
                     column_config={
                         "column": st.column_config.TextColumn("Database Column", disabled=True),
+                        "type": st.column_config.TextColumn("Data Type", disabled=True),
                         "strategy": st.column_config.SelectboxColumn(
                             "Strategy",
                             options=["keep", "mask", "hash", "noise", "synthetic", "date_shift"],
@@ -132,42 +138,70 @@ if 'current_df' in st.session_state:
                         )
                     },
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                     key="plan_editor"
                 )
 
+                plan_data = edited_plan_df.to_dict('records')
+                total_cols = len(plan_data)
+                score_points = 0
+
+                for col in plan_data:
+                    strat = str(col['strategy']).lower()
+                    if strat in ['synthetic', 'hash']:
+                        score_points += 100
+                    elif strat in ['mask', 'noise', 'date_shift']:
+                        score_points += 50
+                    else:
+                        score_points += 0 # keep
+
+                privacy_score = int(score_points / total_cols) if total_cols > 0 else 0
+
+                st.write(f"**Current Privacy Score: {privacy_score}%**")
+                if privacy_score < 40:
+                    st.error(f"?? **Low Protection** - Sensitive data might be exposed! Score: {privacy_score}%")
+                elif privacy_score < 75:
+                    st.warning(f"?? **Balanced Protection** - Good for internal testing. Score: {privacy_score}%")
+                else:
+                    st.success(f"?? **High Protection** - Data is well obfuscated. Score: {privacy_score}%")
+
+                st.progress(privacy_score / 100)
+
                 st.divider()
+
+                # 5. AKCIONI DUGMI?I
                 col_exec, col_save = st.columns(2)
 
                 with col_exec:
-                    if st.button("Run Anonymization", use_container_width=True):
+                    if st.button("?? Run Anonymization", width="stretch"):
                         with st.spinner("Processing data..."):
                             table_name, schema_name = st.session_state['selected_table_info']
-                            final_plan_data = edited_plan_df.to_dict('records')
+                            current_salt = st.session_state.get('salt_input', 'default_salt')
 
                             full_df = db.read_table(table_name, schema_name)
 
-                            anon_df, notes = db.apply_anonymization(full_df, final_plan_data, salt=current_salt)
+                            anon_df, notes = db.apply_anonymization(full_df, plan_data, salt=current_salt)
 
                             st.session_state['last_run_notes'] = list(set(notes))
 
                             db.save_anonymized_table(anon_df, table_name, target_schema='anon')
-                            st.success(f"Data processed and saved to 'anon.{table_name}'")
-
-            if 'last_run_notes' in st.session_state:
-                for n in st.session_state['last_run_notes']:
-                    st.info(n)
+                            st.success(f"? Data processed and saved to 'anon.{table_name}'")
 
                 with col_save:
-                    if st.button("Save/Update Plan in DB", use_container_width=True, type="primary"):
+                    if st.button("?? Save Plan in DB", width="stretch", type="primary"):
                         with st.spinner("Saving configuration..."):
                             table_name, schema_name = st.session_state['selected_table_info']
-                            final_plan_data = edited_plan_df.to_dict('records')
+                            db.save_ai_plan(schema_name, table_name, plan_data)
+                            st.success(f"? Configuration for '{table_name}' saved to metadata!")
 
-                            db.save_ai_plan(schema_name, table_name, final_plan_data)
-                            st.success(f"Configuration for '{table_name}' successfully updated in DB!")
+                # 6. PRIKAZ NOTIFIKACIJA (Referencijalni integritet)
+                if 'last_run_notes' in st.session_state:
+                    st.write("---")
+                    for n in st.session_state['last_run_notes']:
+                        st.info(n)
+
             else:
-                st.warning("Please load columns (Manual or AI Scan) first.")
+                st.warning("?? Please load columns in Tab 1 (Manual or AI Scan) first.")
 
 
 
