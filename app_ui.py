@@ -146,10 +146,17 @@ if 'current_df' in st.session_state:
                             final_plan_data = edited_plan_df.to_dict('records')
 
                             full_df = db.read_table(table_name, schema_name)
-                            anon_df = db.apply_anonymization(full_df, final_plan_data, salt=current_salt)
+
+                            anon_df, notes = db.apply_anonymization(full_df, final_plan_data, salt=current_salt)
+
+                            st.session_state['last_run_notes'] = list(set(notes))
 
                             db.save_anonymized_table(anon_df, table_name, target_schema='anon')
                             st.success(f"Data processed and saved to 'anon.{table_name}'")
+
+            if 'last_run_notes' in st.session_state:
+                for n in st.session_state['last_run_notes']:
+                    st.info(n)
 
                 with col_save:
                     if st.button("Save/Update Plan in DB", use_container_width=True, type="primary"):
@@ -177,7 +184,13 @@ if 'current_df' in st.session_state:
                 raw_sample = db.read_table(table_name, schema_name).head(10)
 
                 if not raw_sample.empty:
-                    anonymized_sample = db.apply_anonymization(raw_sample, current_plan_data, salt=current_salt)
+                    # --- IZMENA 1: Otpakivanje (df, notes) ---
+                    anonymized_sample, comparison_notes = db.apply_anonymization(raw_sample, current_plan_data, salt=current_salt)
+
+                    # --- IZMENA 2: Prikaz notifikacija o integritetu ---
+                    if comparison_notes:
+                        for n in set(comparison_notes):
+                            st.info(n)
 
                     col1, col2 = st.columns(2)
                     with col1:
@@ -185,6 +198,7 @@ if 'current_df' in st.session_state:
                         st.dataframe(raw_sample)
                     with col2:
                         st.write(f"**Anonymized (Salt: {current_salt})**")
+                        # Sada je anonymized_sample ?ist DataFrame
                         st.dataframe(anonymized_sample)
 
                     # --- NOVO: EXPORT SEKCIJA ---
@@ -195,7 +209,8 @@ if 'current_df' in st.session_state:
                     if st.button("Prepare Full Download (CSV)"):
                         with st.spinner("Generating full anonymized file..."):
                             full_df = db.read_table(table_name, schema_name)
-                            full_anon = db.apply_anonymization(full_df, current_plan_data, salt=current_salt)
+                            # --- IZMENA 3: Ponovo otpakivanje za punu tabelu ---
+                            full_anon, _ = db.apply_anonymization(full_df, current_plan_data, salt=current_salt)
 
                             csv = full_anon.to_csv(index=False).encode('utf-8')
 
