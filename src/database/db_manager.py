@@ -11,13 +11,10 @@ class DBManager:
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
         )
-
         self.engine = create_engine(
-        self.db_url,
-        connect_args={'client_encoding': 'utf8'}
+            self.db_url,
+            connect_args={'client_encoding': 'utf8'}
         )
-
-        self.engine = create_engine(self.db_url)
         self.fake = Faker(['de_DE', 'en_US'])
         self._init_metadata_table()
 
@@ -41,6 +38,7 @@ class DBManager:
         try:
             with self.engine.connect() as conn:
                 conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
+                conn.execute(text(f"SET client_encoding TO 'UTF8'"))
                 conn.commit()
             df.to_sql(table_name, self.engine, schema=target_schema, if_exists='replace', index=False)
             return True
@@ -216,44 +214,48 @@ class DBManager:
         except Exception as e:
             print(f"Metadata init error: {e}")
 
-    def save_ai_plan(self, schema, table, plan):
+    def save_ai_plan(self, schema_name, table_name, plan_data):
+        """Saves the entire plan as a single JSON in the plan_json column."""
         query = text("""
             INSERT INTO metadata.ai_plans (schema_name, table_name, plan_json, last_updated)
-            VALUES (:schema, :table, :plan, CURRENT_TIMESTAMP)
+            VALUES (:s, :t, :p, CURRENT_TIMESTAMP)
             ON CONFLICT (schema_name, table_name)
-            DO UPDATE SET plan_json = EXCLUDED.plan_json, last_updated = CURRENT_TIMESTAMP;
+            DO UPDATE SET 
+                plan_json = EXCLUDED.plan_json,
+                last_updated = CURRENT_TIMESTAMP
         """)
-        with self.engine.connect() as conn:
-            conn.execute(query, {"schema": schema, "table": table, "plan": json.dumps(plan)})
-            conn.commit()
-
-    def get_saved_plan(self, schema, table):
-        query = text("SELECT plan_json FROM metadata.ai_plans WHERE schema_name = :s AND table_name = :t")
         try:
             with self.engine.connect() as conn:
-                result = conn.execute(query, {"s": schema, "t": table}).fetchone()
-                return result[0] if result else None
-        except:
+                conn.execute(query, {
+                    "s": schema_name,
+                    "t": table_name,
+                    "p": json.dumps(plan_data) # Pakujemo listu re?nika u JSON
+                })
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"Error saving to plan_json: {e}")
+            return False
+
+    def get_saved_plan(self, schema_name, table_name):
+        """Loads the plan from the plan_json column."""
+        query = text("""
+            SELECT plan_json FROM metadata.ai_plans
+            WHERE schema_name = :s AND table_name = :t
+        """)
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(query, {"s": schema_name, "t": table_name}).fetchone()
+                if result and result[0]:
+                    # Ako je u bazi JSONB, SQLAlchemy ?e ga vratiti kao listu/dict
+                    # Ako je obi?an TEXT, moramo uraditi json.loads
+                    data = result[0]
+                    plan_list = data if isinstance(data, list) else json.loads(data)
+                    return {"plan": plan_list}
+                return None
+        except Exception as e:
+            print(f"Error loading from plan_json: {e}")
             return None
-
-    def save_ai_plan(self, schema, table, plan):
-        query = text("""
-            INSERT INTO metadata.ai_plans (schema_name, table_name, plan_json, last_updated)
-            VALUES (:schema, :table, :plan, CURRENT_TIMESTAMP)
-            ON CONFLICT (schema_name, table_name)
-            DO UPDATE SET plan_json = EXCLUDED.plan_json, last_updated = CURRENT_TIMESTAMP;
-        """)
-        with self.engine.connect() as conn:
-            conn.execute(query, {"schema": schema, "table": table, "plan": json.dumps(plan)})
-            conn.commit()
-
-    def get_saved_plan(self, schema, table):
-        query = text("SELECT plan_json FROM metadata.ai_plans WHERE schema_name = :s AND table_name = :t")
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query, {"s": schema, "t": table}).fetchone()
-                return result[0] if result else None
-        except: return None
 
     def log_action(self, user, schema, table, score, salt, status="SUCCESS"):
         """Upisuje detalje o izvrsenoj anonimizaciji u bazu."""

@@ -1,14 +1,16 @@
+# -*- coding: utf-8 -*-
 import os
 from typing import List, Dict
 from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate  # Updated path
-from langchain_core.output_parsers import PydanticOutputParser # Updated path
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
 
 # 1. Define the structure for the AI response
 class AnonymizationPlan(BaseModel):
     column: str = Field(description="Name of the database column")
-    strategy: str = Field(description="Anonymization strategy: 'hash', 'mask', 'noise', or 'none'")
+    is_pii: bool = Field(default=False, description="True if the column contains sensitive personal data (PII)")
+    strategy: str = Field(description="Anonymization strategy: 'hash', 'mask', 'noise', 'synthetic', or 'none'")
     reason: str = Field(description="Brief explanation in English why this strategy was chosen")
 
 class PrivacyAnalysis(BaseModel):
@@ -35,19 +37,29 @@ class PrivacyAgent:
 
         CRITICAL RULES:
         1. Identify ALL columns containing PII (Personally Identifiable Information).
-        2. Columns like 'phone_number', 'email', 'salary', 'first_name', 'last_name', and 'birth_date' MUST be flagged.
-        3. Even if the sample is partially masked, you must identify the data category.
-        4. For phone numbers, use the 'mask' strategy.
-        5. For names and emails, use 'hash' or 'mask'.
-        6. For financial data like salary, use 'noise'.
-        7. If no PII is found, set strategy to 'none'.
+
+        2. Set 'is_pii': true for columns like 'phone_number', 'email', 'salary', 'first_name', 'last_name', 'birth_date', 'address'.
+
+        3. If 'is_pii' is true, DO NOT suggest 'keep'. Use 'hash', 'mask', 'synthetic', or 'noise'.
+
+        4. Even if the sample is partially masked, you must identify the data category.
+
+        5. For phone numbers, use the 'mask' strategy.
+
+        6. For names and emails, use 'hash', 'mask' or 'synthetic'.
+
+        7. For financial data like salary, use the 'noise' strategy.
+
+        8. If NO PII is found (e.g. for IDs, timestamps, or status codes), you MUST:
+           - Set 'strategy' to 'keep' (DO NOT use 'none')
+           - Set 'is_pii' to false.
 
         Metadata Package:
         {metadata}
 
         {format_instructions}
 
-        IMPORTANT: Return ONLY valid JSON that matches the format instructions. Do not include any conversational text before or after the JSON.
+        IMPORTANT: Return ONLY valid JSON. Every entry MUST have 'is_pii' and 'strategy' set to one of the allowed values: 'keep', 'hash', 'mask', 'noise', 'synthetic', or 'date_shift'.
         """
 
         prompt = ChatPromptTemplate.from_template(template)
