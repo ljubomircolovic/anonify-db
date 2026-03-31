@@ -14,6 +14,13 @@ def render_sidebar(db, agent):
         st.subheader("🔑 Security")
         st.session_state['salt_input'] = st.text_input("Secret Salt", value="default_salt", type="password")
 
+        st.session_state['selected_locale'] = st.selectbox(
+            "Target Locale",
+            options=["de", "us"],
+            index=0,
+            help="Choose the region for generated names and cities."
+        )
+
         st.divider()
         st.subheader("📂 Data Source")
         source_mode = st.radio("Input Type", ["PostgreSQL Database", "CSV Files"])
@@ -76,7 +83,7 @@ def render_sidebar(db, agent):
                 st.error(f"DB Error: {e}")
 
         st.divider()
-        
+
         # --- PRIKAZ LOGOVA INTEGRITETA ---
 
         with st.expander("🩺 System Integrity", expanded=False):
@@ -85,7 +92,7 @@ def render_sidebar(db, agent):
                     # Umesto st.caption, koristimo st.markdown za bolju kontrolu
                     if "⏩" in log:
                         # Koristimo standardni tekst, bez :gray, da bi bio oštar
-                        st.markdown(f"**{log}**") 
+                        st.markdown(f"**{log}**")
                     elif "🔄" in log:
                         # Plava boja za promene (uočljivije)
                         st.markdown(f":blue[{log}]")

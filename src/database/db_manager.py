@@ -124,93 +124,101 @@ class DBManager:
             pass
         
         
-    def _get_mapping_values(self, category):
-        """Izvlači sve lažne vrednosti za određenu kategoriju iz baze."""
-        query = text("""
-            SELECT fake_value 
-            FROM metadata.mapping_values v
-            JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
-            WHERE c.category_name = :cat
-            ORDER BY fake_value ASC
-        """)
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query, {"cat": category})
-                return [row[0] for row in result]
-        except Exception as e:
-            print(f"Error fetching mapping for {category}: {e}")
-            return []
-
-    def _deterministic_map(self, original_val, mapping_list, salt):
-        """Deterministički bira zamensku vrednost na osnovu hasha originala."""
-        if not mapping_list:
-            return "NO_MAPPING_DATA"
-            
+    def get_mapping_value(self, original_value, category, locale, salt):
         import hashlib
-        # Kreiramo hash od (vrednost + salt)
-        combined = str(original_val) + str(salt)
-        hash_obj = hashlib.sha256(combined.encode())
-        # Pretvaramo u broj i koristimo modulo operaciju da dobijemo index u listi
-        index = int(hash_obj.hexdigest(), 16) % len(mapping_list)
-        return mapping_list[index]
+        with self.engine.connect() as conn:
+            # 1. Uzmi sve dostupne fejk vrednosti za kategoriju i jezik, SORTIRANO
+            query = text("""
+                SELECT v.fake_value 
+                FROM metadata.mapping_values v
+                JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
+                WHERE c.category_name = :cat AND c.locale = :loc
+                ORDER BY v.fake_value ASC
+            """)
+            res = conn.execute(query, {"cat": category, "loc": locale})
+            pool = [row[0] for row in res]
+
+        if not pool:
+            return f"Fake_{category}"
+
+        # 2. Deterministički izbor: hash(original + salt) % dužina_liste
+        combined = f"{original_value}{salt}".encode('utf-8')
+        hash_int = int(hashlib.sha256(combined).hexdigest(), 16)
+        index = hash_int % len(pool)
         
+        return pool[index]
         
+    
 
-
-
-    def apply_anonymization(self, df, plan, salt="default_secret"):
+    def apply_anonymization(self, df, plan, salt="default_secret", locale="de"):
         import hashlib
+        import pandas as pd
         import numpy as np
+        
         anonymized_df = df.copy()
         notifications = [] 
-        cached_mappings = {} # Keširamo mapping liste za brzinu
+        # Keširamo mapping liste: ključ će biti 'category_locale' (npr. 'first_name_de')
+        cached_mappings = {} 
 
         for item in plan:
             col = item['column']
             strategy = item.get('strategy', 'keep').lower()
             if col not in anonymized_df.columns: continue
 
-            # --- 1. NOVA STRATEGIJA: MAPPING (Iz tvojih metadata tabela) ---
+            # --- 1. STRATEGIJA: MAPPING (Sa Locale podrškom) ---
             if strategy == 'mapping':
-                category = "first_name" if any(k in col.lower() for k in ['name', 'first', 'ime']) else "city"
+            
+                category = "first_name"
+                if any(k in col.lower() for k in ['last', 'prezime']): category = "last_name"
+                elif any(k in col.lower() for k in ['city', 'grad', 'mesto']): category = "city"
+                elif any(k in col.lower() for k in ['company', 'firma', 'preduzece']): category = "company_name"
                 
-                if category not in cached_mappings:
-                    cached_mappings[category] = self._get_mapping_values(category) # Metoda koju smo ranije definisali
+                cache_key = f"{category}_{locale}"
                 
-                m_list = cached_mappings[category]
+                if cache_key not in cached_mappings:
+                    cached_mappings[cache_key] = self._get_mapping_values_by_locale(category, locale)
+                
+                m_list = cached_mappings[cache_key]
+                
                 if m_list:
+                    # Ako imamo podatke u bazi (npr. za 'de'), radi mapping
                     anonymized_df[col] = anonymized_df[col].apply(
                         lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x
                     )
-                    notifications.append(f"✅ Column '{col}' mapped using '{category}' from DB.")
+                    notifications.append(f"✅ Column '{col}' mapped using '{category}' ({locale}).")
                 else:
-                    notifications.append(f"⚠️ No DB mapping for '{col}'. Falling back to Hash.")
-                    strategy = 'hash' # Ako je tabela prazna, prebaci na hash
+                    # --- OVO JE TAJ FALLBACK ---
+                    # Ako nema podataka (npr. za 'us'), nemoj da pukneš, nego udri HASH
+                    notifications.append(f"🔄 No '{locale}' data for '{category}'. Applied Hash instead.")
+                    anonymized_df[col] = anonymized_df[col].apply(
+                        lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
+                    )
 
-            # --- 2. TVOJA LOGIKA ZA HASH ---
+            # --- 2. LOGIKA ZA HASH (Ostaje ista) ---
             if strategy == 'hash':
                 anonymized_df[col] = anonymized_df[col].apply(
                     lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
                 )
 
-            # --- 3. TVOJA LOGIKA ZA MASK ---
+            # --- 3. LOGIKA ZA MASK (Ostaje ista) ---
             elif strategy == 'mask':
+                # Pretpostavljam da imaš metodu self.mask_value, ako ne, koristi x.mask(...)
                 anonymized_df[col] = anonymized_df[col].apply(
-                    lambda x: self.mask_value(x) if pd.notnull(x) else x
+                    lambda x: f"***{str(x)[-3:]}" if pd.notnull(x) else x
                 )
 
-            # --- 4. TVOJA LOGIKA ZA NOISE ---
+            # --- 4. LOGIKA ZA NOISE (Deterministički šum) ---
             elif strategy == 'noise':
                 if pd.api.types.is_numeric_dtype(anonymized_df[col]):
                     def get_stable_noise(val):
                         if pd.isnull(val): return val
                         combined = f"{val}{salt}".encode()
                         h = int(hashlib.md5(combined).hexdigest()[:8], 16)
-                        noise_percent = 0.9 + (h % 200) / 1000.0
+                        noise_percent = 0.95 + (h % 100) / 1000.0 # Šum +/- 5%
                         return round(val * noise_percent, 2)
                     anonymized_df[col] = anonymized_df[col].apply(get_stable_noise)
 
-            # --- 5. TVOJA LOGIKA ZA DATE_SHIFT ---
+            # --- 5. LOGIKA ZA DATE_SHIFT ---
             elif strategy == 'date_shift':
                 try:
                     anonymized_df[col] = pd.to_datetime(anonymized_df[col])
@@ -218,16 +226,36 @@ class DBManager:
                         if pd.isnull(val): return val
                         combined = f"{val}{salt}".encode()
                         h = int(hashlib.md5(combined).hexdigest()[:8], 16)
-                        days_to_shift = (h % 7) - 3
+                        days_to_shift = (h % 10) - 5 # Pomeraj +/- 5 dana
                         return val + pd.Timedelta(days=days_to_shift)
                     anonymized_df[col] = anonymized_df[col].apply(shift_date)
                 except: pass
 
         return anonymized_df, notifications
 
+    # --- POMOĆNE METODE KOJE MORAŠ IMATI U DBManager KLASI ---
 
+    def _get_mapping_values_by_locale(self, category, locale):
+        from sqlalchemy import text
+        query = text("""
+            SELECT v.fake_value 
+            FROM metadata.mapping_values v
+            JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
+            WHERE c.category_name = :cat AND c.locale = :loc
+            ORDER BY v.fake_value ASC
+        """)
+        with self.engine.connect() as conn:
+            res = conn.execute(query, {"cat": category, "loc": locale})
+            return [row[0] for row in res]
 
-# ... (prethodne metode: apply_anonymization, itd.)
+    def _deterministic_map(self, original_value, mapping_list, salt):
+        import hashlib
+        if not mapping_list: return original_value
+        combined = f"{original_value}{salt}".encode('utf-8')
+        hash_int = int(hashlib.sha256(combined).hexdigest(), 16)
+        index = hash_int % len(mapping_list)
+        return mapping_list[index]
+
 
     def _init_metadata_table(self):
         query = """
