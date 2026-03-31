@@ -26,12 +26,26 @@ class DBManager:
         inspector = inspect(self.engine)
         return inspector.get_table_names(schema=schema)
 
-    def read_table(self, table_name, schema='public'):
-        query = f'SELECT * FROM "{schema}"."{table_name}"'
+    def read_table(self, table_name, schema_name='public', where_filter=None, limit=None):
+        """?ita tabelu sa opcionim WHERE filterom i LIMIT-om."""
+        # Koristimo navodnike za case-sensitivity u Postgresu
+        query = f'SELECT * FROM "{schema_name}"."{table_name}"'
+
+        # Dodajemo WHERE logiku
+        if where_filter and where_filter.strip():
+            # ?istimo filter u slu?aju da je korisnik slu?ajno upisao "WHERE"
+            clean_filter = where_filter.strip().replace("WHERE ", "").replace("where ", "")
+            query += f" WHERE {clean_filter}"
+
+        # Dodajemo LIMIT logiku
+        if limit:
+            query += f" LIMIT {limit}"
+
         try:
             return pd.read_sql(query, self.engine)
         except Exception as e:
-            print(f"Error reading table {schema}.{table_name}: {e}")
+            print(f"Error reading table {schema_name}.{table_name}: {e}")
+            # Vra?amo prazan DataFrame sa istim kolonama ako je mogu?e, ili potpuno prazan
             return pd.DataFrame()
 
     def save_anonymized_table(self, df, table_name, target_schema='anon'):
@@ -53,6 +67,18 @@ class DBManager:
             parts = s.split("@")
             return f"{parts[0][:2]}**@{parts[1][:2]}**.com"
         return f"{s[:3]}***"
+
+    def get_columns(self, table_name, schema_name='public'):
+        """Vra?a listu naziva kolona za datu tabelu koriste?i SQLAlchemy inspect."""
+        from sqlalchemy import inspect
+        try:
+            inspector = inspect(self.engine)
+            columns = inspector.get_columns(table_name, schema=schema_name)
+            return [col['name'] for col in columns]
+        except Exception as e:
+            print(f"Error fetching columns for {schema_name}.{table_name}: {e}")
+            return []
+
 
     def get_ai_ready_metadata(self, table_name, schema='public', sample_size=5):
         inspector = inspect(self.engine)
@@ -220,7 +246,7 @@ class DBManager:
             INSERT INTO metadata.ai_plans (schema_name, table_name, plan_json, last_updated)
             VALUES (:s, :t, :p, CURRENT_TIMESTAMP)
             ON CONFLICT (schema_name, table_name)
-            DO UPDATE SET 
+            DO UPDATE SET
                 plan_json = EXCLUDED.plan_json,
                 last_updated = CURRENT_TIMESTAMP
         """)

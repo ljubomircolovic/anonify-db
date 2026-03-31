@@ -4,7 +4,12 @@ import pandas as pd
 from src.database.db_manager import DBManager
 from sqlalchemy import text
 import os
+import json
 from src.agents.privacy_agent import PrivacyAgent, PrivacyAnalysis
+
+# Inicijalizacija
+if 'active_tab' not in st.session_state:
+    st.session_state['active_tab'] = 0
 
 db = DBManager()
 agent = PrivacyAgent()
@@ -22,130 +27,174 @@ source_mode = st.sidebar.radio("Select Input Type:", ["CSV Files", "PostgreSQL D
 if source_mode == "PostgreSQL Database":
     try:
         schemas = db.get_all_schemas()
-        selected_schema = st.sidebar.selectbox("Choose Schema:", schemas)
+        # Postavljamo public kao default
+        default_idx = schemas.index('public') if 'public' in schemas else 0
+        selected_schema = st.sidebar.selectbox("Choose Schema:", schemas, index=default_idx)
+
         tables = db.get_tables_in_schema(selected_schema)
 
         if tables:
             selected_table = st.sidebar.selectbox("Choose Table:", tables)
 
-            # --- PROMENA: Proveravamo da li postoji sačuvani plan, ali ga ne učitavamo automatski u memoriju ---
+            # 1. Provera sačuvanog plana
             saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
-
             if saved_plan_data:
                 if st.sidebar.button("📂 Load Saved Plan"):
                     try:
-                        # Mapiramo direktno u Pydantic model
-                        st.session_state['ai_analysis'] = PrivacyAnalysis(**saved_plan_data)
-                        st.sidebar.success("✅ Plan loaded from DB!")
+                        # Ako je sačuvani plan u bazi, učitavamo ga
+                        st.session_state['ai_analysis'] = saved_plan_data
+                        st.session_state['active_tab'] = 1
+                        st.sidebar.success("✅ Plan loaded! Switching to Editor...")
+                        st.rerun()
                     except Exception as e:
                         st.sidebar.error(f"❌ Error parsing saved plan: {e}")
 
+
             st.sidebar.divider()
+            st.sidebar.markdown("🔍 **Data Filtering**")
+
+            # Novo: Expander za filtere
+            with st.sidebar.expander("Filter Options", expanded=False):
+                where_clause = st.text_area(
+                    "WHERE condition:",
+                    placeholder="e.g. status = 'active' AND created_at > '2025-01-01'",
+                    help="Omit the 'WHERE' keyword. Just write the condition."
+                )
+                limit_val = st.number_input("Limit rows:", min_value=1, max_value=100000, value=1000)
+
+            # Izmenjeno dugme (sada prosleđuje where_filter i limit)
+            if st.sidebar.button("Load Table Data", width="stretch", type="primary"):
+                with st.sidebar.spinner("Fetching data from DB..."):
+                    try:
+                        df = db.read_table(
+                            selected_table,
+                            selected_schema,
+                            where_filter=where_clause,
+                            limit=limit_val
+                        )
+                        st.session_state['current_df'] = df
+                        st.session_state['selected_table_info'] = (selected_table, selected_schema)
+                        st.sidebar.success(f"✅ Loaded {len(df)} rows!")
+                    except Exception as e:
+                        st.sidebar.error(f"SQL Error: {e}")
 
 
 
-            col_btn1, col_btn2 = st.sidebar.columns(2)
 
-            # --- KLJUČNO: Dugme za prave podatke ---
-            if st.sidebar.button("Load Table Data", width="stretch"):
-                # Čitamo prave podatke iz tabele
-                df = db.read_table(selected_table, selected_schema)
-                st.session_state['current_df'] = df
-                st.session_state['selected_table_info'] = (selected_table, selected_schema)
-                st.sidebar.success(f"Loaded {len(df)} rows from {selected_table}")
 
+
+            # --- Anonymization Analysis Sekcija ---
             st.sidebar.divider()
             st.sidebar.markdown(
                 "### Anonymization Analysis",
-                help="Select manual column loading or run AI scan to determine the best anonymization strategies for this table."
+                help="Select manual column loading or run AI scan to determine the best anonymization strategies."
             )
-
 
             col_btn1, col_btn2 = st.sidebar.columns(2)
 
+            # Kreiramo prazan prostor odmah ispod kolona za dugmiće
+            status_placeholder = st.sidebar.empty()
 
-            st.sidebar.divider()
+            # MANUAL DUGME
+            if col_btn1.button("Manual", width="stretch"):
+                try:
+                    columns = db.get_columns(selected_table, selected_schema)
+                    manual_plan = [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual load"} for c in columns]
+                    st.session_state['ai_analysis'] = {"plan": manual_plan}
+
+                    # Prikazujemo poruku direktno ispod
+                    status_placeholder.success(
+                        "✅ Columns loaded!  \n"
+                        "Please adapt columns in  \n"
+                        "🛠️ 'Execution & Plan' tab."
+                    )
+                    import time
+                    time.sleep(7) # Čekamo 5 sekundi
+                    status_placeholder.empty() # Brišemo poruku
+
+                except Exception as e:
+                    st.sidebar.error(f"Error: {e}")
+
+            # AI SCAN DUGME
+            if col_btn2.button("AI Scan", width="stretch"):
+                with st.sidebar.spinner("AI is analyzing..."):
+                    try:
+                        raw_df = db.read_table(selected_table, selected_schema).head(10)
+                        metadata = raw_df.to_dict(orient='records')
+                        ai_result = agent.analyze_metadata(metadata)
+
+                        if ai_result:
+                            st.session_state['ai_analysis'] = ai_result
+                            status_placeholder.info("🚀 AI Scan complete!")
+                            import time
+                            time.sleep(3)
+                            status_placeholder.empty()
+                    except Exception as e:
+                        st.sidebar.error(f"AI Error: {e}")
 
 
-            # --- 2. Manual i AI opcije jedna pored druge ---
-            if col_btn1.button("Manual"):
 
-                with db.engine.connect() as conn:
-                    result = conn.execute(text(f"SELECT * FROM \"{selected_schema}\".\"{selected_table}\" LIMIT 0"))
-                    columns = result.keys()
-
-                manual_plan = [{"column": c, "strategy": "keep", "confidence": 1.0, "reason": "Manual"} for c in columns]
-
-                from src.agents.privacy_agent import PrivacyAnalysis
-                st.session_state['ai_analysis'] = PrivacyAnalysis(plan=manual_plan)
-                st.sidebar.success("Columns loaded!")
-
-            if col_btn2.button("AI Scan"):
-                with st.spinner("AI is analyzing..."):
-                    metadata = db.get_ai_ready_metadata(selected_table, schema=selected_schema)
-                    st.session_state['ai_analysis'] = agent.analyze_metadata(metadata)
-                    st.sidebar.success("AI analysis complete!")
-
-
+        else:
+            st.sidebar.warning("No tables found.")
 
     except Exception as e:
-        st.error(f"Database Error: {e}")
+        st.sidebar.error(f"Database Error: {e}")
+
+
+
+
+
+
 
 # --- MAIN CONTENT ---
-# --- MAIN CONTENT (app_ui.py) ---
 if 'current_df' in st.session_state:
-    # Kreiramo tabove odmah
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Explorer", "🛠️ Execution & Plan", "🔍 Comparison", "📜 Audit Log"])
+    tab_list = ["📊 Data Explorer", "🛠️ Execution & Plan", "🔍 Comparison", "📜 Audit Log"]
+    # Napomena: st.tabs nema programski index, ali st.rerun() pomaže u održavanju stanja
+    tabs = st.tabs(tab_list)
 
-    with tab1:
+    with tabs[0]:
         st.subheader(f"Raw Data: {st.session_state['selected_table_info'][0]}")
         st.dataframe(st.session_state['current_df'].head(100), width="stretch")
 
-    with tab2:
+    with tabs[1]:
         if 'ai_analysis' in st.session_state:
-
-
-
             st.subheader("🛠️ Review & Finalize Plan")
 
-            # 1. PRIPREMA PODATAKA ZA EDITOR
-            if isinstance(st.session_state['ai_analysis'], dict):
-                plan_df = pd.DataFrame(st.session_state['ai_analysis'].get('plan', []))
+            # Unifikacija podataka (Pydantic vs Dict)
+            analysis_data = st.session_state['ai_analysis']
+            if hasattr(analysis_data, 'plan'):
+                plan_list = [p.model_dump() for p in analysis_data.plan]
+            elif isinstance(analysis_data, dict) and 'plan' in analysis_data:
+                plan_list = analysis_data['plan']
             else:
-                plan_df = pd.DataFrame([p.model_dump() for p in st.session_state['ai_analysis'].plan])
+                plan_list = []
 
-            if 'is_pii' in plan_df.columns:
-                pii_detected = plan_df[plan_df['is_pii'] == True]['column'].tolist()
-                if pii_detected:
-                    st.warning(f"⚠️ **PII Detected:** {', '.join(pii_detected)}. Verify strategies!")
+            plan_df = pd.DataFrame(plan_list)
 
-            edited_plan_df = st.data_editor(
-                plan_df,
-                column_config={
-                    "column": st.column_config.TextColumn("Database Column", disabled=True),
-                    "is_pii": st.column_config.CheckboxColumn("PII Detected", disabled=True),
-                    # STROGI IZBOR: Korisnik ne može da kuca, samo da bira sa liste
-                    "strategy": st.column_config.SelectboxColumn(
-                        "Anonymization Strategy",
-                        help="Click to select a strategy. Manual text entry is strictly disabled.",
-                        width="medium",
-                        options=[
-                            "keep",
-                            "hash",
-                            "mask",
-                            "synthetic",
-                            "noise",
-                            "date_shift"
-                        ],
-                        required=True, # Ovo osigurava da vrednost mora biti sa liste
-                    )
-                },
-                hide_index=True,
-                width="stretch",
-                key="plan_editor_final"
-            )
+            if not plan_df.empty:
+                if 'is_pii' in plan_df.columns:
+                    pii_detected = plan_df[plan_df['is_pii'] == True]['column'].tolist()
+                    if pii_detected:
+                        st.warning(f"⚠️ **PII Detected:** {', '.join(pii_detected)}. Verify strategies!")
+
+                edited_plan_df = st.data_editor(
+                    plan_df,
+                    column_config={
+                        "column": st.column_config.TextColumn("Database Column", disabled=True),
+                        "is_pii": st.column_config.CheckboxColumn("PII Detected", disabled=True),
+                        "strategy": st.column_config.SelectboxColumn(
+                            "Strategy",
+                            options=["keep", "hash", "mask", "synthetic", "noise", "date_shift"],
+                            required=True
+                        )
+                    },
+                    hide_index=True,
+                    width="stretch",
+                    key="plan_editor_final"
+                )
 
             plan_data = edited_plan_df.to_dict('records')
+
             total_cols = len(plan_data)
             score_points = 0
 
@@ -202,27 +251,18 @@ if 'current_df' in st.session_state:
 
             with col_save:
                 if st.button("💾 Save Plan in DB", width="stretch", type="primary"):
-                    with st.spinner("Saving configuration..."):
-                        table_name, schema_name = st.session_state['selected_table_info']
-                        db.save_ai_plan(schema_name, table_name, plan_data)
-                        st.success(f"✅ Configuration for '{table_name}' saved to metadata!")
-
-            # 6. PRIKAZ NOTIFIKACIJA (Referencijalni integritet)
-            if 'last_run_notes' in st.session_state:
-                st.write("---")
-                for n in st.session_state['last_run_notes']:
-                    st.info(n)
-
+                    table_name, schema_name = st.session_state['selected_table_info']
+                    db.save_ai_plan(schema_name, table_name, plan_data)
+                    st.success("Plan saved!")
         else:
-            st.warning("💡  Please load columns in Tab 1 (Manual or AI Scan) first.")
+            st.info("Please run Manual or AI Scan in the sidebar.")
 
 
 
 
 
 
-
-    with tab3:
+    with tabs[2]:
         st.subheader("🔍 Side-by-Side Comparison")
 
         current_salt = st.session_state.get('salt_input', 'default_salt')
@@ -272,7 +312,7 @@ if 'current_df' in st.session_state:
                         )
 
 
-    with tab4:
+    with tabs[3]:
         st.subheader("📜 Audit History")
         query = "SELECT * FROM metadata.audit_log ORDER BY execution_time DESC LIMIT 50"
         log_df = pd.read_sql(query, db.engine)
