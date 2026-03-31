@@ -70,15 +70,47 @@ source_mode = st.sidebar.radio("Select Input Type:", ["CSV Files", "PostgreSQL D
 
 if source_mode == "PostgreSQL Database":
     try:
+        
         schemas = db.get_all_schemas()
-        # Postavljamo public kao default
-        default_idx = schemas.index('public') if 'public' in schemas else 0
+        
+        # Postavljamo 'person' kao default, ako ne postoji, onda 'public', inače prvi na listi
+        if 'person' in schemas:
+            default_idx = schemas.index('person')
+        elif 'public' in schemas:
+            default_idx = schemas.index('public')
+        else:
+            default_idx = 0
+            
         selected_schema = st.sidebar.selectbox("Choose Schema:", schemas, index=default_idx)
+
+
 
         tables = db.get_tables_in_schema(selected_schema)
 
         if tables:
             selected_table = st.sidebar.selectbox("Choose Table:", tables)
+
+# --- SCHEMA HELPER & INTELLISENSE ---
+            columns = db.get_columns(selected_table, selected_schema)
+
+
+            with st.sidebar.expander("Filter Options", expanded=False):
+                # Dodajemo dinamički placeholder koji pokazuje primer sa pravom kolonom
+                example_col = columns[0] if columns else "id"
+                where_clause = st.text_area(
+                    "WHERE condition:",
+                    placeholder=f"e.g. {example_col} = 'some_value'",
+                    help="Tip: Use the Schema Helper above to verify column names."
+                )
+                limit_val = st.number_input("Limit rows:", min_value=1, max_value=100000, value=1000)
+                
+            with st.sidebar.expander("📋 Table Schema Helper", expanded=False):
+                st.info("You can copy column names of this table:")
+                # Prikazujemo kolone kao male "tagove" (button-e)
+                # koji ispisuju naziv u info box da bi mogao lakše da prekopiraš
+                for col in columns:
+
+                    st.code(f"{col}") # Ovo ti olakšava copy-paste
 
             # 1. Provera sačuvanog plana
             saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
@@ -97,14 +129,6 @@ if source_mode == "PostgreSQL Database":
             st.sidebar.divider()
             st.sidebar.markdown("🔍 **Data Filtering**")
 
-            # Novo: Expander za filtere
-            with st.sidebar.expander("Filter Options", expanded=False):
-                where_clause = st.text_area(
-                    "WHERE condition:",
-                    placeholder="e.g. status = 'active' AND created_at > '2025-01-01'",
-                    help="Omit the 'WHERE' keyword. Just write the condition."
-                )
-                limit_val = st.number_input("Limit rows:", min_value=1, max_value=100000, value=1000)
 
             # Izmenjeno dugme (sada prosleđuje where_filter i limit)
             if st.sidebar.button("Load Table Data", width="stretch", type="primary"):
@@ -231,6 +255,23 @@ if 'current_df' in st.session_state:
     with tabs[1]:
         if 'ai_analysis' in st.session_state:
             st.subheader("🛠️ Review & Finalize Plan")
+            
+            
+# 1. Sigurnosna provera za naziv tabele
+            if 'selected_table_info' in st.session_state:
+                current_table = st.session_state['selected_table_info'][0]
+            else:
+                current_table = "initial"
+
+            # 2. Dodajemo i timestamp ili nasumični ID u ključ 
+            # da bismo forsirali osvežavanje pri svakom novom load-u
+            if 'editor_suffix' not in st.session_state:
+                st.session_state['editor_suffix'] = 0
+            
+            editor_key = f"plan_editor_{current_table}_{st.session_state['editor_suffix']}"
+            
+            
+            
 
             # Unifikacija podataka (Pydantic vs Dict)
             analysis_data = st.session_state['ai_analysis']
@@ -244,11 +285,6 @@ if 'current_df' in st.session_state:
             plan_df = pd.DataFrame(plan_list)
 
             if not plan_df.empty:
-                if 'is_pii' in plan_df.columns:
-                    pii_detected = plan_df[plan_df['is_pii'] == True]['column'].tolist()
-                    if pii_detected:
-                        st.warning(f"⚠️ **PII Detected:** {', '.join(pii_detected)}. Verify strategies!")
-
                 edited_plan_df = st.data_editor(
                     plan_df,
                     column_config={
@@ -256,13 +292,13 @@ if 'current_df' in st.session_state:
                         "is_pii": st.column_config.CheckboxColumn("PII Detected", disabled=True),
                         "strategy": st.column_config.SelectboxColumn(
                             "Strategy",
-                            options=["keep", "hash", "mask", "synthetic", "noise", "date_shift"],
+                            options=["keep", "hash", "mask", "mapping", "noise", "date_shift"],
                             required=True
                         )
                     },
                     hide_index=True,
                     width="stretch",
-                    key="plan_editor_final"
+                    key=editor_key # Sada je ključ 100% unikatan
                 )
 
             plan_data = edited_plan_df.to_dict('records')
