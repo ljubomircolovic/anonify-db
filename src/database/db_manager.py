@@ -1,3 +1,4 @@
+﻿# -*- coding: utf-8 -*-
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 import os
@@ -27,13 +28,13 @@ class DBManager:
         return inspector.get_table_names(schema=schema)
 
     def read_table(self, table_name, schema_name='public', where_filter=None, limit=None):
-        """?ita tabelu sa opcionim WHERE filterom i LIMIT-om."""
+        """Čita tabelu sa opcionim WHERE filterom i LIMIT-om."""
         # Koristimo navodnike za case-sensitivity u Postgresu
         query = f'SELECT * FROM "{schema_name}"."{table_name}"'
 
         # Dodajemo WHERE logiku
         if where_filter and where_filter.strip():
-            # ?istimo filter u slu?aju da je korisnik slu?ajno upisao "WHERE"
+            # Čistimo filter u slučaju da je korisnik slučajno upisao "WHERE"
             clean_filter = where_filter.strip().replace("WHERE ", "").replace("where ", "")
             query += f" WHERE {clean_filter}"
 
@@ -45,7 +46,7 @@ class DBManager:
             return pd.read_sql(query, self.engine)
         except Exception as e:
             print(f"Error reading table {schema_name}.{table_name}: {e}")
-            # Vra?amo prazan DataFrame sa istim kolonama ako je mogu?e, ili potpuno prazan
+            # Vraćamo prazan DataFrame sa istim kolonama ako je moguće, ili potpuno prazan
             return pd.DataFrame()
 
     def save_anonymized_table(self, df, table_name, target_schema='anon'):
@@ -121,64 +122,84 @@ class DBManager:
                 conn.commit()
         except:
             pass
+        
+        
+    def _get_mapping_values(self, category):
+        """Izvlači sve lažne vrednosti za određenu kategoriju iz baze."""
+        query = text("""
+            SELECT fake_value 
+            FROM metadata.mapping_values v
+            JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
+            WHERE c.category_name = :cat
+            ORDER BY fake_value ASC
+        """)
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(query, {"cat": category})
+                return [row[0] for row in result]
+        except Exception as e:
+            print(f"Error fetching mapping for {category}: {e}")
+            return []
+
+    def _deterministic_map(self, original_val, mapping_list, salt):
+        """Deterministički bira zamensku vrednost na osnovu hasha originala."""
+        if not mapping_list:
+            return "NO_MAPPING_DATA"
+            
+        import hashlib
+        # Kreiramo hash od (vrednost + salt)
+        combined = str(original_val) + str(salt)
+        hash_obj = hashlib.sha256(combined.encode())
+        # Pretvaramo u broj i koristimo modulo operaciju da dobijemo index u listi
+        index = int(hash_obj.hexdigest(), 16) % len(mapping_list)
+        return mapping_list[index]
+        
+        
+
 
 
     def apply_anonymization(self, df, plan, salt="default_secret"):
         import hashlib
         import numpy as np
-        from faker.providers.person.de_DE import Provider as PersonProvider
-        all_names = list(PersonProvider.first_names)
         anonymized_df = df.copy()
-
-        notifications = [] # Kolekcija poruka za UI
+        notifications = [] 
+        cached_mappings = {} # Keširamo mapping liste za brzinu
 
         for item in plan:
             col = item['column']
             strategy = item.get('strategy', 'keep').lower()
             if col not in anonymized_df.columns: continue
 
-            # --- LOGIKA ZA REFERENCIJALNI INTEGRITET (ID kolone) ---
-            # Ako kolona u imenu ima 'id', 'pk', 'fk', tretiramo je kao kljuc
-            is_id_column = any(k in col.lower() for k in ['id', 'pk', 'fk', 'key', 'sifra'])
+            # --- 1. NOVA STRATEGIJA: MAPPING (Iz tvojih metadata tabela) ---
+            if strategy == 'mapping':
+                category = "first_name" if any(k in col.lower() for k in ['name', 'first', 'ime']) else "city"
+                
+                if category not in cached_mappings:
+                    cached_mappings[category] = self._get_mapping_values(category) # Metoda koju smo ranije definisali
+                
+                m_list = cached_mappings[category]
+                if m_list:
+                    anonymized_df[col] = anonymized_df[col].apply(
+                        lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x
+                    )
+                    notifications.append(f"✅ Column '{col}' mapped using '{category}' from DB.")
+                else:
+                    notifications.append(f"⚠️ No DB mapping for '{col}'. Falling back to Hash.")
+                    strategy = 'hash' # Ako je tabela prazna, prebaci na hash
 
-            if strategy == 'synthetic' or (is_id_column and strategy != 'keep'):
-                def get_smart_synthetic(val):
-                    if pd.isnull(val): return val
-
-                    # 1. Proveri da li vec postoji u globalnoj mapi
-                    existing = self.get_global_mapping(col, val, salt)
-                    if existing:
-                        return existing
-
-                    # 2. Ako ne postoji, generisi novu vrednost
-                    combined = f"{val}{salt}".encode()
-                    hash_obj = hashlib.sha256(combined)
-                    hash_idx = int(hash_obj.hexdigest(), 16)
-
-                    new_val = ""
-                    if any(k in col.lower() for k in ['name', 'first', 'last', 'ime']):
-                        new_val = all_names[hash_idx % len(all_names)]
-                    else:
-                        new_val = f"anon_{hash_idx % 1000000}"
-
-                    # 3. Sacuvaj u mapu za buducu upotrebu u drugim tabelama
-                    self.save_global_mapping(col, val, new_val, salt)
-                    return new_val
-
-                anonymized_df[col] = anonymized_df[col].apply(get_smart_synthetic)
-
-                if is_id_column:
-                    notifications.append(f"?? Column '{col}' handled with Referential Integrity. Values mapped across tables.")
-
-            # --- OSTALE STRATEGIJE (Hash, Mask, Noise, Date Shift) ---
-            elif strategy == 'hash':
+            # --- 2. TVOJA LOGIKA ZA HASH ---
+            if strategy == 'hash':
                 anonymized_df[col] = anonymized_df[col].apply(
                     lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
                 )
+
+            # --- 3. TVOJA LOGIKA ZA MASK ---
             elif strategy == 'mask':
                 anonymized_df[col] = anonymized_df[col].apply(
                     lambda x: self.mask_value(x) if pd.notnull(x) else x
                 )
+
+            # --- 4. TVOJA LOGIKA ZA NOISE ---
             elif strategy == 'noise':
                 if pd.api.types.is_numeric_dtype(anonymized_df[col]):
                     def get_stable_noise(val):
@@ -188,6 +209,8 @@ class DBManager:
                         noise_percent = 0.9 + (h % 200) / 1000.0
                         return round(val * noise_percent, 2)
                     anonymized_df[col] = anonymized_df[col].apply(get_stable_noise)
+
+            # --- 5. TVOJA LOGIKA ZA DATE_SHIFT ---
             elif strategy == 'date_shift':
                 try:
                     anonymized_df[col] = pd.to_datetime(anonymized_df[col])
@@ -200,8 +223,7 @@ class DBManager:
                     anonymized_df[col] = anonymized_df[col].apply(shift_date)
                 except: pass
 
-        return anonymized_df, notifications # Vracamo i DF i notifikacije
-
+        return anonymized_df, notifications
 
 
 
