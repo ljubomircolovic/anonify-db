@@ -6,16 +6,60 @@ from sqlalchemy import text
 import os
 import json
 from src.agents.privacy_agent import PrivacyAgent, PrivacyAnalysis
+from dotenv import load_dotenv
 
-# Inicijalizacija
+# 1. PRVO učitavamo .env
+load_dotenv()
+
+# 2. PRVA Streamlit komanda MORA biti set_page_config
+st.set_page_config(page_title="AnonifyDB", layout="wide")
+
+# --- LOGIN LOGIKA ---
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+
+def check_login():
+    if not st.session_state['authenticated']:
+        st.title("🔐 AnonifyDB Login")
+        with st.form("login_form"):
+            # Koristimo labele na engleskom kako smo se dogovorili
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", width="stretch")
+
+            if submitted:
+                # Vučemo kredencijale iz .env fajla
+                env_user = os.getenv("APP_ADMIN_USER")
+                env_pass = os.getenv("APP_ADMIN_PASSWORD")
+
+                if username == env_user and password == env_pass:
+                    st.session_state['authenticated'] = True
+                    st.session_state['user_name'] = username
+                    st.rerun()
+                else:
+                    st.error("Invalid Username or Password")
+        return False
+    return True
+
+# Ako nije ulogovan, stop
+if not check_login():
+    st.stop()
+
+# --- GLAVNI UI NAKON LOGINA ---
+st.sidebar.write(f"👤 User: **{st.session_state.get('user_name', 'Guest')}**")
+if st.sidebar.button("Logout"):
+    st.session_state['authenticated'] = False
+    st.rerun()
+
+st.title("AnonifyDB - Data Engineering Tool")
+
+# Inicijalizacija ostalih stanja
 if 'active_tab' not in st.session_state:
     st.session_state['active_tab'] = 0
 
+# Objekti se kreiraju tek nakon uspešnog logina (bolje za resurse)
 db = DBManager()
 agent = PrivacyAgent()
-
-st.set_page_config(page_title="AnonifyDB", layout="wide")
-st.title("AnonifyDB - Data Engineering Tool")
 
 # --- GLOBAL SIDEBAR ---
 st.sidebar.header("Global Settings")
@@ -64,14 +108,20 @@ if source_mode == "PostgreSQL Database":
 
             # Izmenjeno dugme (sada prosleđuje where_filter i limit)
             if st.sidebar.button("Load Table Data", width="stretch", type="primary"):
+
                 with st.sidebar.spinner("Fetching data from DB..."):
                     try:
+                        # Čuvamo filtere u session_state da bi bili dostupni svim tabovima
+                        st.session_state['last_where_filter'] = where_clause
+                        st.session_state['last_limit_val'] = limit_val
+
                         df = db.read_table(
                             selected_table,
                             selected_schema,
                             where_filter=where_clause,
                             limit=limit_val
                         )
+
                         st.session_state['current_df'] = df
                         st.session_state['selected_table_info'] = (selected_table, selected_schema)
                         st.sidebar.success(f"✅ Loaded {len(df)} rows!")
@@ -153,8 +203,30 @@ if 'current_df' in st.session_state:
     tabs = st.tabs(tab_list)
 
     with tabs[0]:
-        st.subheader(f"Raw Data: {st.session_state['selected_table_info'][0]}")
-        st.dataframe(st.session_state['current_df'].head(100), width="stretch")
+        table_name, schema_name = st.session_state['selected_table_info']
+        st.subheader(f"📊 Raw Data Explorer: {schema_name}.{table_name}")
+
+        # Proveravamo da li je DataFrame prazan (npr. zbog lošeg WHERE filtera)
+        if not st.session_state['current_df'].empty:
+            st.info(f"Showing {len(st.session_state['current_df'])} rows based on your sidebar filter.")
+            st.dataframe(st.session_state['current_df'], use_container_width=True)
+        else:
+            # Prikazujemo upozorenje ako nema rezultata
+            st.warning(f"⚠️ **No records found!** The filter `WHERE {st.session_state.get('last_where_filter', '')}` returned 0 rows.")
+            st.markdown("""
+            **What to do next?**
+            1. Check your SQL syntax in the **WHERE condition** (sidebar).
+            2. Verify if the column names are correct.
+            3. Try a broader filter or clear the condition to see all data.
+            """)
+
+            # Korisno: Ipak pokaži koje kolone postoje da bi lakše debagovao query
+            with st.expander("🛠️ View Available Columns"):
+                try:
+                    cols = db.get_columns(table_name, schema_name)
+                    st.code(", ".join(cols))
+                except:
+                    st.write("Could not fetch column names.")
 
     with tabs[1]:
         if 'ai_analysis' in st.session_state:
@@ -265,32 +337,51 @@ if 'current_df' in st.session_state:
     with tabs[2]:
         st.subheader("🔍 Side-by-Side Comparison")
 
-        current_salt = st.session_state.get('salt_input', 'default_salt')
-
         if 'ai_analysis' in st.session_state and 'selected_table_info' in st.session_state:
+            # 1. Uzimamo plan direktno iz editora (da bismo videli promene uživo bez čuvanja)
             current_plan_data = edited_plan_df.to_dict('records')
             table_name, schema_name = st.session_state['selected_table_info']
 
-            # Uzimamo uzorak za prikaz (Top 10)
-            raw_sample = db.read_table(table_name, schema_name).head(10)
+            # 2. Dobavljanje filtera i limita iz sesije (da bi Comparison bio usklađen sa Explorerom)
+            active_filter = st.session_state.get('last_where_filter', None)
+            active_limit = st.session_state.get('last_limit_val', 10)
+
+            # 3. Čitanje podataka sa primenjenim filterom
+            raw_sample = db.read_table(
+                table_name,
+                schema_name,
+                where_filter=active_filter,
+                limit=active_limit
+            )
 
             if not raw_sample.empty:
-                # --- IZMENA 1: Otpakivanje (df, notes) ---
-                anonymized_sample, comparison_notes = db.apply_anonymization(raw_sample, current_plan_data, salt=current_salt)
+                current_salt = st.session_state.get('salt_input', 'default_salt')
 
-                # --- IZMENA 2: Prikaz notifikacija o integritetu ---
+                # Primenjujemo anonimizaciju na uzorak
+                anonymized_sample, comparison_notes = db.apply_anonymization(
+                    raw_sample,
+                    current_plan_data,
+                    salt=current_salt
+                )
+
+                # Prikaz notifikacija o integritetu
                 if comparison_notes:
                     for n in set(comparison_notes):
                         st.info(n)
 
+                # Prikaz poređenja u dve kolone
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.write("**📄 Original Data**")
-                    st.dataframe(raw_sample)
+                    st.write(f"**📄 Original Data ({len(raw_sample)} rows)**")
+                    st.dataframe(raw_sample, use_container_width=True)
                 with col2:
-                    st.write(f"**🛡️ Anonymized (Salt: {current_salt})**")
-                    # Sada je anonymized_sample Ä�ist DataFrame
-                    st.dataframe(anonymized_sample)
+                    st.write(f"**🛡️ Anonymized Preview (Salt: {current_salt})**")
+                    st.dataframe(anonymized_sample, use_container_width=True)
+            else:
+                st.warning(f"⚠️ **No records found!** The filter `WHERE {st.session_state.get('last_where_filter', '')}` returned 0 rows.")
+
+
+
 
                 # --- NOVO: EXPORT SEKCIJA ---
                 st.divider()
