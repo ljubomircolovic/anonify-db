@@ -82,25 +82,42 @@ def render_sidebar(agent):
 
                 tables = db.get_tables_in_schema(selected_schema)
                 if tables:
-                    selected_table = st.selectbox("Choose Table:", tables)
-                    columns = db.get_columns(selected_table, selected_schema)
+                    # 1. Menjamo selectbox u multiselect za Batch rad
+                    selected_tables = st.multiselect(
+                        "Choose Tables (Batch Mode):",
+                        options=tables,
+                        default=st.session_state.get('last_selected_tables', [])
+                    )
+                    st.session_state['last_selected_tables'] = selected_tables
 
-                    with st.expander("🔍 Filtering & Schema", expanded=False):
-                        # SQL Injection Safe napomena
-                        where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100")
-                        limit_val = st.number_input("Limit rows:", value=1000, min_value=1)
-                        st.info("Available columns:")
-                        st.code(", ".join(columns))
+                    if selected_tables:
+                        # 2. Dobijamo ispravan redosled na osnovu FK relacija
+                        ordered_tables = db.get_execution_order(selected_tables, selected_schema)
 
-                    # --- LOAD SAVED PLAN ---
-                    saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
-                    if saved_plan_data:
-                        if st.button("📂 Load Saved Plan", use_container_width=True):
-                            st.session_state['ai_analysis'] = saved_plan_data
-                            st.success("✅ Saved plan loaded!")
-                            st.rerun()
-                    else:
-                        st.caption("ℹ️ No saved plan found for this table.")
+                        # Vizuelni feedback o redosledu (veoma bitno za Senior DE)
+                        st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join(ordered_tables)}")
+
+                        # 3. Biramo koju tabelu trenutno gledamo (Preview/Analysis)
+                        selected_table = st.selectbox("Current Table for Analysis:", options=ordered_tables)
+                        columns = db.get_columns(selected_table, selected_schema)
+
+                        with st.expander("🔍 Filtering & Schema", expanded=False):
+                            where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100")
+                            limit_val = st.number_input("Limit rows:", value=1000, min_value=1)
+                            st.info("Available columns:")
+                            st.code(", ".join(columns))
+
+                        # --- Ostatak koda (Load Saved Plan, Load Data, AI Scan) ostaje isti ---
+                        # On će sada raditi na bazi 'selected_table' koju smo dobili iz dropdown-a iznad
+
+                        saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
+                        if saved_plan_data:
+                            if st.button("📂 Load Saved Plan", use_container_width=True):
+                                st.session_state['ai_analysis'] = saved_plan_data
+                                st.success(f"✅ Plan for {selected_table} loaded!")
+                                st.rerun()
+                        else:
+                            st.caption(f"ℹ️ No saved plan found for {selected_table}.")
 
                     # --- LOAD DATA ---
                     if st.button("🚀 Load Table Data", type="primary", use_container_width=True):

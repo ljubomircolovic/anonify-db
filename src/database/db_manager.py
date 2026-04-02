@@ -15,8 +15,8 @@ load_dotenv()
 
 class DBManager:
     def __init__(self, db_url=None):
-        
-        
+
+
         self.db_url = db_url or os.getenv(
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
@@ -27,7 +27,7 @@ class DBManager:
         )
         azure_key = os.getenv("AZURE_OPENAI_KEY")
         azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        
+
         if azure_key and azure_endpoint:
             self.ai_client = AzureOpenAI(
                 api_key=azure_key,
@@ -37,7 +37,7 @@ class DBManager:
         else:
             self.ai_client = None
             print("⚠️ Azure OpenAI credentials not found in environment.")
-        
+
 
         self.fake = Faker(['de_DE', 'en_US'])
         self._init_metadata_table()
@@ -53,7 +53,7 @@ class DBManager:
     def read_table(self, table_name, schema_name='public', where_filter=None, limit=None, params=None):
         """Čita tabelu koristeći parametrizovan SQL radi bezbednosti."""
         from sqlalchemy import text
-        
+
         # Osnovni upit sa zaštićenim imenima šeme i tabele
         query_str = f'SELECT * FROM "{schema_name}"."{table_name}"'
 
@@ -66,7 +66,7 @@ class DBManager:
             query_str += f" LIMIT {limit}"
 
         query = text(query_str)
-        
+
         try:
             with self.engine.connect() as conn:
                 # params bi bio npr. {"min_id": 100} ako u where_filter imaš :min_id
@@ -150,14 +150,14 @@ class DBManager:
                 conn.commit()
         except:
             pass
-        
-        
+
+
     def get_mapping_value(self, original_value, category, locale, salt):
         import hashlib
         with self.engine.connect() as conn:
             # 1. Uzmi sve dostupne fejk vrednosti za kategoriju i jezik, SORTIRANO
             query = text("""
-                SELECT v.fake_value 
+                SELECT v.fake_value
                 FROM metadata.mapping_values v
                 JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
                 WHERE c.category_name = :cat AND c.locale = :loc
@@ -173,20 +173,20 @@ class DBManager:
         combined = f"{original_value}{salt}".encode('utf-8')
         hash_int = int(hashlib.sha256(combined).hexdigest(), 16)
         index = hash_int % len(pool)
-        
+
         return pool[index]
-        
-    
+
+
 
     def apply_anonymization(self, df, plan, salt="default_secret", locale="de"):
         import hashlib
         import pandas as pd
         import numpy as np
-        
+
         anonymized_df = df.copy()
-        notifications = [] 
+        notifications = []
         # Keširamo mapping liste: ključ će biti 'category_locale' (npr. 'first_name_de')
-        cached_mappings = {} 
+        cached_mappings = {}
 
         for item in plan:
             col = item['column']
@@ -195,19 +195,19 @@ class DBManager:
 
             # --- 1. STRATEGIJA: MAPPING (Sa Locale podrškom) ---
             if strategy == 'mapping':
-            
+
                 category = "first_name"
                 if any(k in col.lower() for k in ['last', 'prezime']): category = "last_name"
                 elif any(k in col.lower() for k in ['city', 'grad', 'mesto']): category = "city"
                 elif any(k in col.lower() for k in ['company', 'firma', 'preduzece']): category = "company_name"
-                
+
                 cache_key = f"{category}_{locale}"
-                
+
                 if cache_key not in cached_mappings:
                     cached_mappings[cache_key] = self._get_mapping_values_by_locale(category, locale)
-                
+
                 m_list = cached_mappings[cache_key]
-                
+
                 if m_list:
                     # Ako imamo podatke u bazi (npr. za 'de'), radi mapping
                     anonymized_df[col] = anonymized_df[col].apply(
@@ -266,7 +266,7 @@ class DBManager:
     def _get_mapping_values_by_locale(self, category, locale):
         from sqlalchemy import text
         query = text("""
-            SELECT v.fake_value 
+            SELECT v.fake_value
             FROM metadata.mapping_values v
             JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
             WHERE c.category_name = :cat AND c.locale = :loc
@@ -389,3 +389,80 @@ class DBManager:
         except Exception as e:
             # Vraćamo detaljnu grešku da bismo znali šta nije u redu (npr. loša lozinka)
             return False, f"Connection failed: {str(e)} ❌"
+
+    def get_foreign_key_relations_postgres(self, schema_name='public'):
+        """
+        Dohvata Foreign Key relacije specifične za PostgreSQL.
+        Vraća DataFrame sa: table_name, column_name, foreign_table_name, foreign_column_name.
+        """
+        from sqlalchemy import text
+
+        # SQL upit optimizovan za Postgres metapodatke
+        query = text("""
+            SELECT
+                tc.table_name AS table_name,
+                kcu.column_name AS column_name,
+                ccu.table_name AS foreign_table_name,
+                ccu.column_name AS foreign_column_name
+            FROM
+                information_schema.table_constraints AS tc
+                JOIN information_schema.key_column_usage AS kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage AS ccu
+                  ON ccu.constraint_name = tc.constraint_name
+                  AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = :schema;
+        """)
+
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(query, {"schema": schema_name})
+                df_rel = pd.DataFrame(result.fetchall(), columns=result.keys())
+
+                # Logujemo broj pronađenih relacija u konzolu radi lakšeg debugginga
+                print(f"📊 [Dependency Engine] Found {len(df_rel)} relations in schema '{schema_name}'")
+                return df_rel
+        except Exception as e:
+            print(f"❌ Error fetching Postgres relations: {e}")
+            return pd.DataFrame()
+
+    def get_execution_order(self, selected_tables, schema_name='public'):
+        """
+        Sortira izabrane tabele po hijerarhiji (PK pre FK).
+        Koristi topološko sortiranje na osnovu relacija.
+        """
+        relations = self.get_foreign_key_relations_postgres(schema_name)
+
+        # 1. Napravi graf zavisnosti
+        # dependencies[tabela] = {skup tabela od kojih ona zavisi}
+        dependencies = {table: set() for table in selected_tables}
+
+        for _, row in relations.iterrows():
+            tab = row['table_name']
+            parent = row['foreign_table_name']
+
+            # Ako su obe tabele u našem izboru, zabeleži zavisnost
+            if tab in dependencies and parent in selected_tables and tab != parent:
+                dependencies[tab].add(parent)
+
+        # 2. Algoritam za sortiranje (Kahn's simplified)
+        ordered_tables = []
+        while dependencies:
+            # Pronađi tabele koje nemaju zavisnosti (ili su im zavisnosti već rešene)
+            ready_nodes = [t for t, deps in dependencies.items() if not deps]
+
+            if not ready_nodes:
+                # Ako imamo kružnu zavisnost, uzmi preostale (fallback)
+                ordered_tables.extend(list(dependencies.keys()))
+                break
+
+            for node in ready_nodes:
+                ordered_tables.append(node)
+                del dependencies[node]
+                # Ukloni ovu tabelu kao zavisnost iz ostalih preostalih tabela
+                for t in dependencies:
+                    dependencies[t].discard(node)
+
+        return ordered_tables
