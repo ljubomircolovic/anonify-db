@@ -66,3 +66,23 @@ INSERT INTO ecommerce.order_items (order_id, product_id, quantity, unit_price) V
 (1, 2, 1, 120.00),
 (2, 3, 2, 250.00),
 (3, 1, 1, 1500.00);
+
+
+CREATE TABLE IF NOT EXISTS ecommerce.anon_forced_mappings (
+    id SERIAL PRIMARY KEY,
+    column_name VARCHAR(100) UNIQUE NOT NULL,
+    is_pii BOOLEAN DEFAULT TRUE,
+    strategy VARCHAR(100) NOT NULL,
+    reason TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Inicijalni podaci (tvoj stari hardkodovani rečnik)
+INSERT INTO ecommerce.anon_forced_mappings (column_name, strategy, reason) VALUES
+('first_name', 'faker_first_name', 'Mandatory PII mapping'),
+('last_name', 'faker_last_name', 'Mandatory PII mapping'),
+('email', 'faker_email', 'Mandatory PII mapping'),
+('phone', 'faker_phone_number', 'Mandatory PII mapping'),
+('city', 'faker_city', 'Location PII'),
+('address', 'faker_address', 'Location PII')
+ON CONFLICT (column_name) DO NOTHING;

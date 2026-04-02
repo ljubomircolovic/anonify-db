@@ -32,7 +32,7 @@ if 'db_initialized' not in st.session_state:
 render_sidebar(agent)
 
 # 5. Glavni sadržaj (Modularni Tabovi)
-st.title("AnonifyDB obzirom da cesto menjamo k- Data Engineering Tool")
+st.title("AnonifyDB Data Engineering Tool")
 
 if 'selected_table_info' in st.session_state:
     # Pozivamo jednu funkciju koja u sebi sadrži svu logiku za tabove

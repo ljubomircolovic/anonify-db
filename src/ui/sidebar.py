@@ -77,12 +77,11 @@ def render_sidebar(agent):
         if source_mode == "PostgreSQL Database":
             try:
                 schemas = db.get_all_schemas()
-                default_idx = schemas.index('person') if 'person' in schemas else 0
+                default_idx = schemas.index('ecommerce') if 'ecommerce' in schemas else 0
                 selected_schema = st.selectbox("Choose Schema:", schemas, index=default_idx)
 
                 tables = db.get_tables_in_schema(selected_schema)
                 if tables:
-                    # 1. Menjamo selectbox u multiselect za Batch rad
                     selected_tables = st.multiselect(
                         "Choose Tables (Batch Mode):",
                         options=tables,
@@ -90,26 +89,24 @@ def render_sidebar(agent):
                     )
                     st.session_state['last_selected_tables'] = selected_tables
 
+                    # --- SVA LOGIKA IDE OVDE (AKO SU TABELE IZABRANE) ---
                     if selected_tables:
-                        # 2. Dobijamo ispravan redosled na osnovu FK relacija
+                        # 1. Redosled izvršavanja
                         ordered_tables = db.get_execution_order(selected_tables, selected_schema)
+                        st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join([f'`{t}`' for t in ordered_tables])}")
 
-                        # Vizuelni feedback o redosledu (veoma bitno za Senior DE)
-                        st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join(ordered_tables)}")
-
-                        # 3. Biramo koju tabelu trenutno gledamo (Preview/Analysis)
+                        # 2. Selektor za konfiguraciju trenutne tabele
                         selected_table = st.selectbox("Current Table for Analysis:", options=ordered_tables)
                         columns = db.get_columns(selected_table, selected_schema)
 
+                        # 3. Parametri (Filter i Limit)
                         with st.expander("🔍 Filtering & Schema", expanded=False):
-                            where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100")
-                            limit_val = st.number_input("Limit rows:", value=1000, min_value=1)
+                            where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100", key=f"where_{selected_table}")
+                            limit_val = st.number_input("Limit rows:", value=1000, min_value=1, key=f"limit_{selected_table}")
                             st.info("Available columns:")
                             st.code(", ".join(columns))
 
-                        # --- Ostatak koda (Load Saved Plan, Load Data, AI Scan) ostaje isti ---
-                        # On će sada raditi na bazi 'selected_table' koju smo dobili iz dropdown-a iznad
-
+                        # 4. Učitavanje starog plana
                         saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
                         if saved_plan_data:
                             if st.button("📂 Load Saved Plan", use_container_width=True):
@@ -119,44 +116,35 @@ def render_sidebar(agent):
                         else:
                             st.caption(f"ℹ️ No saved plan found for {selected_table}.")
 
-                    # --- LOAD DATA ---
-                    if st.button("🚀 Load Table Data", type="primary", use_container_width=True):
-                        with st.spinner("Fetching data..."):
-                            # Koristimo novu read_table sa zaštitom
-                            df = db.read_table(selected_table, selected_schema, where_filter=where_clause, limit=limit_val)
-                            st.session_state['current_df'] = df
-                            st.session_state['selected_table_info'] = (selected_table, selected_schema)
-                            st.session_state['last_where_filter'] = where_clause
-                            st.session_state['last_limit_val'] = limit_val
-                            st.success(f"✅ Loaded {len(df)} rows!")
+                        # 5. Dugme za učitavanje podataka u glavni prozor
+                        if st.button("🚀 Load Table Data", type="primary", use_container_width=True):
+                            with st.spinner(f"Fetching {selected_table}..."):
+                                df = db.read_table(selected_table, selected_schema, where_filter=where_clause, limit=limit_val)
+                                st.session_state['current_df'] = df
+                                st.session_state['selected_table_info'] = (selected_table, selected_schema)
+                                st.success(f"✅ Loaded {len(df)} rows!")
 
-                    st.divider()
-                    st.subheader("🤖 Analysis")
-                    c1, c2 = st.columns(2)
+                        st.divider()
+                        st.subheader("🤖 Analysis")
+                        c1, c2 = st.columns(2)
 
-                    if c1.button("Manual", use_container_width=True):
-                        manual_plan = [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual"} for c in columns]
-                        st.session_state['ai_analysis'] = {"plan": manual_plan}
-                        st.rerun()
-
-                    if c2.button("AI Scan", use_container_width=True):
-                        with st.spinner("AI analyzing via Azure..."):
-                            raw_df = db.read_table(selected_table, selected_schema).head(10)
-                            # Ovde 'agent' sada koristi Azure OpenAI jer smo ga podesili u DBManager-u
-                            st.session_state['ai_analysis'] = agent.analyze_metadata(raw_df.to_dict(orient='records'))
+                        if c1.button("Manual", use_container_width=True):
+                            manual_plan = [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual"} for c in columns]
+                            st.session_state['ai_analysis'] = {"plan": manual_plan}
                             st.rerun()
+
+                        if c2.button("AI Scan", use_container_width=True):
+                            with st.spinner("Consulting Database & AI..."):
+                                # Čitamo mali uzorak za analizu
+                                raw_df = db.read_table(selected_table, selected_schema, limit=10)
+                                # Analiza koja prvo gleda 'anon_forced_mappings' u bazi, pa onda pita OpenAI
+                                st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df, agent, schema_name=selected_schema)
+                                st.rerun()
+                    
+                    else:
+                        st.warning("👈 Please select one or more tables to start.")
+                            
                 else:
                     st.warning("No tables found in this schema.")
             except Exception as e:
                 st.error(f"DB Error: {e}")
-
-        st.divider()
-
-        # --- SYSTEM INTEGRITY LOGOVI (Tvoja originalna logika) ---
-        with st.expander("🩺 System Integrity", expanded=False):
-            if 'init_logs' in st.session_state:
-                for log in st.session_state['init_logs']:
-                    if "⏩" in log: st.markdown(f"**{log}**")
-                    elif "🔄" in log: st.markdown(f":blue[{log}]")
-                    elif "✅" in log: st.markdown(f":green[{log}]")
-                    else: st.write(log)

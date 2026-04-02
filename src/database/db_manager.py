@@ -16,7 +16,6 @@ load_dotenv()
 class DBManager:
     def __init__(self, db_url=None):
 
-
         self.db_url = db_url or os.getenv(
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
@@ -41,6 +40,8 @@ class DBManager:
 
         self.fake = Faker(['de_DE', 'en_US'])
         self._init_metadata_table()
+
+
 
     def get_all_schemas(self):
         inspector = inspect(self.engine)
@@ -466,3 +467,65 @@ class DBManager:
                     dependencies[t].discard(node)
 
         return ordered_tables
+
+    # U src/database/db_manager.py
+
+    def load_forced_mappings_from_db(self, schema_name='ecommerce'):
+        from sqlalchemy import text
+        # Koristimo duple navodnike za svaki deo naziva da izbegnemo probleme sa Case-Sensitivity
+        query = text(f'SELECT column_name, is_pii, strategy, reason FROM "{schema_name}"."anon_forced_mappings"')
+        
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(query)
+                # Vraćamo rečnik sa malim slovima radi lakšeg poređenja
+                return {row.column_name.lower(): {
+                    "is_pii": row.is_pii,
+                    "strategy": row.strategy,
+                    "reason": row.reason
+                } for row in result}
+        except Exception as e:
+            # Ovde ćemo ispisati tačnu grešku u konzolu da je vidimo u Docker logovima
+            print(f"❌ DATABASE ERROR: {str(e)}")
+            return {}
+        
+    # U src/database/db_manager.py
+
+# U src/database/db_manager.py
+
+    def analyze_table_structure(self, df_sample, agent, schema_name='ecommerce'):
+        columns = df_sample.columns.tolist()
+        db_mappings = self.load_forced_mappings_from_db(schema_name)
+        
+        to_analyze = []  # Lista za AI
+        final_plan = []  # Konačan rezultat
+
+        for col in columns:
+            col_lower = col.lower()
+            if col_lower in db_mappings:
+                # Uzimamo iz baze (bez zvanja Azure-a)
+                rule = db_mappings[col_lower].copy()
+                rule["column"] = col
+                final_plan.append(rule)
+            else:
+                # Pripremamo za grupni AI poziv
+                sample_data = df_sample[col].dropna().head(3).tolist()
+                to_analyze.append({
+                    "column": col, 
+                    "sample_values": [str(v) for v in sample_data]
+                })
+
+        # AKO IMA KOLONA ZA ANALIZU, ŠALJEMO IH SVE ODJEDNOM
+        if to_analyze:
+            ai_response = agent.analyze_metadata(to_analyze)
+            # Proveravamo da li je odgovor validan i da li ima 'plan'
+            if ai_response and hasattr(ai_response, 'plan'):
+                for item in ai_response.plan:
+                    final_plan.append({
+                        "column": item.column,
+                        "is_pii": item.is_pii,
+                        "strategy": item.strategy,
+                        "reason": item.reason
+                    })
+
+        return {"plan": final_plan}
