@@ -29,10 +29,10 @@ if 'db_initialized' not in st.session_state:
 
 # 4. Pozivamo modularni Sidebar
 # On puni session_state (selected_table, salt, current_df...)
-render_sidebar(db, agent)
+render_sidebar(agent)
 
 # 5. Glavni sadržaj (Modularni Tabovi)
-st.title("AnonifyDB - Data Engineering Tool")
+st.title("AnonifyDB obzirom da cesto menjamo k- Data Engineering Tool")
 
 if 'selected_table_info' in st.session_state:
     # Pozivamo jednu funkciju koja u sebi sadrži svu logiku za tabove

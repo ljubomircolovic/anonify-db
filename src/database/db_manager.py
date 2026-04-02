@@ -6,8 +6,17 @@ import json
 import hashlib
 from faker import Faker
 
+import os
+from openai import AzureOpenAI
+from dotenv import load_dotenv
+
+# Učitava varijable iz .env fajla u sistemsko okruženje
+load_dotenv()
+
 class DBManager:
     def __init__(self, db_url=None):
+        
+        
         self.db_url = db_url or os.getenv(
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
@@ -16,6 +25,20 @@ class DBManager:
             self.db_url,
             connect_args={'client_encoding': 'utf8'}
         )
+        azure_key = os.getenv("AZURE_OPENAI_KEY")
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        
+        if azure_key and azure_endpoint:
+            self.ai_client = AzureOpenAI(
+                api_key=azure_key,
+                api_version=os.getenv("AZURE_OPENAI_VERSION", "2024-02-15-preview"),
+                azure_endpoint=azure_endpoint
+            )
+        else:
+            self.ai_client = None
+            print("⚠️ Azure OpenAI credentials not found in environment.")
+        
+
         self.fake = Faker(['de_DE', 'en_US'])
         self._init_metadata_table()
 
@@ -27,26 +50,31 @@ class DBManager:
         inspector = inspect(self.engine)
         return inspector.get_table_names(schema=schema)
 
-    def read_table(self, table_name, schema_name='public', where_filter=None, limit=None):
-        """Čita tabelu sa opcionim WHERE filterom i LIMIT-om."""
-        # Koristimo navodnike za case-sensitivity u Postgresu
-        query = f'SELECT * FROM "{schema_name}"."{table_name}"'
+    def read_table(self, table_name, schema_name='public', where_filter=None, limit=None, params=None):
+        """Čita tabelu koristeći parametrizovan SQL radi bezbednosti."""
+        from sqlalchemy import text
+        
+        # Osnovni upit sa zaštićenim imenima šeme i tabele
+        query_str = f'SELECT * FROM "{schema_name}"."{table_name}"'
 
-        # Dodajemo WHERE logiku
         if where_filter and where_filter.strip():
-            # Čistimo filter u slučaju da je korisnik slučajno upisao "WHERE"
-            clean_filter = where_filter.strip().replace("WHERE ", "").replace("where ", "")
-            query += f" WHERE {clean_filter}"
+            # Čistimo filter od reči "WHERE" ako ju je korisnik uneo
+            clean_filter = where_filter.lower().replace("where", "").strip()
+            query_str += f" WHERE {clean_filter}"
 
-        # Dodajemo LIMIT logiku
         if limit:
-            query += f" LIMIT {limit}"
+            query_str += f" LIMIT {limit}"
 
+        query = text(query_str)
+        
         try:
-            return pd.read_sql(query, self.engine)
+            with self.engine.connect() as conn:
+                # params bi bio npr. {"min_id": 100} ako u where_filter imaš :min_id
+                result = conn.execute(query, params or {})
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                return df
         except Exception as e:
-            print(f"Error reading table {schema_name}.{table_name}: {e}")
-            # Vraćamo prazan DataFrame sa istim kolonama ako je moguće, ili potpuno prazan
+            print(f"Error reading table {table_name}: {e}")
             return pd.DataFrame()
 
     def save_anonymized_table(self, df, table_name, target_schema='anon'):
@@ -348,3 +376,16 @@ class DBManager:
                 conn.commit()
         except Exception as e:
             print(f"Logging error: {e}")
+
+    def test_connection(self):
+        """Proverava da li je baza dostupna i da li imamo osnovni pristup."""
+        # VAŽNO: Uvozimo text unutar metode ako nije uvezena na vrhu fajla
+        from sqlalchemy import text
+        try:
+            with self.engine.connect() as conn:
+                # Izvršavamo prost upit da potvrdimo 'handshake'
+                conn.execute(text("SELECT 1"))
+                return True, "Connection successful! ✅"
+        except Exception as e:
+            # Vraćamo detaljnu grešku da bismo znali šta nije u redu (npr. loša lozinka)
+            return False, f"Connection failed: {str(e)} ❌"

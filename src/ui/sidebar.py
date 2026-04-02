@@ -1,8 +1,33 @@
 ﻿# -*- coding: utf-8 -*-
 import streamlit as st
+from src.database.db_manager import DBManager
 import time
+import os
 
-def render_sidebar(db, agent):
+
+def get_all_connections():
+    import os
+    connections = {}
+
+    # Prvo uzimamo default bazu
+    default = os.getenv("DATABASE_URL")
+    if default:
+        connections["Local (Default)"] = default
+
+    # Zatim prolazimo kroz SVE environment varijable
+    for key, value in os.environ.items():
+        if key.startswith("DB_URL_"):
+            # Pretvaramo "DB_URL_STAGING" u lepše ime "Staging"
+            clean_name = key.replace("DB_URL_", "").replace("_", " ").title()
+            connections[clean_name] = value
+
+    return connections
+
+# I onda ovo koristiš za selectbox:
+DB_CONFIGS = get_all_connections()
+
+
+def render_sidebar(agent):
     with st.sidebar:
         st.title("🛡️ AnonifyDB")
         st.caption(f"👤 User: **{st.session_state.get('user_name', 'Admin')}**")
@@ -11,6 +36,28 @@ def render_sidebar(db, agent):
             st.rerun()
 
         st.divider()
+
+        # --- NOVO: CONNECTION MANAGER ---
+        st.subheader("🔌 Connection Manager")
+        selected_env = st.selectbox("Target Environment", options=list(DB_CONFIGS.keys()))
+        current_url = DB_CONFIGS[selected_env]
+
+        # Inicijalizacija DBManager-a (samo ako se promenila baza)
+        if 'db' not in st.session_state or st.session_state.get('last_env') != selected_env:
+            st.session_state['db'] = DBManager(db_url=current_url)
+            st.session_state['last_env'] = selected_env
+
+        db = st.session_state['db']
+
+        if st.button("⚡ Test Connection", use_container_width=True):
+            with st.spinner("Checking..."):
+                success, message = db.test_connection()
+                if success: st.success(message)
+                else: st.error(message)
+
+        st.divider()
+
+        # --- SECURITY SEKCIJA ---
         st.subheader("🔑 Security")
         st.session_state['salt_input'] = st.text_input("Secret Salt", value="default_salt", type="password")
 
@@ -22,6 +69,8 @@ def render_sidebar(db, agent):
         )
 
         st.divider()
+
+        # --- DATA SOURCE (Tvoja originalna logika) ---
         st.subheader("📂 Data Source")
         source_mode = st.radio("Input Type", ["PostgreSQL Database", "CSV Files"])
 
@@ -36,8 +85,8 @@ def render_sidebar(db, agent):
                     selected_table = st.selectbox("Choose Table:", tables)
                     columns = db.get_columns(selected_table, selected_schema)
 
-                    # Pomeramo definicije filtera ovde da bi dugme dole uvek videlo vrednosti
                     with st.expander("🔍 Filtering & Schema", expanded=False):
+                        # SQL Injection Safe napomena
                         where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100")
                         limit_val = st.number_input("Limit rows:", value=1000, min_value=1)
                         st.info("Available columns:")
@@ -56,6 +105,7 @@ def render_sidebar(db, agent):
                     # --- LOAD DATA ---
                     if st.button("🚀 Load Table Data", type="primary", use_container_width=True):
                         with st.spinner("Fetching data..."):
+                            # Koristimo novu read_table sa zaštitom
                             df = db.read_table(selected_table, selected_schema, where_filter=where_clause, limit=limit_val)
                             st.session_state['current_df'] = df
                             st.session_state['selected_table_info'] = (selected_table, selected_schema)
@@ -73,8 +123,9 @@ def render_sidebar(db, agent):
                         st.rerun()
 
                     if c2.button("AI Scan", use_container_width=True):
-                        with st.spinner("AI analyzing..."):
+                        with st.spinner("AI analyzing via Azure..."):
                             raw_df = db.read_table(selected_table, selected_schema).head(10)
+                            # Ovde 'agent' sada koristi Azure OpenAI jer smo ga podesili u DBManager-u
                             st.session_state['ai_analysis'] = agent.analyze_metadata(raw_df.to_dict(orient='records'))
                             st.rerun()
                 else:
@@ -84,20 +135,11 @@ def render_sidebar(db, agent):
 
         st.divider()
 
-        # --- PRIKAZ LOGOVA INTEGRITETA ---
-
+        # --- SYSTEM INTEGRITY LOGOVI (Tvoja originalna logika) ---
         with st.expander("🩺 System Integrity", expanded=False):
             if 'init_logs' in st.session_state:
                 for log in st.session_state['init_logs']:
-                    # Umesto st.caption, koristimo st.markdown za bolju kontrolu
-                    if "⏩" in log:
-                        # Koristimo standardni tekst, bez :gray, da bi bio oštar
-                        st.markdown(f"**{log}**")
-                    elif "🔄" in log:
-                        # Plava boja za promene (uočljivije)
-                        st.markdown(f":blue[{log}]")
-                    elif "✅" in log:
-                        # Zelena za kraj (kao i do sada, ali oštrije)
-                        st.markdown(f":green[{log}]")
-                    else:
-                        st.write(log)
+                    if "⏩" in log: st.markdown(f"**{log}**")
+                    elif "🔄" in log: st.markdown(f":blue[{log}]")
+                    elif "✅" in log: st.markdown(f":green[{log}]")
+                    else: st.write(log)
