@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 
+
 def render_explorer_tab(db):
     if 'current_df' in st.session_state:
         table_name, schema_name = st.session_state['selected_table_info']
@@ -30,109 +31,97 @@ def render_fk_explanation():
     **Preporuka:** Koristite **HASH** za sve Foreign Key kolone kako biste osigurali maksimalnu privatnost uz zadržavanje funkcionalnosti baze.
     """)
 
-
 def render_planner_tab(db):
     if 'ai_analysis' in st.session_state:
         st.subheader("🛠️ Review & Finalize Plan")
-
-        # Uzimamo osnovne informacije o tabeli
         table_name, schema_name = st.session_state['selected_table_info']
-
-        # --- FIX ZA BUG 2: Osiguranje da podaci odgovaraju selektovanoj tabeli ---
-        if 'current_df' in st.session_state:
-            # Proveravamo kolone u učitanom DataFrame-u naspram onoga što baza kaže za trenutnu tabelu
-            actual_db_cols = db.get_columns(table_name, schema_name)
-            current_df_cols = st.session_state['current_df'].columns.tolist()
-
-            # Ako se kolone ne podudaraju, stopiramo render dok korisnik ne klikne Load Table Data
-            if not all(col in actual_db_cols for col in current_df_cols[:3]):
-                st.warning(f"🔄 Data mismatch detected. Please click 'Load Table Data' for `{table_name}` to refresh.")
-                st.stop()
-
-        # 1. Unifikacija podataka (Pydantic vs Dict)
-        analysis_data = st.session_state['ai_analysis']
-        if hasattr(analysis_data, 'plan'):
-            plan_list = [p.model_dump() for p in analysis_data.plan]
-        elif isinstance(analysis_data, dict) and 'plan' in analysis_data:
-            plan_list = analysis_data['plan']
-        else:
-            plan_list = []
-
-        # --- FIX ZA BUG 1: Redosled kolona (Column First) ---
-        plan_df = pd.DataFrame(plan_list)
-        if not plan_df.empty:
-            # Definišemo željeni redosled: 'column' ide na početak
-            desired_order = ['column', 'is_pii', 'strategy', 'reason']
-            # Ređamo samo one koje postoje u DF-u
-            existing_cols = [c for c in desired_order if c in plan_df.columns]
-            plan_df = plan_df[existing_cols]
-
-        # --- NOVO: Detekcija Foreign Key kolona (Za upozorenje) ---
-        fk_relations = db.get_foreign_key_relations_postgres(schema_name)
-        current_table_fks = fk_relations[fk_relations['table_name'] == table_name]['column_name'].tolist()
-        fks_in_plan = [col for col in plan_list if col['column'] in current_table_fks]
-
-        if fks_in_plan:
-            with st.warning("⚠️ **Foreign Key Columns Detected**"):
-                cols_str = ", ".join([f"`{c['column']}`" for c in fks_in_plan])
-                st.write(f"Ove kolone povezuju tabele: {cols_str}")
-                st.info("💡 Za ove kolone koristite **HASH** ili **KEEP**.")
-                if st.button("❓ Saznaj više o FK anonimizaciji"):
-                    render_fk_explanation()
-
-        # 2. Data Editor (sada sa ispravnim redosledom kolona)
         editor_key = f"plan_editor_{table_name}"
+
+        # 1. ODREĐIVANJE "SOURCE OF TRUTH"
+        if 'current_plan' in st.session_state and st.session_state.get('last_table_for_plan') == table_name:
+            plan_list = st.session_state['current_plan']
+        else:
+            analysis_data = st.session_state['ai_analysis']
+            plan_list = [p.model_dump() if hasattr(p, 'model_dump') else p for p in (analysis_data.plan if hasattr(analysis_data, 'plan') else analysis_data.get('plan', []))]
+            st.session_state['current_plan'] = plan_list
+            st.session_state['last_table_for_plan'] = table_name
+
+        plan_df = pd.DataFrame(plan_list)
+
+        # 2. SINHRONIZACIJA SA EDITOROM (Čuvanje izmena dok korisnik menja redove)
+        if editor_key in st.session_state:
+            edits = st.session_state[editor_key].get('edited_rows', {})
+            for row_idx, changes in edits.items():
+                for col_name, new_val in changes.items():
+                    if row_idx < len(plan_df):
+                        plan_df.at[row_idx, col_name] = new_val
+            st.session_state['current_plan'] = plan_df.to_dict('records')
+
+        # 3. STATUS I REORGANIZACIJA
+        valid_strategies = ["keep", "hash", "mask", "mapping", "noise", "date_shift"]
+        plan_df['status'] = plan_df['strategy'].apply(
+            lambda x: "✅ OK" if str(x).lower().strip() in valid_strategies else "❌ MISSING"
+        )
+        
+        desired_order = ['status', 'column', 'is_pii', 'strategy', 'reason']
+        plan_df = plan_df[[c for c in desired_order if c in plan_df.columns]]
+
+        # 4. DATA EDITOR
         edited_plan_df = st.data_editor(
             plan_df,
             column_config={
+                "status": st.column_config.TextColumn("Status", disabled=True, width="small"),
                 "column": st.column_config.TextColumn("Database Column", disabled=True),
                 "is_pii": st.column_config.CheckboxColumn("PII", disabled=True),
-                "strategy": st.column_config.SelectboxColumn(
-                    "Strategy",
-                    options=["keep", "hash", "mask", "mapping", "noise", "date_shift"],
-                    required=True
-                ),
+                "strategy": st.column_config.SelectboxColumn("Strategy", options=valid_strategies, required=True),
                 "reason": st.column_config.TextColumn("AI Reasoning", disabled=True)
             },
-            hide_index=True,
-            use_container_width=True,
-            key=editor_key
+            hide_index=True, use_container_width=True, key=editor_key
         )
 
+        # DEFINIŠEMO plan_data ZA DALJU UPOTREBU (Fix za NameError)
         plan_data = edited_plan_df.to_dict('records')
         st.session_state['current_plan'] = plan_data
 
-        # 3. Privacy Score
-        total_cols = len(plan_data)
-        score_points = sum(100 if str(col['strategy']).lower() in ['mapping', 'hash'] else 50 if str(col['strategy']).lower() in ['mask', 'noise', 'date_shift'] else 0 for col in plan_data)
-        privacy_score = int(score_points / total_cols) if total_cols > 0 else 0
-
+        # 5. PRIVACY SCORE
+        score_points = sum(100 if str(col.get('strategy', '')).lower() in ['mapping', 'hash'] else 50 if str(col.get('strategy', '')).lower() in ['mask', 'noise', 'date_shift'] else 0 for col in plan_data)
+        privacy_score = int(score_points / len(plan_data)) if plan_data else 0
         st.write(f"**Current Privacy Score: {privacy_score}%**")
         st.progress(privacy_score / 100)
 
-        if privacy_score < 40: st.error("🔴 Low Protection")
-        elif privacy_score < 75: st.warning("🟡 Balanced Protection")
-        else: st.success("🟢 High Protection")
-
         st.divider()
 
-        # 4. Akcije
-        col1, col2 = st.columns(2)
-        with col1:
+        # 6. AKCIJE
+        c1, c2 = st.columns(2)
+        with c1:
             if st.button("🚀 Run Anonymization Preview", use_container_width=True):
-                with st.spinner("Processing data..."):
-                    current_salt = st.session_state.get('salt_input', 'default_salt')
-                    full_df = db.read_table(table_name, schema_name)
-                    anon_df = db.apply_anonymization_rules(full_df, plan_data, salt=current_salt)
+                current_salt = st.session_state.get('salt_input', 'default_salt')
+                # Čistimo privremenu 'status' kolonu
+                clean_plan = [{k: v for k, v in row.items() if k != 'status'} for row in plan_data]
+                
+                with st.spinner("Applying rules..."):
+                    raw_table = db.read_table(table_name, schema_name)
+                    anon_df = db.apply_anonymization_rules(raw_table, clean_plan, salt=current_salt)
                     db.save_anonymized_table(anon_df, table_name, target_schema='anon')
-                    db.log_action(st.session_state.get('user_name', 'Admin'), schema_name, table_name, privacy_score, current_salt)
-                    st.success(f"✅ Processed and saved to 'anon.{table_name}'")
+                    st.success(f"✅ Saved to 'anon.{table_name}'")
 
-        with col2:
+        with c2:
             if st.button("💾 Save Plan in DB", type="primary", use_container_width=True):
-                db.save_ai_plan(schema_name, table_name, plan_data)
-                st.success("Plan saved successfully!")
-                st.rerun()
+                import time 
+                valid_strategies = ["keep", "hash", "mask", "mapping", "noise", "date_shift"]
+                
+                missing = [item.get('column') for item in plan_data if str(item.get('strategy', '')).lower().strip() not in valid_strategies]
+                
+                if missing:
+                    missing_str = ", ".join([f"`{m}`" for m in missing])
+                    st.error(f"❌ Missing strategies for: {missing_str}")
+                else:
+                    clean_plan = [{k: v for k, v in row.items() if k != 'status'} for row in plan_data]
+                    db.save_ai_plan(schema_name, table_name, clean_plan)
+                    st.success("✅ Plan saved!")
+                    time.sleep(0.8)
+                    st.rerun()
+
 
 def render_comparison_tab(db):
     st.subheader("🔍 Side-by-Side Comparison")
