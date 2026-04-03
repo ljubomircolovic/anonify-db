@@ -32,10 +32,56 @@ def render_fk_explanation():
     """)
 
 def render_planner_tab(db):
-    if 'ai_analysis' in st.session_state:
-        st.subheader("🛠️ Review & Finalize Plan")
+    if 'selected_table_info' in st.session_state:
         table_name, schema_name = st.session_state['selected_table_info']
         editor_key = f"plan_editor_{table_name}"
+
+        st.subheader("🛠️ Review & Finalize Plan")
+        # Koristimo Markdown sa HTML-om za veću kontrolu nad stilom
+        st.markdown(f"""
+            <div style="background-color: #e8f4f8; padding: 15px; border-radius: 10px; border-left: 5px solid #2e86de; margin-bottom: 20px;">
+                <span style="color: #576574; font-size: 16px; font-weight: bold;">Current Table for Analysis:</span><br>
+                <span style="color: #2e86de; font-size: 24px; font-weight: 800; font-family: 'Courier New', monospace;">
+                    {schema_name}.{table_name}
+                </span>
+            </div>
+        """, unsafe_allow_html=True)
+
+        # --- NOVO: ACTION BAR (AI Scan, Manual & Refresh) ---
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+
+        with col_btn1:
+            if st.button("🤖 AI Scan", use_container_width=True, type="secondary"):
+                with st.spinner("Consulting AI..."):
+                    # Uzimamo mali uzorak za AI
+                    raw_df = db.read_table(table_name, schema_name, limit=10)
+                    agent = st.session_state.get('agent')
+                    st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df, agent, schema_name=schema_name)
+                    # Brišemo trenutni plan da bi se osvežio sa novim AI rezultatima
+                    if 'current_plan' in st.session_state: del st.session_state['current_plan']
+                    st.rerun()
+
+        with col_btn2:
+            if st.button("✍️ Manual", use_container_width=True):
+                columns = db.get_columns(table_name, schema_name)
+                st.session_state['ai_analysis'] = {
+                    "plan": [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual Entry"} for c in columns]
+                }
+                if 'current_plan' in st.session_state: del st.session_state['current_plan']
+                st.rerun()
+
+        with col_btn3:
+            if st.button("👁️ Refresh Data Preview", use_container_width=True):
+                df = db.read_table(table_name, schema_name, limit=100)
+                st.session_state['current_df'] = df
+                st.success("Data refreshed!")
+
+        st.divider()
+
+        # Provera da li imamo analizu (ako nemamo, ne crtamo editor još)
+        if 'ai_analysis' not in st.session_state:
+            st.warning("⚠️ No analysis found. Please click **AI Scan** to start.")
+            return
 
         # 1. ODREĐIVANJE "SOURCE OF TRUTH"
         if 'current_plan' in st.session_state and st.session_state.get('last_table_for_plan') == table_name:
@@ -48,7 +94,7 @@ def render_planner_tab(db):
 
         plan_df = pd.DataFrame(plan_list)
 
-        # 2. SINHRONIZACIJA SA EDITOROM (Čuvanje izmena dok korisnik menja redove)
+        # 2. SINHRONIZACIJA SA EDITOROM
         if editor_key in st.session_state:
             edits = st.session_state[editor_key].get('edited_rows', {})
             for row_idx, changes in edits.items():
@@ -62,7 +108,6 @@ def render_planner_tab(db):
         plan_df['status'] = plan_df['strategy'].apply(
             lambda x: "✅ OK" if str(x).lower().strip() in valid_strategies else "❌ MISSING"
         )
-        
         desired_order = ['status', 'column', 'is_pii', 'strategy', 'reason']
         plan_df = plan_df[[c for c in desired_order if c in plan_df.columns]]
 
@@ -79,7 +124,6 @@ def render_planner_tab(db):
             hide_index=True, use_container_width=True, key=editor_key
         )
 
-        # DEFINIŠEMO plan_data ZA DALJU UPOTREBU (Fix za NameError)
         plan_data = edited_plan_df.to_dict('records')
         st.session_state['current_plan'] = plan_data
 
@@ -91,36 +135,47 @@ def render_planner_tab(db):
 
         st.divider()
 
-        # 6. AKCIJE
+        # 6. AKCIJE (Save & Move to Next)
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🚀 Run Anonymization Preview", use_container_width=True):
                 current_salt = st.session_state.get('salt_input', 'default_salt')
-                # Čistimo privremenu 'status' kolonu
                 clean_plan = [{k: v for k, v in row.items() if k != 'status'} for row in plan_data]
-                
-                with st.spinner("Applying rules..."):
+                with st.spinner("Processing preview..."):
                     raw_table = db.read_table(table_name, schema_name)
                     anon_df = db.apply_anonymization_rules(raw_table, clean_plan, salt=current_salt)
                     db.save_anonymized_table(anon_df, table_name, target_schema='anon')
-                    st.success(f"✅ Saved to 'anon.{table_name}'")
+                    st.success(f"✅ Preview saved to 'anon.{table_name}'")
 
         with c2:
-            if st.button("💾 Save Plan in DB", type="primary", use_container_width=True):
-                import time 
-                valid_strategies = ["keep", "hash", "mask", "mapping", "noise", "date_shift"]
-                
+            if st.button("💾 Save Plan & Next Table", type="primary", use_container_width=True):
+                import time
                 missing = [item.get('column') for item in plan_data if str(item.get('strategy', '')).lower().strip() not in valid_strategies]
-                
+
                 if missing:
-                    missing_str = ", ".join([f"`{m}`" for m in missing])
-                    st.error(f"❌ Missing strategies for: {missing_str}")
+                    st.error(f"❌ Missing strategies for: {', '.join([f'`{m}`' for m in missing])}")
                 else:
                     clean_plan = [{k: v for k, v in row.items() if k != 'status'} for row in plan_data]
                     db.save_ai_plan(schema_name, table_name, clean_plan)
-                    st.success("✅ Plan saved!")
-                    time.sleep(0.8)
-                    st.rerun()
+                    st.success(f"✅ Plan for `{table_name}` saved!")
+
+                    all_tables = st.session_state.get('all_tables_list', [])
+                    if all_tables:
+                        try:
+                            current_idx = all_tables.index(table_name)
+                            if current_idx + 1 < len(all_tables):
+                                next_table = all_tables[current_idx + 1]
+                                st.session_state['selected_table_info'] = (next_table, schema_name)
+                                for key in ['current_df', 'ai_analysis', 'current_plan', 'last_table_for_plan']:
+                                    if key in st.session_state: del st.session_state[key]
+                                st.info(f"➡️ Automatski prelazak na: `{next_table}`")
+                                time.sleep(1.2)
+                                st.rerun()
+                            else:
+                                st.balloons()
+                                st.success("🎯 Sve tabele su obrađene!")
+                        except ValueError:
+                            st.error("Problem sa identifikacijom redosleda tabela.")
 
 
 def render_comparison_tab(db):

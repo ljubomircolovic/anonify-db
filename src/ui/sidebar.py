@@ -17,7 +17,7 @@ def get_all_connections():
     # Zatim prolazimo kroz SVE environment varijable
     for key, value in os.environ.items():
         if key.startswith("DB_URL_"):
-            # Pretvaramo "DB_URL_STAGING" u lepše ime "Staging"
+            # Pretvaramo "DB_URL_STAGING" u lepše ime "Staging"Q
             clean_name = key.replace("DB_URL_", "").replace("_", " ").title()
             connections[clean_name] = value
 
@@ -29,34 +29,11 @@ DB_CONFIGS = get_all_connections()
 
 def render_sidebar(agent):
     with st.sidebar:
-        st.title("🛡️ AnonifyDB")
-        st.caption(f"👤 User: **{st.session_state.get('user_name', 'Admin')}**")
-        if st.button("Logout", use_container_width=True):
-            st.session_state['authenticated'] = False
-            st.rerun()
-
-        st.divider()
-
-        # --- NOVO: CONNECTION MANAGER ---
-        st.subheader("🔌 Connection Manager")
-        selected_env = st.selectbox("Target Environment", options=list(DB_CONFIGS.keys()))
-        current_url = DB_CONFIGS[selected_env]
-
-        # Inicijalizacija DBManager-a (samo ako se promenila baza)
-        if 'db' not in st.session_state or st.session_state.get('last_env') != selected_env:
-            st.session_state['db'] = DBManager(db_url=current_url)
-            st.session_state['last_env'] = selected_env
-
+        if 'db' not in st.session_state:
+            st.error("Database connection not initialized in header.")
+            return
+        
         db = st.session_state['db']
-
-        if st.button("⚡ Test Connection", use_container_width=True):
-            with st.spinner("Checking..."):
-                success, message = db.test_connection()
-                if success: st.success(message)
-                else: st.error(message)
-
-        st.divider()
-
         # --- SECURITY SEKCIJA ---
         st.subheader("🔑 Security")
         st.session_state['salt_input'] = st.text_input("Secret Salt", value="default_salt", type="password")
@@ -82,7 +59,7 @@ def render_sidebar(agent):
 
                 tables = db.get_tables_in_schema(selected_schema)
                 if tables:
-                    # --- FIX: Rešavamo Double-Click bug ---
+                    # 1. Selektujemo tabele koje ulaze u proces
                     if 'last_confirmed_tables' not in st.session_state:
                         st.session_state['last_confirmed_tables'] = []
 
@@ -93,16 +70,20 @@ def render_sidebar(agent):
                         key='batch_table_selector'
                     )
 
-                    # Ako se selekcija promenila, odmah osvežavamo Execution Order
+                    # Resetuj redosled ako se promeni multiselect
                     if selected_tables != st.session_state['last_confirmed_tables']:
                         st.session_state['last_confirmed_tables'] = selected_tables
                         st.rerun()
 
                     if selected_tables:
-                        # 1. Dinamički redosled izvršavanja
+                        # Dobijamo ispravan redosled zbog Foreign Keys
                         ordered_tables = db.get_execution_order(selected_tables, selected_schema)
-
                         
+                        # --- KLJUČNA LINIJA ZA AUTOMATIZACIJU ---
+                        # Ovo Planner koristi da zna šta je "Next"
+                        st.session_state['all_tables_list'] = ordered_tables
+
+                        # 2. Vizuelni status procesa (Samo prikaz, ne može da se menja ovde)
                         status_icons = []
                         for t in ordered_tables:
                             if db.get_saved_plan(selected_schema, t):
@@ -110,85 +91,55 @@ def render_sidebar(agent):
                             else:
                                 status_icons.append(f"⚠️ `{t}`")
                         
-                        st.info(f"⛓️ **Execution Order & Status:** \n{' ➔ '.join(status_icons)}")
-                        
-                        if any("⚠️" in icon for icon in status_icons):
-                            st.warning("Napomena: Tabele sa ⚠️ nemaju sačuvan plan. AI Scan-uj ih i klikni 'Save Plan in DB' pre Batch-a.")
+                        st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join(status_icons)}")
 
-
-                        # 2. Selektor za trenutnu tabelu (za analizu)
-                        selected_table = st.selectbox("Current Table for Analysis:", options=ordered_tables)
-                        columns = db.get_columns(selected_table, selected_schema)
-
-                        with st.expander("🔍 Filtering & Schema", expanded=False):
-                            where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100", key=f"where_{selected_table}")
-                            limit_val = st.number_input("Limit rows:", value=1000, min_value=1, key=f"limit_{selected_table}")
-                            st.code(", ".join(columns))
-
-                        # 3. Učitavanje/Skeniranje plana
-                        saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
-                        if saved_plan_data:
-                            if st.button("📂 Load Saved Plan", use_container_width=True):
-                                st.session_state['ai_analysis'] = saved_plan_data
-                                st.success(f"✅ Plan for {selected_table} loaded!")
-                                st.rerun()
-                        
-                        if st.button("🚀 Load Table Data", type="primary", use_container_width=True):
-                            with st.spinner(f"Fetching {selected_table}..."):
-                                df = db.read_table(selected_table, selected_schema, where_filter=where_clause, limit=limit_val)
+                        # 3. Dugme koje te "ubacuje" u prvu neobrađenu tabelu
+                        if st.button("🚀 Start Planning / Load Data", type="primary", use_container_width=True):
+                            # Ako već nismo negde u procesu, kreni od prve tabele
+                            if 'selected_table_info' not in st.session_state:
+                                first_table = ordered_tables[0]
+                                st.session_state['selected_table_info'] = (first_table, selected_schema)
+                            
+                            # Učitavamo podatke za trenutno aktivnu tabelu (onu iz session_state)
+                            current_table, _ = st.session_state['selected_table_info']
+                            
+                            with st.spinner(f"Loading {current_table}..."):
+                                df = db.read_table(current_table, selected_schema, limit=100)
                                 st.session_state['current_df'] = df
-                                st.session_state['selected_table_info'] = (selected_table, selected_schema)
-                                st.success(f"✅ Loaded {len(df)} rows!")
-
-                        st.divider()
-                        st.subheader("🤖 Analysis")
-                        c1, c2 = st.columns(2)
-                        if c1.button("Manual", use_container_width=True):
-                            st.session_state['ai_analysis'] = {"plan": [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual"} for c in columns]}
-                            st.rerun()
-                        if c2.button("AI Scan", use_container_width=True):
-                            with st.spinner("Consulting AI..."):
-                                raw_df = db.read_table(selected_table, selected_schema, limit=10)
-                                st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df, agent, schema_name=selected_schema)
+                                
+                                # Automatski AI Scan ako nema plana, da uštedimo jedan klik
+                                if not db.get_saved_plan(selected_schema, current_table):
+                                    raw_df_for_ai = db.read_table(current_table, selected_schema, limit=10)
+                                    st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df_for_ai, agent, schema_name=selected_schema)
+                                
+                                st.success(f"Ready! Go to 'Planner' tab to review `{current_table}`.")
                                 st.rerun()
 
-                        # --- DINAMIČKI BATCH EXECUTION ---
+                        # --- DINAMIČKI BATCH EXECUTION (Samo dugme za finalni run) ---
                         st.divider()
-                        st.subheader("🚀 Batch Execution")
+                        st.subheader("🔥 Batch Execution")
                         target_schema = st.text_input("Target Schema Name:", value=f"{selected_schema}_anon")
 
                         if st.button("🔥 RUN FULL ANONYMIZATION", type="primary", use_container_width=True):
                             with st.status("Executing Enterprise Pipeline...", expanded=True) as status:
                                 try:
-                                    # Faza 0: Clean Wipe
-                                    status.write(f"🗑️ Dropping schema `{target_schema}`...")
-                                    db.drop_target_schema(target_schema)
-                                    
-                                    # Faza 1: Skupljanje planova iz baze
-                                    status.write(f"📂 Collecting plans for {len(selected_tables)} tables...")
                                     full_plan = {}
                                     for t in ordered_tables:
                                         p = db.get_saved_plan(selected_schema, t)
                                         if p: full_plan[t] = p['plan']
                                     
                                     if len(full_plan) < len(selected_tables):
-                                        st.error("❌ Missing saved plans! Please Scan and Save plans for all tables.")
+                                        st.error("❌ Missing saved plans! Scan and Save all tables first.")
                                         st.stop()
 
-                                    # Faza 2: Izvršavanje
                                     db.execute_anonymization_batch(selected_schema, target_schema, full_plan)
-                                    
                                     status.update(label="✅ Success!", state="complete")
                                     st.balloons()
-                                    st.success(f"Database anonymized in `{target_schema}`")
                                 except Exception as e:
-                                    status.update(label="❌ Failed", state="error")
                                     st.error(f"Error: {str(e)}")
                     else:
                         st.warning("👈 Please select tables to start.")
-                    st.subheader("")
-                    st.subheader("")
                 else:
-                    st.warning("No tables found in this schema.")
+                    st.warning("No tables found.")
             except Exception as e:
                 st.error(f"DB Error: {e}")
