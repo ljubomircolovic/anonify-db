@@ -21,15 +21,13 @@ if not check_login():
     st.stop()
 
 # --- 2. DYNAMIC HEADER (Desna strana) ---
-# Kolona 1 je prazna (pogura sve udesno), Kolona 2 je naš "System Tray"
 h_col1, h_col2 = st.columns([7, 3])
 
 with h_col2:
-# Red 1: User & Logout
+    # Red 1: User & Logout
     u_col1, u_col2 = st.columns([2, 1])
     u_col1.markdown(f"👤 **{st.session_state.get('user_name', 'Admin')}**")
 
-    # IZBAČENO size="small"
     if u_col2.button("Logout", use_container_width=True):
         st.session_state['authenticated'] = False
         st.rerun()
@@ -42,7 +40,7 @@ with h_col2:
         label_visibility="collapsed"
     )
 
-    # Logika za promenu baze (ostaje ista, samo je ovde)
+    # Logika za promenu baze
     if 'db' not in st.session_state or st.session_state.get('last_env') != selected_env:
         current_url = DB_CONFIGS[selected_env]
         st.session_state['db'] = DBManager(db_url=current_url)
@@ -50,14 +48,13 @@ with h_col2:
 
     db = st.session_state['db']
 
-    # Red 3: Test Connection (Diskretno dugme)
+    # Red 3: Test Connection
     if st.button("⚡ Test Connection", use_container_width=True):
         success, message = db.test_connection()
         if success: st.success(message)
         else: st.error(message)
 
-# --- 2. INICIJALIZACIJA (State Management) ---
-# Inicijalizujemo Agenta i DB samo jednom da ne trošimo resurse
+# --- 3. INICIJALIZACIJA (State Management) ---
 if 'agent' not in st.session_state:
     st.session_state['agent'] = PrivacyAgent()
 
@@ -65,22 +62,26 @@ if 'db_initialized' not in st.session_state:
     st.session_state['init_logs'] = initialize_metadata()
     st.session_state['db_initialized'] = True
 
-# Lokalni aliasi radi lakšeg korišćenja
+# --- NOVO: Inicijalizacija Navigacione Istorije ---
+if 'navigation_history' not in st.session_state:
+    st.session_state['navigation_history'] = []
+if 'history_pointer' not in st.session_state:
+    st.session_state['history_pointer'] = -1
+
+# Lokalni aliasi
 db = st.session_state['db']
 agent = st.session_state['agent']
 
-# --- 3. UI: SIDEBAR ---
-# Sada 'agent' i 'db' garantovano postoje pre ovog poziva
+# --- 4. UI: SIDEBAR ---
 render_sidebar(agent)
 
-# --- 4. UI: GLAVNI SADRŽAJ ---
+# --- 5. UI: GLAVNI SADRŽAJ ---
 st.title("🛡️ AnonifyDB Data Engineering Tool")
 
 if 'selected_table_info' in st.session_state:
-    # Prosleđujemo 'db' instancu tabovima
+    # Prosleđujemo 'db' instancu tabovima (render_tabs će unutar sebe pozvati render_planner_tab)
     render_tabs(db)
 else:
-
     hour = datetime.datetime.now().hour
     greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
     user = st.session_state.get('user_name', 'User')

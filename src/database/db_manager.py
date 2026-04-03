@@ -190,12 +190,12 @@ class DBManager:
         """
         import hashlib
         df_anon = df.copy()
-        
+
         # Ovde je bila greška: koristimo 'table_plan' umesto 'plan'
         for item in table_plan:
             col = item['column']
             strategy = item.get('strategy', 'keep').lower()
-            
+
             if col not in df_anon.columns or strategy == 'keep':
                 continue
 
@@ -206,14 +206,14 @@ class DBManager:
                 df_anon[col] = [self.fake.last_name() for _ in range(len(df_anon))]
             elif 'faker_email' in strategy:
                 df_anon[col] = [self.fake.email() for _ in range(len(df_anon))]
-            
+
             # --- 2. DETERMINISTIČKI MAPPING (Tvoja custom logika iz baze) ---
             elif strategy == 'mapping':
                 # Mapiramo na osnovu imena kolone (fallback na first_name ako ne prepoznamo)
                 category = "first_name"
                 if "last" in col.lower(): category = "last_name"
                 elif "city" in col.lower(): category = "city"
-                
+
                 m_list = self._get_mapping_values_by_locale(category, 'de')
                 if m_list:
                     df_anon[col] = df_anon[col].apply(lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x)
@@ -223,7 +223,7 @@ class DBManager:
                 df_anon[col] = df_anon[col].apply(
                     lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
                 )
-            
+
             elif strategy == 'mask':
                 df_anon[col] = df_anon[col].apply(
                     lambda x: self.mask_value(x) if pd.notnull(x) else x
@@ -313,23 +313,45 @@ class DBManager:
             return False
 
     def get_saved_plan(self, schema_name, table_name):
-        """Loads the plan from the plan_json column."""
+        """Loads the plan from the plan_json column and ensures it is a list."""
+        import json
+        from sqlalchemy import text
+
+        # IZBACILI SMO 'ORDER BY created_at' jer kolona ne postoji u bazi
         query = text("""
             SELECT plan_json FROM metadata.ai_plans
             WHERE schema_name = :s AND table_name = :t
+            LIMIT 1
         """)
+
         try:
             with self.engine.connect() as conn:
                 result = conn.execute(query, {"s": schema_name, "t": table_name}).fetchone()
+
                 if result and result[0]:
-                    # Ako je u bazi JSONB, SQLAlchemy ?e ga vratiti kao listu/dict
-                    # Ako je obi?an TEXT, moramo uraditi json.loads
                     data = result[0]
-                    plan_list = data if isinstance(data, list) else json.loads(data)
-                    return {"plan": plan_list}
+
+                    # 1. Parsiranje: TEXT -> JSON (list/dict), JSONB -> already Python object
+                    if isinstance(data, str):
+                        try:
+                            plan_list = json.loads(data)
+                        except json.JSONDecodeError:
+                            print(f"Error decoding JSON string for {table_name}")
+                            return None
+                    else:
+                        plan_list = data
+
+                    # 2. Raspakivanje ako je unutar {"plan": [...]}
+                    if isinstance(plan_list, dict) and "plan" in plan_list:
+                        return plan_list["plan"]
+                    
+                    # 3. Osiguravamo da vraćamo listu (bitno za st.data_editor)
+                    return plan_list if isinstance(plan_list, list) else None
+
                 return None
         except Exception as e:
-            print(f"Error loading from plan_json: {e}")
+            # Ovo će ti sada ispisati u logu ako postoji bilo koji drugi problem
+            print(f"Error loading from plan_json for {table_name}: {e}")
             return None
 
     def log_action(self, user, schema, table, score, salt, status="SUCCESS"):
@@ -538,19 +560,19 @@ class DBManager:
         fks = conn.execute(query).fetchall()
         for fk in fks:
             conn.execute(text(f"ALTER TABLE {schema}.{table} DROP CONSTRAINT {fk[0]}"))
-            
+
 
     def restore_foreign_keys(self, source_schema, target_schema, tables):
         """Prebacuje FK constraints sa izvora na target."""
         query = text("""
-            SELECT 
-                conname, 
+            SELECT
+                conname,
                 pg_get_constraintdef(oid) as def
-            FROM pg_constraint 
-            WHERE contype = 'f' 
+            FROM pg_constraint
+            WHERE contype = 'f'
             AND conrelid::regclass::text LIKE :schema_prefix
         """)
-        
+
         with self.engine.connect() as conn:
             # Tražimo sve FK-ove u izvornoj šemi
             res = conn.execute(query, {"schema_prefix": f"{source_schema}.%"})
@@ -560,11 +582,11 @@ class DBManager:
                 # Modifikujemo definiciju da pokazuje na target šemu
                 # Primer: REFERENCES ecommerce.customers(id) -> REFERENCES ecommerce_anon.customers(id)
                 new_def = con_def.replace(f"{source_schema}.", f"{target_schema}.")
-                
+
                 # Nađi na kojoj je tabeli taj constraint
                 table_query = text(f"SELECT relname FROM pg_class c JOIN pg_constraint con ON con.conrelid = c.oid WHERE con.conname = '{con_name}'")
                 tab_name = conn.execute(table_query).fetchone()[0]
-                
+
                 if tab_name in tables:
                     try:
                         conn.execute(text(f'ALTER TABLE "{target_schema}"."{tab_name}" ADD CONSTRAINT "{con_name}" {new_def}'))
@@ -574,36 +596,55 @@ class DBManager:
 
     def execute_anonymization_batch(self, source_schema, target_schema, execution_plan):
         # Osiguravamo da tabele idu po redosledu zavisnosti
-        ordered_tables = list(execution_plan.keys()) 
-        
+        ordered_tables = list(execution_plan.keys())
+
         # Faza 1: DDL Skeleton (Bez FK)
         self.prepare_anonymization_target(source_schema, target_schema, ordered_tables)
 
         for table in ordered_tables:
             print(f"⚡ Processing: {table}")
-            
+
             # Koristimo text() za sigurnost
             query = text(f'SELECT * FROM "{source_schema}"."{table}"')
             df = pd.read_sql(query, self.engine)
-            
+
             if df.empty:
                 print(f"⚠️ Table {table} is empty, skipping...")
                 continue
-                
+
             # Faza 2: Transform
             df_anon = self.apply_anonymization_rules(df, execution_plan[table])
-            
+
             # Load (Koristimo 'append' jer je prepare_anonymization_target već napravio tabelu)
             df_anon.to_sql(table, self.engine, schema=target_schema, if_exists='append', index=False)
-            
+
         # Faza 3: Rekonstrukcija veza
         print("🔗 Rekonstrukcija Foreign Key relacija...")
         self.restore_foreign_keys(source_schema, target_schema, ordered_tables)
         print("✅ Batch proces uspešno završen!")
-        
-        
+
+
     def drop_target_schema(self, target_schema):
         from sqlalchemy import text
         with self.engine.connect() as conn:
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{target_schema}" CASCADE'))
             conn.commit()
+
+    def get_primary_keys(self, schema, table):
+        """Vraća listu kolona koje su Primary Key za datu tabelu koristeći DDL meta-podatke."""
+        query = """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+            AND tc.table_schema = %s
+            AND tc.table_name = %s;
+        """
+        try:
+            df = pd.read_sql(query, self.engine, params=(schema, table))
+            return df['column_name'].tolist()
+        except Exception as e:
+            print(f"Error fetching PKs: {e}")
+            return []
