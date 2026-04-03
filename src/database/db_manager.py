@@ -9,6 +9,7 @@ from faker import Faker
 import os
 from openai import AzureOpenAI
 from dotenv import load_dotenv
+from sqlalchemy import text
 
 # Učitava varijable iz .env fajla u sistemsko okruženje
 load_dotenv()
@@ -45,11 +46,16 @@ class DBManager:
 
     def get_all_schemas(self):
         inspector = inspect(self.engine)
-        return inspector.get_schema_names()
+        all_schemas = inspector.get_schema_names()
+        # Isključujemo sistemske šeme i sve što sadrži 'anon'
+        forbidden = ['information_schema', 'pg_catalog', 'metadata']
+        return [s for s in all_schemas if s not in forbidden and 'anon' not in s.lower()]
 
     def get_tables_in_schema(self, schema='public'):
         inspector = inspect(self.engine)
-        return inspector.get_table_names(schema=schema)
+        all_tables = inspector.get_table_names(schema=schema)
+        # Vraćamo samo tabele koje nemaju 'anon' u nazivu
+        return [t for t in all_tables if 'anon' not in t.lower()]
 
     def read_table(self, table_name, schema_name='public', where_filter=None, limit=None, params=None):
         """Čita tabelu koristeći parametrizovan SQL radi bezbednosti."""
@@ -178,89 +184,53 @@ class DBManager:
         return pool[index]
 
 
-
-    def apply_anonymization(self, df, plan, salt="default_secret", locale="de"):
+    def apply_anonymization_rules(self, df, table_plan, salt="secret_123"):
+        """
+        Transformacija podataka na nivou tabele.
+        """
         import hashlib
-        import pandas as pd
-        import numpy as np
-
-        anonymized_df = df.copy()
-        notifications = []
-        # Keširamo mapping liste: ključ će biti 'category_locale' (npr. 'first_name_de')
-        cached_mappings = {}
-
-        for item in plan:
+        df_anon = df.copy()
+        
+        # Ovde je bila greška: koristimo 'table_plan' umesto 'plan'
+        for item in table_plan:
             col = item['column']
             strategy = item.get('strategy', 'keep').lower()
-            if col not in anonymized_df.columns: continue
+            
+            if col not in df_anon.columns or strategy == 'keep':
+                continue
 
-            # --- 1. STRATEGIJA: MAPPING (Sa Locale podrškom) ---
-            if strategy == 'mapping':
-
+            # --- 1. FAKER STRATEGIJE ---
+            if 'faker_first_name' in strategy:
+                df_anon[col] = [self.fake.first_name() for _ in range(len(df_anon))]
+            elif 'faker_last_name' in strategy:
+                df_anon[col] = [self.fake.last_name() for _ in range(len(df_anon))]
+            elif 'faker_email' in strategy:
+                df_anon[col] = [self.fake.email() for _ in range(len(df_anon))]
+            
+            # --- 2. DETERMINISTIČKI MAPPING (Tvoja custom logika iz baze) ---
+            elif strategy == 'mapping':
+                # Mapiramo na osnovu imena kolone (fallback na first_name ako ne prepoznamo)
                 category = "first_name"
-                if any(k in col.lower() for k in ['last', 'prezime']): category = "last_name"
-                elif any(k in col.lower() for k in ['city', 'grad', 'mesto']): category = "city"
-                elif any(k in col.lower() for k in ['company', 'firma', 'preduzece']): category = "company_name"
-
-                cache_key = f"{category}_{locale}"
-
-                if cache_key not in cached_mappings:
-                    cached_mappings[cache_key] = self._get_mapping_values_by_locale(category, locale)
-
-                m_list = cached_mappings[cache_key]
-
+                if "last" in col.lower(): category = "last_name"
+                elif "city" in col.lower(): category = "city"
+                
+                m_list = self._get_mapping_values_by_locale(category, 'de')
                 if m_list:
-                    # Ako imamo podatke u bazi (npr. za 'de'), radi mapping
-                    anonymized_df[col] = anonymized_df[col].apply(
-                        lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x
-                    )
-                    notifications.append(f"✅ Column '{col}' mapped using '{category}' ({locale}).")
-                else:
-                    # --- OVO JE TAJ FALLBACK ---
-                    # Ako nema podataka (npr. za 'us'), nemoj da pukneš, nego udri HASH
-                    notifications.append(f"🔄 No '{locale}' data for '{category}'. Applied Hash instead.")
-                    anonymized_df[col] = anonymized_df[col].apply(
-                        lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
-                    )
+                    df_anon[col] = df_anon[col].apply(lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x)
 
-            # --- 2. LOGIKA ZA HASH (Ostaje ista) ---
-            if strategy == 'hash':
-                anonymized_df[col] = anonymized_df[col].apply(
+            # --- 3. HASH / MASK / NOISE ---
+            elif strategy == 'hash':
+                df_anon[col] = df_anon[col].apply(
                     lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
                 )
-
-            # --- 3. LOGIKA ZA MASK (Ostaje ista) ---
+            
             elif strategy == 'mask':
-                # Pretpostavljam da imaš metodu self.mask_value, ako ne, koristi x.mask(...)
-                anonymized_df[col] = anonymized_df[col].apply(
-                    lambda x: f"***{str(x)[-3:]}" if pd.notnull(x) else x
+                df_anon[col] = df_anon[col].apply(
+                    lambda x: self.mask_value(x) if pd.notnull(x) else x
                 )
 
-            # --- 4. LOGIKA ZA NOISE (Deterministički šum) ---
-            elif strategy == 'noise':
-                if pd.api.types.is_numeric_dtype(anonymized_df[col]):
-                    def get_stable_noise(val):
-                        if pd.isnull(val): return val
-                        combined = f"{val}{salt}".encode()
-                        h = int(hashlib.md5(combined).hexdigest()[:8], 16)
-                        noise_percent = 0.95 + (h % 100) / 1000.0 # Šum +/- 5%
-                        return round(val * noise_percent, 2)
-                    anonymized_df[col] = anonymized_df[col].apply(get_stable_noise)
+        return df_anon
 
-            # --- 5. LOGIKA ZA DATE_SHIFT ---
-            elif strategy == 'date_shift':
-                try:
-                    anonymized_df[col] = pd.to_datetime(anonymized_df[col])
-                    def shift_date(val):
-                        if pd.isnull(val): return val
-                        combined = f"{val}{salt}".encode()
-                        h = int(hashlib.md5(combined).hexdigest()[:8], 16)
-                        days_to_shift = (h % 10) - 5 # Pomeraj +/- 5 dana
-                        return val + pd.Timedelta(days=days_to_shift)
-                    anonymized_df[col] = anonymized_df[col].apply(shift_date)
-                except: pass
-
-        return anonymized_df, notifications
 
     # --- POMOĆNE METODE KOJE MORAŠ IMATI U DBManager KLASI ---
 
@@ -474,7 +444,7 @@ class DBManager:
         from sqlalchemy import text
         # Koristimo duple navodnike za svaki deo naziva da izbegnemo probleme sa Case-Sensitivity
         query = text(f'SELECT column_name, is_pii, strategy, reason FROM "{schema_name}"."anon_forced_mappings"')
-        
+
         try:
             with self.engine.connect() as conn:
                 result = conn.execute(query)
@@ -488,7 +458,7 @@ class DBManager:
             # Ovde ćemo ispisati tačnu grešku u konzolu da je vidimo u Docker logovima
             print(f"❌ DATABASE ERROR: {str(e)}")
             return {}
-        
+
     # U src/database/db_manager.py
 
 # U src/database/db_manager.py
@@ -496,7 +466,7 @@ class DBManager:
     def analyze_table_structure(self, df_sample, agent, schema_name='ecommerce'):
         columns = df_sample.columns.tolist()
         db_mappings = self.load_forced_mappings_from_db(schema_name)
-        
+
         to_analyze = []  # Lista za AI
         final_plan = []  # Konačan rezultat
 
@@ -511,7 +481,7 @@ class DBManager:
                 # Pripremamo za grupni AI poziv
                 sample_data = df_sample[col].dropna().head(3).tolist()
                 to_analyze.append({
-                    "column": col, 
+                    "column": col,
                     "sample_values": [str(v) for v in sample_data]
                 })
 
@@ -529,3 +499,111 @@ class DBManager:
                     })
 
         return {"plan": final_plan}
+
+    def prepare_anonymization_target(self, source_schema, target_schema, ordered_tables):
+        """
+        Faza 1: Kreira šemu i tabele sa indeksima, ali BEZ stranih ključeva.
+        """
+        with self.engine.connect() as conn:
+            # 1. Osiguraj da target šema postoji
+            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
+
+            for table in ordered_tables:
+                print(f"🏗️  Kreiram skeleton za: {target_schema}.{table}")
+
+                # Brišemo staru tabelu ako postoji (CASCADE čisti i stare veze)
+                conn.execute(text(f"DROP TABLE IF EXISTS {target_schema}.{table} CASCADE"))
+
+                # LIKE ... INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
+                # Namerno NE uključujemo FK u ovom koraku ako verzija Postgresa to dozvoljava,
+                # ili ih čistimo odmah nakon kreiranja.
+                conn.execute(text(f"""
+                    CREATE TABLE {target_schema}.{table}
+                    (LIKE {source_schema}.{table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)
+                """))
+
+                # Uklanjanje FK-ova koji su možda prekopirani (za svaki slučaj)
+                self._drop_fks_from_table(conn, target_schema, table)
+
+            conn.commit()
+
+    def _drop_fks_from_table(self, conn, schema, table):
+        """Pomoćna metoda za uklanjanje FK-ova pre punjenja podataka."""
+        query = text(f"""
+            SELECT conname
+            FROM pg_constraint
+            WHERE contype = 'f'
+            AND conrelid = '{schema}.{table}'::regclass
+        """)
+        fks = conn.execute(query).fetchall()
+        for fk in fks:
+            conn.execute(text(f"ALTER TABLE {schema}.{table} DROP CONSTRAINT {fk[0]}"))
+            
+
+    def restore_foreign_keys(self, source_schema, target_schema, tables):
+        """Prebacuje FK constraints sa izvora na target."""
+        query = text("""
+            SELECT 
+                conname, 
+                pg_get_constraintdef(oid) as def
+            FROM pg_constraint 
+            WHERE contype = 'f' 
+            AND conrelid::regclass::text LIKE :schema_prefix
+        """)
+        
+        with self.engine.connect() as conn:
+            # Tražimo sve FK-ove u izvornoj šemi
+            res = conn.execute(query, {"schema_prefix": f"{source_schema}.%"})
+            for row in res:
+                con_name = row[0]
+                con_def = row[1]
+                # Modifikujemo definiciju da pokazuje na target šemu
+                # Primer: REFERENCES ecommerce.customers(id) -> REFERENCES ecommerce_anon.customers(id)
+                new_def = con_def.replace(f"{source_schema}.", f"{target_schema}.")
+                
+                # Nađi na kojoj je tabeli taj constraint
+                table_query = text(f"SELECT relname FROM pg_class c JOIN pg_constraint con ON con.conrelid = c.oid WHERE con.conname = '{con_name}'")
+                tab_name = conn.execute(table_query).fetchone()[0]
+                
+                if tab_name in tables:
+                    try:
+                        conn.execute(text(f'ALTER TABLE "{target_schema}"."{tab_name}" ADD CONSTRAINT "{con_name}" {new_def}'))
+                    except Exception as e:
+                        print(f"⚠️ Mismatch on FK {con_name}: {e}")
+            conn.commit()
+
+    def execute_anonymization_batch(self, source_schema, target_schema, execution_plan):
+        # Osiguravamo da tabele idu po redosledu zavisnosti
+        ordered_tables = list(execution_plan.keys()) 
+        
+        # Faza 1: DDL Skeleton (Bez FK)
+        self.prepare_anonymization_target(source_schema, target_schema, ordered_tables)
+
+        for table in ordered_tables:
+            print(f"⚡ Processing: {table}")
+            
+            # Koristimo text() za sigurnost
+            query = text(f'SELECT * FROM "{source_schema}"."{table}"')
+            df = pd.read_sql(query, self.engine)
+            
+            if df.empty:
+                print(f"⚠️ Table {table} is empty, skipping...")
+                continue
+                
+            # Faza 2: Transform
+            df_anon = self.apply_anonymization_rules(df, execution_plan[table])
+            
+            # Load (Koristimo 'append' jer je prepare_anonymization_target već napravio tabelu)
+            df_anon.to_sql(table, self.engine, schema=target_schema, if_exists='append', index=False)
+            
+        # Faza 3: Rekonstrukcija veza
+        print("🔗 Rekonstrukcija Foreign Key relacija...")
+        self.restore_foreign_keys(source_schema, target_schema, ordered_tables)
+        print("✅ Batch proces uspešno završen!")
+        
+        
+    def drop_target_schema(self, target_schema):
+        from sqlalchemy import text
+        with self.engine.connect() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{target_schema}" CASCADE'))
+            conn.commit()

@@ -82,41 +82,57 @@ def render_sidebar(agent):
 
                 tables = db.get_tables_in_schema(selected_schema)
                 if tables:
+                    # --- FIX: Rešavamo Double-Click bug ---
+                    if 'last_confirmed_tables' not in st.session_state:
+                        st.session_state['last_confirmed_tables'] = []
+
                     selected_tables = st.multiselect(
                         "Choose Tables (Batch Mode):",
                         options=tables,
-                        default=st.session_state.get('last_selected_tables', [])
+                        default=st.session_state['last_confirmed_tables'],
+                        key='batch_table_selector'
                     )
-                    st.session_state['last_selected_tables'] = selected_tables
 
-                    # --- SVA LOGIKA IDE OVDE (AKO SU TABELE IZABRANE) ---
+                    # Ako se selekcija promenila, odmah osvežavamo Execution Order
+                    if selected_tables != st.session_state['last_confirmed_tables']:
+                        st.session_state['last_confirmed_tables'] = selected_tables
+                        st.rerun()
+
                     if selected_tables:
-                        # 1. Redosled izvršavanja
+                        # 1. Dinamički redosled izvršavanja
                         ordered_tables = db.get_execution_order(selected_tables, selected_schema)
-                        st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join([f'`{t}`' for t in ordered_tables])}")
 
-                        # 2. Selektor za konfiguraciju trenutne tabele
+                        
+                        status_icons = []
+                        for t in ordered_tables:
+                            if db.get_saved_plan(selected_schema, t):
+                                status_icons.append(f"✅ `{t}`")
+                            else:
+                                status_icons.append(f"⚠️ `{t}`")
+                        
+                        st.info(f"⛓️ **Execution Order & Status:** \n{' ➔ '.join(status_icons)}")
+                        
+                        if any("⚠️" in icon for icon in status_icons):
+                            st.warning("Napomena: Tabele sa ⚠️ nemaju sačuvan plan. AI Scan-uj ih i klikni 'Save Plan in DB' pre Batch-a.")
+
+
+                        # 2. Selektor za trenutnu tabelu (za analizu)
                         selected_table = st.selectbox("Current Table for Analysis:", options=ordered_tables)
                         columns = db.get_columns(selected_table, selected_schema)
 
-                        # 3. Parametri (Filter i Limit)
                         with st.expander("🔍 Filtering & Schema", expanded=False):
                             where_clause = st.text_area("WHERE condition:", placeholder="e.g. id > 100", key=f"where_{selected_table}")
                             limit_val = st.number_input("Limit rows:", value=1000, min_value=1, key=f"limit_{selected_table}")
-                            st.info("Available columns:")
                             st.code(", ".join(columns))
 
-                        # 4. Učitavanje starog plana
+                        # 3. Učitavanje/Skeniranje plana
                         saved_plan_data = db.get_saved_plan(selected_schema, selected_table)
                         if saved_plan_data:
                             if st.button("📂 Load Saved Plan", use_container_width=True):
                                 st.session_state['ai_analysis'] = saved_plan_data
                                 st.success(f"✅ Plan for {selected_table} loaded!")
                                 st.rerun()
-                        else:
-                            st.caption(f"ℹ️ No saved plan found for {selected_table}.")
-
-                        # 5. Dugme za učitavanje podataka u glavni prozor
+                        
                         if st.button("🚀 Load Table Data", type="primary", use_container_width=True):
                             with st.spinner(f"Fetching {selected_table}..."):
                                 df = db.read_table(selected_table, selected_schema, where_filter=where_clause, limit=limit_val)
@@ -127,23 +143,51 @@ def render_sidebar(agent):
                         st.divider()
                         st.subheader("🤖 Analysis")
                         c1, c2 = st.columns(2)
-
                         if c1.button("Manual", use_container_width=True):
-                            manual_plan = [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual"} for c in columns]
-                            st.session_state['ai_analysis'] = {"plan": manual_plan}
+                            st.session_state['ai_analysis'] = {"plan": [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual"} for c in columns]}
                             st.rerun()
-
                         if c2.button("AI Scan", use_container_width=True):
-                            with st.spinner("Consulting Database & AI..."):
-                                # Čitamo mali uzorak za analizu
+                            with st.spinner("Consulting AI..."):
                                 raw_df = db.read_table(selected_table, selected_schema, limit=10)
-                                # Analiza koja prvo gleda 'anon_forced_mappings' u bazi, pa onda pita OpenAI
                                 st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df, agent, schema_name=selected_schema)
                                 st.rerun()
-                    
+
+                        # --- DINAMIČKI BATCH EXECUTION ---
+                        st.divider()
+                        st.subheader("🚀 Batch Execution")
+                        target_schema = st.text_input("Target Schema Name:", value=f"{selected_schema}_anon")
+
+                        if st.button("🔥 RUN FULL ANONYMIZATION", type="primary", use_container_width=True):
+                            with st.status("Executing Enterprise Pipeline...", expanded=True) as status:
+                                try:
+                                    # Faza 0: Clean Wipe
+                                    status.write(f"🗑️ Dropping schema `{target_schema}`...")
+                                    db.drop_target_schema(target_schema)
+                                    
+                                    # Faza 1: Skupljanje planova iz baze
+                                    status.write(f"📂 Collecting plans for {len(selected_tables)} tables...")
+                                    full_plan = {}
+                                    for t in ordered_tables:
+                                        p = db.get_saved_plan(selected_schema, t)
+                                        if p: full_plan[t] = p['plan']
+                                    
+                                    if len(full_plan) < len(selected_tables):
+                                        st.error("❌ Missing saved plans! Please Scan and Save plans for all tables.")
+                                        st.stop()
+
+                                    # Faza 2: Izvršavanje
+                                    db.execute_anonymization_batch(selected_schema, target_schema, full_plan)
+                                    
+                                    status.update(label="✅ Success!", state="complete")
+                                    st.balloons()
+                                    st.success(f"Database anonymized in `{target_schema}`")
+                                except Exception as e:
+                                    status.update(label="❌ Failed", state="error")
+                                    st.error(f"Error: {str(e)}")
                     else:
-                        st.warning("👈 Please select one or more tables to start.")
-                            
+                        st.warning("👈 Please select tables to start.")
+                    st.subheader("")
+                    st.subheader("")
                 else:
                     st.warning("No tables found in this schema.")
             except Exception as e:
