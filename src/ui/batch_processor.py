@@ -100,48 +100,65 @@ def handle_batch_execution(db, ordered_tables, selected_schema, target_schema, s
     # 4. Izvršni Pipeline
     if st.session_state.get('start_batch_proc'):
         with st.status("Executing Enterprise Pipeline...", expanded=True) as status:
-            try:
-                full_plan = {}
+            debug_area = st.empty() 
+            with debug_area.container():
+                
+                # --- KLJUČNI DODATAK: ČIŠĆENJE PRE SVEGA ---
+                st.write("🧹 **Korak 1: Resetovanje ciljne šeme (TRUNCATE CASCADE)...**")
+                try:
+                    # Prosleđujemo ordered_tables da bi brisao ispravnim redosledom
+                    db.truncate_anon_tables(target_schema, ordered_tables)
+                    st.success("✅ Ciljna šema je očišćena.")
+                except Exception as e:
+                    st.error(f"❌ Greška pri čišćenju šeme: {e}")
+                    st.stop() # Zaustavljamo proces ako čišćenje ne uspe
+                # ------------------------------------------
 
-                # DEBUG: Provera u konzoli
-                print(f"DEBUG: Start Batch Proc for Schema: {selected_schema}")
+                st.write("🔍 **Korak 2: Provera planova i priprema transformacije...**")
+                
+                try:
+                    full_plan = {}
+                    for t_name in selected_tables:
+                        # ... tvoj postojeći kod za get_saved_plan ...
+                        saved = db.get_saved_plan(selected_schema, t_name)
+                        
+                        if saved:
+                            current_plan = saved.get('plan')
+                            
+                            # Ispisujemo tip podatka direktno u aplikaciji
+                            st.write(f"🔹 Tabela: `{t_name}` | Tip plana: `{type(current_plan)}`")
+                            
+                            # Ako je string, popravljamo i ispisujemo to
+                            if isinstance(current_plan, str):
+                                st.warning(f"⚠️ Plan za `{t_name}` je stigao kao STRING. Popravljam...")
+                                import json
+                                current_plan = json.loads(current_plan)
+                            
+                            # PROVERA STRUKTURE: Da li su unutra rečnici?
+                            if isinstance(current_plan, list) and len(current_plan) > 0:
+                                first_item_type = type(current_plan[0])
+                                st.write(f"   ∟ Prvi element plana je tipa: `{first_item_type}`")
+                                if not isinstance(current_plan[0], dict):
+                                    st.error(f"❌ ERROR: Element nije DICT! Vrednost: `{current_plan[0]}`")
 
-                # Koristimo selected_tables kao master listu jer nju proveravamo na kraju
-                for t in selected_tables:
-                    p = db.get_saved_plan(selected_schema, t)
-                    if p:
-                        full_plan[t] = p
-                    else:
-                        print(f"DEBUG: Plan NOT FOUND for {selected_schema}.{t}")
+                            full_plan[t_name] = {
+                                "plan": current_plan,
+                                "where": saved.get('where', "")
+                            }
+                        else:
+                            st.error(f"❌ Nema plana za tabelu: `{t_name}`")
 
-                # Provera da li imamo sve planove
-                # Koristimo setove za poređenje da izbegnemo greške u redosledu
-                missing = [t for t in selected_tables if t not in full_plan]
+                    # Konačna provera pre poziva batch-a
+                    st.write("🚀 **Pozivam db.execute_anonymization_batch...**")
+                    
+                    # IZVRŠAVANJE
+                    db.execute_anonymization_batch(selected_schema, target_schema, full_plan)
 
-                # Pre nego što pozoveš execute_anonymization_batch
-                st.write(f"DEBUG: Tražim planove za šemu: `{selected_schema}`")
-                st.write(f"DEBUG: Tabele u planu: `{list(full_plan.keys())}`")
-                st.write(f"DEBUG: Tabele koje sistem očekuje: `{selected_tables}`")
+                    status.update(label="✅ Success!", state="complete")
+                    st.success("Operacija uspešno završena.")
 
-
-                if missing:
-                    st.error(f"❌ Missing plans for: {', '.join(missing)}")
-                    # Dodatni info za tebe tokom debaigovanja
-                    st.write(f"Proveravam šemu: `{selected_schema}`")
-                    st.session_state['start_batch_proc'] = False
-                    st.stop()
-
-                # Pokretanje (Ovde prosleđujemo full_plan koji sada garantovano ima sve što treba)
-                # Napomena: db.execute_anonymization_batch bi unutra trebalo da koristi
-                # svoj mehanizam za sortiranje tabela po FK redosledu
-                db.execute_anonymization_batch(selected_schema, target_schema, full_plan)
-
-                status.update(label="✅ Success!", state="complete")
-                st.info("Operacija uspešno završena.")
-
-            except Exception as e:
-                st.error(f"Error during execution: {str(e)}")
-                import traceback
-                print(traceback.format_exc()) # Ispisuje ceo stack trace u konzolu
-            finally:
-                st.session_state['start_batch_proc'] = False
+                except Exception as e:
+                    import traceback
+                    # ISPISUJEMO CEO TRACEBACK NA EKRAN DA GA VIDIŠ
+                    st.error(f"💥 KRITIČNA GREŠKA: {str(e)}")
+                    st.code(traceback.format_exc(), language="python") # Ovo menja terminal!
