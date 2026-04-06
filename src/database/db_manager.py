@@ -11,6 +11,12 @@ from openai import AzureOpenAI
 from dotenv import load_dotenv
 from sqlalchemy import text
 
+
+import random
+from datetime import timedelta
+import pandas as pd
+
+
 # Učitava varijable iz .env fajla u sistemsko okruženje
 load_dotenv()
 
@@ -183,15 +189,17 @@ class DBManager:
 
         return pool[index]
 
-
     def apply_anonymization_rules(self, df, table_plan, salt="secret_123"):
         """
-        Transformacija podataka na nivou tabele.
+        Transformacija podataka prema Type-Safe pravilima.
         """
         import hashlib
+        import pandas as pd
+        import random
+        from datetime import timedelta
+
         df_anon = df.copy()
 
-        # Ovde je bila greška: koristimo 'table_plan' umesto 'plan'
         for item in table_plan:
             col = item['column']
             strategy = item.get('strategy', 'keep').lower()
@@ -199,26 +207,53 @@ class DBManager:
             if col not in df_anon.columns or strategy == 'keep':
                 continue
 
-            # --- 1. FAKER STRATEGIJE ---
-            if 'faker_first_name' in strategy:
-                df_anon[col] = [self.fake.first_name() for _ in range(len(df_anon))]
-            elif 'faker_last_name' in strategy:
-                df_anon[col] = [self.fake.last_name() for _ in range(len(df_anon))]
-            elif 'faker_email' in strategy:
-                df_anon[col] = [self.fake.email() for _ in range(len(df_anon))]
+            # --- 1. NULL STRATEGIJA ---
+            if strategy == 'null':
+                df_anon[col] = None
 
-            # --- 2. DETERMINISTIČKI MAPPING (Tvoja custom logika iz baze) ---
+            # --- 2. FAKER STRATEGIJE ---
+            elif strategy == 'faker_name':
+                df_anon[col] = [self.fake.name() for _ in range(len(df_anon))]
+            elif strategy == 'faker_email':
+                df_anon[col] = [self.fake.email() for _ in range(len(df_anon))]
+            elif strategy == 'faker_phone':
+                df_anon[col] = [self.fake.phone_number() for _ in range(len(df_anon))]
+
+            # --- 3. DATE SHIFT (Za datume) ---
+            elif strategy == 'date_shift':
+                def shift_date(val):
+                    if pd.isnull(val): return val
+                    # Pomeramo nasumično do 30 dana napred ili nazad
+                    days_to_shift = random.randint(-30, 30)
+                    try:
+                        return val + timedelta(days=days_to_shift)
+                    except:
+                        return val
+                df_anon[col] = df_anon[col].apply(shift_date)
+
+            # --- 4. NOISE (Za brojeve) ---
+            elif strategy == 'noise':
+                def add_noise(val):
+                    if pd.isnull(val) or not isinstance(val, (int, float)):
+                        return val
+                    # +/- 10% varijacije
+                    variation = val * random.uniform(-0.1, 0.1)
+                    return type(val)(val + variation)
+                df_anon[col] = df_anon[col].apply(add_noise)
+
+            # --- 5. DETERMINISTIČKI MAPPING ---
             elif strategy == 'mapping':
-                # Mapiramo na osnovu imena kolone (fallback na first_name ako ne prepoznamo)
                 category = "first_name"
                 if "last" in col.lower(): category = "last_name"
                 elif "city" in col.lower(): category = "city"
 
                 m_list = self._get_mapping_values_by_locale(category, 'de')
                 if m_list:
-                    df_anon[col] = df_anon[col].apply(lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x)
+                    df_anon[col] = df_anon[col].apply(
+                        lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x
+                    )
 
-            # --- 3. HASH / MASK / NOISE ---
+            # --- 6. HASH / MASK ---
             elif strategy == 'hash':
                 df_anon[col] = df_anon[col].apply(
                     lambda x: hashlib.sha256(f"{x}{salt}".encode()).hexdigest()[:12] if pd.notnull(x) else x
@@ -230,7 +265,6 @@ class DBManager:
                 )
 
         return df_anon
-
 
     # --- POMOĆNE METODE KOJE MORAŠ IMATI U DBManager KLASI ---
 
@@ -598,11 +632,18 @@ class DBManager:
         # Osiguravamo da tabele idu po redosledu zavisnosti
         ordered_tables = list(execution_plan.keys())
 
-        # Faza 1: DDL Skeleton (Bez FK)
+        # Faza 1: DDL Skeleton (Bez FK) - Pravi tabele sa originalnim tipovima
         self.prepare_anonymization_target(source_schema, target_schema, ordered_tables)
 
         for table in ordered_tables:
             print(f"⚡ Processing: {table}")
+
+            # --- KLJUČNA INTERVENCIJA ---
+            # Pre nego što povučemo podatke, menjamo tipove kolona u TARGET bazi
+            # da bi mogli da prime heširane vrednosti (npr. INT -> VARCHAR)
+            plan = execution_plan[table]
+            self.align_db_types(target_schema, table, plan)
+            # ----------------------------
 
             # Koristimo text() za sigurnost
             query = text(f'SELECT * FROM "{source_schema}"."{table}"')
@@ -613,16 +654,15 @@ class DBManager:
                 continue
 
             # Faza 2: Transform
-            df_anon = self.apply_anonymization_rules(df, execution_plan[table])
+            df_anon = self.apply_anonymization_rules(df, plan)
 
-            # Load (Koristimo 'append' jer je prepare_anonymization_target već napravio tabelu)
+            # Load (Sada će raditi jer je align_db_types već odradio ALTER TABLE)
             df_anon.to_sql(table, self.engine, schema=target_schema, if_exists='append', index=False)
 
         # Faza 3: Rekonstrukcija veza
         print("🔗 Rekonstrukcija Foreign Key relacija...")
         self.restore_foreign_keys(source_schema, target_schema, ordered_tables)
         print("✅ Batch proces uspešno završen!")
-
 
     def drop_target_schema(self, target_schema):
         from sqlalchemy import text
@@ -668,3 +708,195 @@ class DBManager:
         query = text(f'SELECT COUNT(*) FROM "{schema_name}"."{table_name}"')
         with self.engine.connect() as conn:
             return conn.execute(query).scalar()
+
+    def get_column_details(self, table_name, schema_name):
+        """
+        Vraća proširene meta-podatke o kolonama (tip i nullability) za strogu validaciju.
+        """
+        query = text("""
+            SELECT
+                column_name,
+                data_type,
+                is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = :s AND table_name = :t
+            ORDER BY ordinal_position
+        """)
+        with self.engine.connect() as conn:
+            result = conn.execute(query, {"s": schema_name, "t": table_name})
+
+            # Pakujemo u rečnik gde je ključ ime kolone,
+            # a vrednost je novi rečnik sa detaljima
+            return {
+                row[0]: {
+                    "type": row[1],
+                    "nullable": row[2]  # Vraća 'YES' ili 'NO'
+                }
+                for row in result
+            }
+
+    def get_all_foreign_keys(self, schema_name):
+        """
+        Izvlači sve Foreign Key relacije u šemi kako bi se osigurao referencijalni integritet.
+        Vraća listu torki: (source_table, source_column, target_table, target_column)
+        """
+        from sqlalchemy import text
+
+        query = text("""
+            SELECT
+                kcu.table_name as source_table,
+                kcu.column_name as source_column,
+                rel_kcu.table_name as target_table,
+                rel_kcu.column_name as target_column
+            FROM information_schema.table_constraints tco
+            JOIN information_schema.key_column_usage kcu
+              ON tco.constraint_name = kcu.constraint_name
+            JOIN information_schema.referential_constraints rco
+              ON tco.constraint_name = rco.constraint_name
+            JOIN information_schema.key_column_usage rel_kcu
+              ON rco.unique_constraint_name = rel_kcu.constraint_name
+            WHERE tco.constraint_type = 'FOREIGN KEY'
+              AND tco.table_schema = :s
+        """)
+
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(query, {"s": schema_name})
+                # Vraćamo listu torki za lakšu iteraciju u validaciji
+                return [(row[0], row[1], row[2], row[3]) for row in result]
+        except Exception as e:
+            print(f"Error fetching foreign keys: {e}")
+            return []
+
+    def get_all_saved_plans(self, schema_name):
+        """
+        Dohvata sve sačuvane planove koristeći ispravno ime kolone 'plan_json'.
+        """
+        import json
+        from sqlalchemy import text
+
+        # Popravljeno ime kolone: plan -> plan_json
+        query = text("""
+            SELECT table_name, plan_json
+            FROM metadata.ai_plans
+            WHERE schema_name = :s
+        """)
+
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(query, {"s": schema_name})
+                plans = {}
+                for row in result:
+                    # row[0] je table_name, row[1] je plan_json
+                    table_name_db = row[0]
+                    raw_plan = row[1]
+
+                    if raw_plan is None:
+                        plans[table_name_db] = []
+                        continue
+
+                    # Provera da li je JSON već dikt (ako koristiš JSONB) ili string
+                    if isinstance(raw_plan, str):
+                        plans[table_name_db] = json.loads(raw_plan)
+                    else:
+                        plans[table_name_db] = raw_plan
+
+                return plans
+        except Exception as e:
+            # Ako Postgres baci error, transakcija mora da se "ohladi"
+            print(f"❌ Error fetching all saved plans: {e}")
+            return {}
+
+
+    def align_db_types(self, target_schema, table_name, plan):
+        """
+        Automatski menja tipove kolona u ciljnoj šemi (npr. INT -> VARCHAR)
+        ako plan zahteva hash ili tekstualnu anonimizaciju.
+        """
+        from sqlalchemy import text
+
+        # Strategije koje menjaju izlaz u STRING
+        string_strategies = ['hash', 'mask', 'faker_name', 'faker_email', 'faker_phone']
+
+        with self.engine.connect() as conn:
+            for item in plan:
+                col = item['column']
+                strategy = item.get('strategy', 'keep').lower()
+
+                if strategy in string_strategies:
+                    # Proveravamo trenutni tip kolone u ANON šemi
+                    check_sql = text("""
+                        SELECT data_type
+                        FROM information_schema.columns
+                        WHERE table_schema = :s AND table_name = :t AND column_name = :c
+                    """)
+                    current_type = conn.execute(check_sql, {
+                        "s": target_schema, "t": table_name, "c": col
+                    }).scalar()
+
+                    # Ako je trenutno numerički tip, a mi guramo hash -> ALTER
+                    if current_type and ('int' in current_type.lower() or 'numeric' in current_type.lower()):
+                        print(f"🔄 Altera-ujem kolonu {table_name}.{col} iz {current_type} u VARCHAR(255)...")
+
+                        alter_sql = text(f"""
+                            ALTER TABLE "{target_schema}"."{table_name}"
+                            ALTER COLUMN "{col}" TYPE VARCHAR(255)
+                            USING "{col}"::VARCHAR
+                        """)
+                        conn.execute(alter_sql)
+            conn.commit()
+
+    def truncate_anon_tables(self, target_schema, ordered_tables):
+        """Briše podatke počevši od child tabela (obrnuti redosled)."""
+        from sqlalchemy import text
+        # Obrćemo listu: ako je orders na kraju (dete), on mora biti prvi za brisanje
+        deletion_order = list(reversed(ordered_tables))
+
+        with self.engine.connect() as conn:
+            for table in deletion_order:
+                print(f"🧹 Truncating table: {target_schema}.{table}")
+                # Koristimo CASCADE za svaki slučaj, ali idemo redom zbog sigurnosti
+                conn.execute(text(f'TRUNCATE TABLE "{target_schema}"."{table}" CASCADE'))
+            conn.commit()
+
+    def align_db_types(self, target_schema, table_name, plan):
+        """
+        Kritična metoda: Menja DDL tipove u anonimnoj šemi na osnovu plana.
+        Izvršava se nakon TRUNCATE, a pre INSERT operacije.
+        """
+        from sqlalchemy import text
+
+        # Lista strategija koje zahtevaju tekstualni tip (VARCHAR)
+        # Dodaj ovde 'mapping' ako tvoj mapping vraća stringove za ID-eve
+        text_transform_strategies = ['hash', 'mask', 'faker_name', 'faker_email', 'faker_phone']
+
+        with self.engine.connect() as conn:
+            for item in plan:
+                col = item['column']
+                strategy = item.get('strategy', 'keep').lower()
+
+                if strategy in text_transform_strategies:
+                    # 1. Proveravamo trenutni tip kolone u informatičkom sistemu baze
+                    check_sql = text("""
+                        SELECT data_type
+                        FROM information_schema.columns
+                        WHERE table_schema = :s AND table_name = :t AND column_name = :c
+                    """)
+                    current_type = conn.execute(check_sql, {
+                        "s": target_schema, "t": table_name, "c": col
+                    }).scalar()
+
+                    # 2. Ako je kolona trenutno numerička (int, bigint, numeric), a ide u heš -> menjamo u VARCHAR
+                    if current_type and ('int' in current_type.lower() or 'numeric' in current_type.lower()):
+                        print(f"🔧 DDL Sync: Menjam {table_name}.{col} iz {current_type} u VARCHAR(255)")
+
+                        # Koristimo TYPE VARCHAR(255).
+                        # CAST (USING) je obavezan u Postgresu čak i za prazne tabele.
+                        alter_sql = text(f"""
+                            ALTER TABLE "{target_schema}"."{table_name}"
+                            ALTER COLUMN "{col}" TYPE VARCHAR(255)
+                            USING "{col}"::VARCHAR
+                        """)
+                        conn.execute(alter_sql)
+
+            conn.commit()

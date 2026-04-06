@@ -77,7 +77,12 @@ def render_sidebar(agent):
             try:
                 schemas = db.get_all_schemas()
                 default_idx = schemas.index('ecommerce') if 'ecommerce' in schemas else 0
-                selected_schema = st.selectbox("Choose Schema:", schemas, index=default_idx)
+                selected_schema = st.selectbox(
+                    "Choose Schema:",
+                    schemas,
+                    index=default_idx,
+                    key='selected_schema'
+                )
 
                 tables = db.get_tables_in_schema(selected_schema)
                 if tables:
@@ -92,36 +97,49 @@ def render_sidebar(agent):
                         key='batch_table_selector'
                     )
 
+                    # --- RESET LOGIKA PRILIKOM PROMENE SELEKCIJE ---
+                    if selected_tables != st.session_state.get('last_confirmed_tables'):
+                        # Ako se lista tabela promenila, brišemo kvačice (✅)
+                        st.session_state['completed_tables'] = set()
+                        # Ažuriramo marker poslednje potvrđene liste
+                        st.session_state['last_confirmed_tables'] = selected_tables
+                        # Opciono: Možeš i da obrišeš selektovanu tabelu da forsiraš novi Start
+                        if 'selected_table_info' in st.session_state:
+                            del st.session_state['selected_table_info']
+
                     # Resetuj ako se promeni multiselect
-            
+
 
                     if selected_tables:
-                        # Dobijamo ispravan redosled zbog Foreign Keys
+                        # 1. Dobijamo ispravan redosled zbog Foreign Keys
                         ordered_tables = db.get_execution_order(selected_tables, selected_schema)
                         st.session_state['all_tables_list'] = ordered_tables
 
-                        # --- 1. VIZUELNI STATUS PROCESA ---
+                        # Inicijalizacija seta završenih tabela ako ne postoji
+                        if 'completed_tables' not in st.session_state:
+                            st.session_state['completed_tables'] = set()
+
+                        # --- 1. VIZUELNI STATUS PROCESA (Adaptirano za Session State) ---
                         status_icons = []
                         for t in ordered_tables:
-                            if db.get_saved_plan(selected_schema, t):
+                            # Prvo proveravamo session_state (brže), pa bazu
+                            if t in st.session_state['completed_tables'] or db.get_saved_plan(selected_schema, t):
                                 status_icons.append(f"✅ `{t}`")
+                                # Ako je u bazi a nije u setu, dodajemo ga radi sinhronizacije UI-ja
+                                st.session_state['completed_tables'].add(t)
                             else:
-                                status_icons.append(f"⚠️ `{t}`")
+                                status_icons.append(f"⏳ `{t}`")
 
                         st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join(status_icons)}")
 
-                        # --- 2. DUGME ZA START / LOAD (Samo JEDNOM) ---
-                        # DODAJEMO KEY DA BUDEMO 100% SIGURNI
-                        if st.button("🚀 Start Planning / Load Data", type="primary", use_container_width=True, key="btn_start_planning"):
+                        # --- 2. DUGME ZA START / LOAD ---
+                        if st.button("🚀 Start Planning / Load Data", type="primary", width="stretch", key="btn_start_planning"):
 
-                            # Određujemo koju tabelu učitavamo
-                            if 'selected_table_info' not in st.session_state:
-                                first_table = ordered_tables[0]
-                                st.session_state['selected_table_info'] = (first_table, selected_schema)
+                            # Uvek krećemo od prve tabele u lancu pri inicijalnom load-u
+                            first_table = ordered_tables[0]
+                            st.session_state['selected_table_info'] = (first_table, selected_schema)
 
-                            current_table, _ = st.session_state['selected_table_info']
-
-                            # --- KOMPLETNO ČIŠĆENJE ---
+                            # --- KOMPLETNO ČIŠĆENJE PROSTORA ZA NOVU TABELU ---
                             keys_to_clear = [
                                 'ai_analysis', 'current_plan', 'plan_snapshot',
                                 'plan_origin', 'current_df', 'last_table_for_plan',
@@ -131,39 +149,31 @@ def render_sidebar(agent):
                                 if key in st.session_state:
                                     del st.session_state[key]
 
+                            # Čistimo i stare editor state-ove
                             for key in list(st.session_state.keys()):
                                 if key.startswith("plan_editor_"):
                                     del st.session_state[key]
 
-                            with st.spinner(f"Switching context to {current_table}..."):
-                                st.session_state['current_df'] = db.read_table(current_table, selected_schema, limit=100)
-                                saved_p = db.get_saved_plan(selected_schema, current_table)
+                            with st.spinner(f"Switching context to {first_table}..."):
+                                # Učitavanje podataka za prvu tabelu
+                                st.session_state['current_df'] = db.read_table(first_table, selected_schema, limit=100)
+
+                                # Provera plana
+                                saved_p = db.get_saved_plan(selected_schema, first_table)
                                 if saved_p:
                                     st.session_state['ai_analysis'] = saved_p
                                     st.session_state['plan_origin'] = 'saved'
                                     st.session_state['plan_snapshot'] = saved_p
                                 else:
-                                    raw_df_for_ai = db.read_table(current_table, selected_schema, limit=10)
+                                    raw_df_for_ai = db.read_table(first_table, selected_schema, limit=10)
                                     st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df_for_ai, agent, schema_name=selected_schema)
                                     st.session_state['plan_origin'] = 'new'
 
-                                st.session_state['last_table_for_plan'] = current_table
+                                st.session_state['last_table_for_plan'] = first_table
                                 st.rerun()
 
-                        # --- 3. BATCH EXECUTION SEKCIJA (Samo JEDNOM) ---
-                        st.divider()
-                        st.subheader("🔥 Batch Execution")
-                        target_schema = st.text_input("Target Schema Name:", value=f"{selected_schema}_anon", key="input_target_schema")
-
-                        # POZIVAMO METODU (Prosleđujemo instance_id)
-                        handle_batch_execution(
-                            db=db,
-                            ordered_tables=ordered_tables,
-                            selected_schema=selected_schema,
-                            target_schema=target_schema,
-                            selected_tables=selected_tables,
-                            instance_id=f"sb_{selected_schema}"
-                        )
+                        # --- NAPOMENA: BATCH SEKCIJA JE IZBAČENA ODAVDE ---
+                        # Prebačena je na dno Planner taba u tabs_content.py
 
 
                     else:

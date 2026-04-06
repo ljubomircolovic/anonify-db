@@ -28,7 +28,7 @@ with h_col2:
     u_col1, u_col2 = st.columns([2, 1])
     u_col1.markdown(f"👤 **{st.session_state.get('user_name', 'Admin')}**")
 
-    if u_col2.button("Logout", use_container_width=True):
+    if u_col2.button("Logout", width="stretch"):
         st.session_state['authenticated'] = False
         st.rerun()
 
@@ -49,7 +49,7 @@ with h_col2:
     db = st.session_state['db']
 
     # Red 3: Test Connection
-    if st.button("⚡ Test Connection", use_container_width=True):
+    if st.button("⚡ Test Connection", width="stretch"):
         success, message = db.test_connection()
         if success: st.success(message)
         else: st.error(message)

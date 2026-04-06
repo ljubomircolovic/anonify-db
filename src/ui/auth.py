@@ -11,7 +11,7 @@ def check_login():
         with st.form("login_form"):
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login", use_container_width=True)
+            submitted = st.form_submit_button("Login", width="stretch")
 
             if submitted:
                 if username == os.getenv("APP_ADMIN_USER") and password == os.getenv("APP_ADMIN_PASSWORD"):
