@@ -5,36 +5,66 @@ import time
 
 # --- 1. OVDE STAVI FUNKCIJU (Vrh fajla) ---
 def save_and_move_to_next(db, table_name, schema_name, plan_data):
-    """Pomocna funkcija za cuvanje plana i navigaciju kroz tabele"""
-    # Ciscenje UI kolona pre snimanja
+    """Pomocna funkcija za cuvanje plana i navigaciju kroz tabele sa validacijom"""
+    
+    # --- 1. SANITY CHECK: Da li snimamo ispravne kolone? ---
+    try:
+        actual_db_columns = db.get_columns(table_name, schema_name)
+        plan_columns = [row.get('column') for row in plan_data if 'column' in row]
+        
+        # Proveravamo da li je bar prva kolona iz plana prisutna u bazi za TU tabelu
+        if plan_columns and plan_columns[0] not in actual_db_columns:
+            st.error(f"🛑 **CRITICAL DATA MISMATCH!**")
+            st.warning(f"Plan contains column `{plan_columns[0]}`, but table `{table_name}` does not.")
+            st.info("Saving blocked to prevent metadata corruption. Please refresh or re-scan.")
+            return # PREKIDAMO SNIMANJE!
+    except Exception as e:
+        st.error(f"Validation error: {e}")
+        return
+
+    # --- 2. ČIŠĆENJE I SNIMANJE ---
+    # Ciscenje UI kolona (status) pre snimanja
     clean_plan = [{k: v for k, v in row.items() if k != 'status'} for row in plan_data]
 
-    # Snimanje u bazu
+    # Snimanje u bazu (sada smo sigurni da su podaci ispravni)
     db.save_ai_plan(schema_name, table_name, clean_plan)
 
-    # Logika za prelazak na sledecu tabelu
+    # --- 3. LOGIKA ZA PRELAZAK NA SLEDEĆU TABELU ---
     all_tables = st.session_state.get('all_tables_list', [])
+    
     if all_tables:
         try:
             current_idx = all_tables.index(table_name)
             if current_idx + 1 < len(all_tables):
                 next_table = all_tables[current_idx + 1]
+                
                 # Postavljamo novu tabelu kao aktivnu
                 st.session_state['selected_table_info'] = (next_table, schema_name)
 
-                # Brisanje state-a da bi nova tabela pocela sveza
-                for key in ['current_df', 'ai_analysis', 'current_plan', 'last_table_for_plan']:
+                # --- KOMPLETNO BRISANJE STATE-A ZA NOVU TABELU ---
+                keys_to_clear = [
+                    'current_df', 'ai_analysis', 'current_plan', 
+                    'last_table_for_plan', 'last_rendered_table', 
+                    'plan_snapshot', 'plan_origin'
+                ]
+                for key in keys_to_clear:
                     if key in st.session_state:
                         del st.session_state[key]
+                
+                # Čistimo i specifične ključeve editora
+                for key in list(st.session_state.keys()):
+                    if key.startswith("plan_editor_"):
+                        del st.session_state[key]
 
-                st.success(f"✅ Plan saved. Moving to `{next_table}`...")
+                st.success(f"✅ Plan for `{table_name}` saved. Moving to `{next_table}`...")
                 time.sleep(1)
                 st.rerun()
             else:
-                st.balloons()
-                st.success("🎯 All tables processed!")
+                # st.balloons()
+                st.info("Operacija završena.")
+                st.success(f"🎯 All tables processed! Plan for `{table_name}` is final.")
         except ValueError:
-            st.error("Table sequence error.")
+            st.error("Table sequence error: Current table not found in the list.")
 
 
 def render_explorer_tab(db):
@@ -170,7 +200,7 @@ def render_planner_tab(db):
         # --- 2. PAMETNA PROVERA IZVORA PODATAKA ---
         # Proveravamo da li za TRENUTNU tabelu imamo bilo šta u state-u
         is_data_ready = (
-            ('ai_analysis' in st.session_state) or 
+            ('ai_analysis' in st.session_state) or
             ('current_plan' in st.session_state and st.session_state.get('last_table_for_plan') == table_name)
         )
 
@@ -190,7 +220,7 @@ def render_planner_tab(db):
             plan_list = st.session_state['current_plan']
         else:
             analysis_data = st.session_state.get('ai_analysis')
-            
+
             if isinstance(analysis_data, list):
                 # Podaci iz baze (get_saved_plan vraća listu)
                 plan_list = analysis_data
@@ -202,7 +232,7 @@ def render_planner_tab(db):
                 plan_list = analysis_data.get('plan', [])
             else:
                 plan_list = []
-                
+
             # Sinhronizujemo session_state za editor
             st.session_state['current_plan'] = plan_list
             st.session_state['last_table_for_plan'] = table_name
@@ -274,22 +304,22 @@ def render_planner_tab(db):
         # ==========================================
         # KORAK 3: DINAMIČKI DUGMIĆI & NAVIGACIJA
         # ==========================================
-        st.write("") 
-        c1, c2 = st.columns([6, 4]) 
+        st.write("")
+        c1, c2 = st.columns([6, 4])
 
         with c2:
             # 1. Osnovne definicije
             real_pks = st.session_state.get(f"pks_{table_name}", [])
             pk_strategies = ["keep", "hash"]
             origin = st.session_state.get('plan_origin', 'new')
-            
+
             # 2. DETEKCIJA PROMENA
             has_changes = False
             if origin == 'saved' and 'plan_snapshot' in st.session_state:
                 # Čistimo privremene UI kolone pre poređenja
                 clean_current = [{k: v for k, v in r.items() if k != 'status'} for r in plan_data]
                 clean_snapshot = [{k: v for k, v in r.items() if k != 'status'} for r in st.session_state['plan_snapshot']]
-                
+
                 if clean_current != clean_snapshot:
                     has_changes = True
 
@@ -359,7 +389,7 @@ def render_planner_tab(db):
                 privacy_score = int(score_points / len(plan_data))
                 st.write(f"**Privacy Score: {privacy_score}%**")
                 st.progress(privacy_score / 100)
-        
+
         with inf_col2:
             if st.button("🚀 Run Anonymization Preview", use_container_width=True, key=f"pre_btn_{table_name}"):
                 current_salt = st.session_state.get('salt_input', 'default_salt')

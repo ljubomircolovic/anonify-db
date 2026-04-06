@@ -344,7 +344,7 @@ class DBManager:
                     # 2. Raspakivanje ako je unutar {"plan": [...]}
                     if isinstance(plan_list, dict) and "plan" in plan_list:
                         return plan_list["plan"]
-                    
+
                     # 3. Osiguravamo da vraćamo listu (bitno za st.data_editor)
                     return plan_list if isinstance(plan_list, list) else None
 
@@ -648,3 +648,23 @@ class DBManager:
         except Exception as e:
             print(f"Error fetching PKs: {e}")
             return []
+
+
+    def table_exists(self, table_name, schema_name):
+        """Proverava da li tabela postoji u specifičnoj šemi."""
+        query = text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = :s
+                AND table_name = :t
+            )
+        """)
+        with self.engine.connect() as conn:
+            return conn.execute(query, {"s": schema_name.lower(), "t": table_name.lower()}).scalar()
+
+    def get_row_count(self, table_name, schema_name):
+        """Vraća broj redova u tabeli."""
+        # Koristimo f-string za ime tabele jer SQLAlchemy ne dozvoljava parametrizaciju imena objekata
+        query = text(f'SELECT COUNT(*) FROM "{schema_name}"."{table_name}"')
+        with self.engine.connect() as conn:
+            return conn.execute(query).scalar()
