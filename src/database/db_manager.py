@@ -90,35 +90,39 @@ class DBManager:
             print(f"Error reading table {table_name}: {e}")
             return pd.DataFrame()
 
-    def save_anonymized_table(self, df, table_name, target_schema='anon'):
+    def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None):
         """
-        Safe save: Ne ruši tabelu (izbegava DROP), već samo dodaje podatke
-        nakon što je TRUNCATE obavio čišćenje.
+        Snima DataFrame u ciljnu tabelu. Ako je 'conn' prisutan, ostaje u istoj sesiji.
         """
         from sqlalchemy import text
-        try:
-            with self.engine.connect() as conn:
-                # 1. Osiguravamo šemu
-                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
 
-                # 2. VAŽNO: Ovde NE RADIMO TRUNCATE jer to radi Batch procesor
-                # grupno za sve tabele (zbog FK zavisnosti).
-
-                # 3. Upisujemo podatke koristeći 'append'
-                # 'append' ne radi DROP, već samo INSERT INTO.
-                df.to_sql(
-                    table_name,
-                    self.engine,
-                    schema=target_schema,
-                    if_exists='append',  # KLJUČNA PROMENA
-                    index=False,
-                    method='multi',      # Ubrzava insert za veće setove podataka
-                    chunksize=1000
-                )
-                conn.commit()
+        def _run_save(active_conn):
+            # Osiguravamo šemu ako ne postoji
+            active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
+            
+            # Upisujemo podatke koristeći 'append' (TRUNCATE je već odrađen na nivou Batch-a)
+            # KLJUČNO: Ovde koristimo active_conn umesto self.engine
+            df.to_sql(
+                table_name,
+                active_conn,
+                schema=target_schema,
+                if_exists='append',
+                index=False,
+                method='multi',
+                chunksize=1000
+            )
             return True
+
+        try:
+            if conn:
+                # Deo Batch transakcije
+                return _run_save(conn)
+            else:
+                # Samostalni upis
+                with self.engine.connect() as standalone_conn:
+                    with standalone_conn.begin():
+                        return _run_save(standalone_conn)
         except Exception as e:
-            # Ako append pukne (npr. zbog PK), ovde ćemo videti zašto
             print(f"❌ Error saving to {target_schema}.{table_name}: {e}")
             return False
 
@@ -708,72 +712,42 @@ class DBManager:
                         print(f"⚠️ Mismatch on FK {con_name}: {e}")
             conn.commit()
 
-    def execute_anonymization_batch(self, selected_schema, target_schema, full_plan):
+    def drop_all_fks_for_table(self, conn, schema, table):
         """
-        Izvršava batch proces anonimizacije tabelu po tabelu.
-        SADA UKLJUČUJE:
-        1. Robusno izvlačenje filtera (WHERE).
-        2. Automatsko čišćenje plana (JSON string -> List).
-        3. Preskakanje praznih rezultata (da ne puca na insertu).
+        Pronalazi FK-ove, zapisuje ih u metadata.pending_fks i briše ih.
         """
+        from sqlalchemy import text
 
-        """
-        Izvršava batch proces anonimizacije.
-        """
-        print("\n" + "="*60)
-        print(f"DEBUG: EXECUTE_BATCH POZVAN")
-        print(f"DEBUG: Broj tabela u planu: {len(full_plan)}")
-        print("="*60)
+        find_fks_sql = text("""
+            SELECT
+                conname,
+                relname,
+                pg_get_constraintdef(c.oid) as constraint_def
+            FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = :schema
+            AND (t.relname = :table OR c.confrelid = (SELECT oid FROM pg_class WHERE relname = :table AND relnamespace = n.oid))
+            AND c.contype = 'f';
+        """)
 
-        import json
+        results = conn.execute(find_fks_sql, {"schema": schema, "table": table}).fetchall()
+        rehook_commands = []
 
-        # full_plan je rečnik gde je ključ ime tabele, a vrednost rečnik sa 'plan' i 'where'
-        for table_name, data in full_plan.items():
-            # 1. EKSTRAKCIJA I ČIŠĆENJE PLANA
-            # Uzimamo listu pravila. Ako je slučajno JSON string, pretvaramo u listu.
-            plan = data.get('plan', [])
-            if isinstance(plan, str):
-                try:
-                    plan = json.loads(plan)
-                except:
-                    plan = []
+        for conname, relname, condef in results:
+            rehook_sql = f'ALTER TABLE "{schema}"."{relname}" ADD CONSTRAINT "{conname}" {condef}'
+            rehook_commands.append(rehook_sql)
 
-            # 2. EKSTRAKCIJA FILTERA (WHERE)
-            # Uzimamo WHERE klauzulu koju smo sačuvali u UI-ju/Bazi
-            where_clause = data.get('where', "")
+            # --- ZAPIS U METADATA TABELU ---
+            conn.execute(text("""
+                INSERT INTO metadata.pending_fks (target_schema, table_name, constraint_name, rehook_sql)
+                VALUES (:s, :t, :c, :sql)
+            """), {"s": schema, "t": relname, "c": conname, "sql": rehook_sql})
 
-            print(f"🚀 [BATCH] Processing: {selected_schema}.{table_name}")
-            print(f"🔍 [FILTER] Active: {where_clause if where_clause else 'NO FILTER (Loading all data)'}")
+            print(f"💾 [META] Zapisan FK '{conname}' u pending_fks")
+            conn.execute(text(f'ALTER TABLE "{schema}"."{relname}" DROP CONSTRAINT IF EXISTS "{conname}"'))
 
-            try:
-                # 3. ČITANJE PODATAKA (Ovde se dešava filtriranje na nivou baze)
-                # Koristimo argument 'where' koji tvoj read_table sada podržava
-                df = self.read_table(table_name, selected_schema, where=where_clause)
-
-                if df is None or df.empty:
-                    print(f"⚠️ [SKIP] Table {table_name} returned 0 rows. Nothing to anonymize.")
-                    continue
-
-                print(f"📊 [DATA] Loaded {len(df)} rows for anonymization.")
-
-                # 4. DDL SYNC (Priprema kolona u 'anon' šemi - npr. INT -> VARCHAR)
-                # Prosleđujemo očišćen plan
-                self.align_db_types(target_schema, table_name, plan)
-
-                # 5. PRIMENA PRAVILA ANONIMIZACIJE
-                # PAŽNJA: Prosleđujemo listu 'plan', ne ceo rečnik 'data'
-                df_anon = self.apply_anonymization_rules(df, plan)
-
-                # 6. UPIS U CILJNU ŠEMU
-                # Ovde koristimo 'append' jer je batch_processor verovatno već uradio TRUNCATE
-                self.save_anonymized_table(df_anon, table_name, target_schema=target_schema)
-
-                print(f"✅ [SUCCESS] Table {table_name} saved to {target_schema}.\n")
-
-            except Exception as e:
-                print(f"❌ [ERROR] Failed to process table {table_name}: {str(e)}")
-                # Nastavljamo sa sledećom tabelom u batch-u umesto da prekinemo sve
-                continue
+        return rehook_commands
 
     def drop_target_schema(self, target_schema):
         from sqlalchemy import text
@@ -795,6 +769,7 @@ class DBManager:
         """
         try:
             df = pd.read_sql(query, self.engine, params=(schema, table))
+            print(f"🚀 [BATCH] {table_name}: Učitano {len(df)} redova.")
             return df['column_name'].tolist()
         except Exception as e:
             print(f"Error fetching PKs: {e}")
@@ -919,94 +894,139 @@ class DBManager:
             return {}
 
 
-    def align_db_types(self, target_schema, table_name, plan):
+    def align_db_types(self, target_schema, table_name, plan, conn=None):
         """
-        Menja DDL tipove uz PRIVREMENO UKLANJANJE Foreign Key-eva 
-        koji blokiraju promenu tipa kolone.
+        Usklađuje tipove podataka. Ako je 'conn' prosleđen, koristi ga (unutar transakcije).
+        Ako nije, otvara novu sesiju.
         """
         import json
         from sqlalchemy import text
 
         if isinstance(plan, str):
-            try:
-                plan = json.loads(plan)
-            except Exception as e:
-                print(f"❌ DDL Sync Error: Neuspelo parsiranje plana za {table_name}: {e}")
-                return
+            try: plan = json.loads(plan)
+            except: return []
 
         text_transform_strategies = ['hash', 'mask', 'faker_name', 'faker_email', 'faker_phone', 'mapping']
+        
+        def _run_alignment(active_conn):
+            # 1. Privremeno sklanjamo FK-ove i pamtimo ih (zapisuje i u metadata.pending_fks)
+            rehook_commands = self.drop_all_fks_for_table(active_conn, target_schema, table_name)
 
-        try:
-            with self.engine.connect() as conn:
-                # --- KORAK 1: UKLANJANJE FK KONSTRAINTA ---
-                # Moramo skinuti sve FK-ove koji "gađaju" ovu tabelu ili koje ova tabela ima,
-                # jer Postgres ne dozvoljava ALTER TYPE na koloni koja je deo FK-a.
-                self.drop_all_fks_for_table(conn, target_schema, table_name)
+            for item in plan:
+                if isinstance(item, str):
+                    try: item = json.loads(item)
+                    except: continue
 
-                for item in plan:
-                    if isinstance(item, str):
-                        try: item = json.loads(item)
-                        except: continue
+                col = item.get('column')
+                strategy = str(item.get('strategy', 'keep')).lower()
 
-                    col = item.get('column')
-                    strategy = str(item.get('strategy', 'keep')).lower()
+                if strategy in text_transform_strategies:
+                    # Provera trenutnog tipa u bazi
+                    check_sql = text("""
+                        SELECT data_type FROM information_schema.columns
+                        WHERE table_schema = :s AND table_name = :t AND column_name = :c
+                    """)
+                    current_type = active_conn.execute(check_sql, {"s": target_schema, "t": table_name, "c": col}).scalar()
 
-                    if not col: continue
-
-                    if strategy in text_transform_strategies:
-                        check_sql = text("""
-                            SELECT data_type FROM information_schema.columns
-                            WHERE table_schema = :s AND table_name = :t AND column_name = :c
+                    if current_type and any(t in current_type.lower() for t in ['int', 'numeric', 'double', 'date', 'timestamp']):
+                        print(f"🔧 DDL Sync: Menjam {table_name}.{col} u VARCHAR(255)")
+                        alter_sql = text(f"""
+                            ALTER TABLE "{target_schema}"."{table_name}"
+                            ALTER COLUMN "{col}" TYPE VARCHAR(255)
+                            USING "{col}"::VARCHAR
                         """)
-                        current_type = conn.execute(check_sql, {
-                            "s": target_schema, "t": table_name, "c": col
-                        }).scalar()
+                        active_conn.execute(alter_sql)
+            
+            return rehook_commands
 
-                        if current_type and any(t in current_type.lower() for t in ['int', 'numeric', 'double', 'date', 'timestamp']):
-                            print(f"🔧 DDL Sync: Menjam {table_name}.{col} iz {current_type} u VARCHAR(255)")
-
-                            # Koristimo explicitno kasting da izbegnemo greške pri konverziji
-                            alter_sql = text(f"""
-                                ALTER TABLE "{target_schema}"."{table_name}"
-                                ALTER COLUMN "{col}" TYPE VARCHAR(255)
-                                USING "{col}"::VARCHAR
-                            """)
-                            conn.execute(alter_sql)
-
-                conn.commit()
-                print(f"✅ DDL Sync završen za {table_name}")
-
+        # --- LOGIKA KONEKCIJE ---
+        try:
+            if conn:
+                # Koristimo postojeću transakciju iz Batch-a
+                return _run_alignment(conn)
+            else:
+                # Samostalni poziv van Batch-a
+                with self.engine.connect() as standalone_conn:
+                    with standalone_conn.begin():
+                        res = _run_alignment(standalone_conn)
+                        return res
         except Exception as e:
-            print(f"❌ DDL Sync Critical Failure na tabeli {table_name}: {e}")
+            print(f"❌ DDL Sync Failure na {table_name}: {e}")
+            return []
 
     def drop_all_fks_for_table(self, conn, schema, table):
         """
-        Pomoćna metoda koja pronalazi i briše sve Foreign Key-eve 
-        koji su povezani sa specifičnom tabelom.
+        Pronalazi FK-ove, zapisuje ih u metadata.pending_fks i briše ih.
+        Pazi: 'table' je argument funkcije koji prosleđujemo SQL-u.
         """
         from sqlalchemy import text
-        
-        # Query koji pronalazi nazive FK constrainta gde je tabela ILI roditelj ILI dete
+
         find_fks_sql = text("""
-            SELECT conname, relname 
-            FROM pg_constraint c 
-            JOIN pg_class t ON c.conrelid = t.oid 
-            JOIN pg_namespace n ON t.relnamespace = n.oid 
-            WHERE n.nspname = :schema 
+            SELECT
+                conname,
+                relname,
+                pg_get_constraintdef(c.oid) as constraint_def
+            FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = :schema_name
             AND (
-                t.relname = :table 
-                OR c.confrelid = (SELECT oid FROM pg_class WHERE relname = :table AND relnamespace = n.oid)
+                t.relname = :table_name
+                OR c.confrelid = (
+                    SELECT oid FROM pg_class
+                    WHERE relname = :table_name
+                    AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = :schema_name)
+                )
             )
             AND c.contype = 'f';
         """)
-        
-        results = conn.execute(find_fks_sql, {"schema": schema, "table": table}).fetchall()
-        
-        for conname, relname in results:
-            print(f"🔗 [FK Drop] Uklanjam constraint '{conname}' sa tabele '{relname}'")
-            # Moramo koristiti ALTER TABLE na tabeli koja poseduje FK (dete)
-            drop_sql = text(f'ALTER TABLE "{schema}"."{relname}" DROP CONSTRAINT IF EXISTS "{conname}"')
-            conn.execute(drop_sql)
+
+        # OVO JE KLJUČNO: Mapiranje argumenata funkcije na SQL parametre
+        results = conn.execute(find_fks_sql, {
+            "schema_name": schema,
+            "table_name": table
+        }).fetchall()
+
+        rehook_commands = []
+
+        for conname, relname, condef in results:
+            rehook_sql = f'ALTER TABLE "{schema}"."{relname}" ADD CONSTRAINT "{conname}" {condef}'
+            rehook_commands.append(rehook_sql)
+
+            # Zapis u bazu da imamo trag ako nešto pukne
+            conn.execute(text("""
+                INSERT INTO metadata.pending_fks (target_schema, table_name, constraint_name, rehook_sql)
+                VALUES (:s, :t, :c, :sql)
+            """), {
+                "s": schema,
+                "t": relname,
+                "c": conname,
+                "sql": rehook_sql
+            })
+
+            print(f"💾 [META] Zapisan FK '{conname}' za tabelu '{relname}'")
+            conn.execute(text(f'ALTER TABLE "{schema}"."{relname}" DROP CONSTRAINT IF EXISTS "{conname}"'))
+
+        return rehook_commands
+
+    def rehook_foreign_keys(self, conn, commands):
+        """
+        Vraća FK integritet i čisti metadata.pending_fks.
+        """
+        from sqlalchemy import text
+        print(f"\n⚓ [RE-HOOK] Vraćam {len(commands)} Foreign Key-eva...")
+
+        for cmd in commands:
+            try:
+                conn.execute(text(cmd))
+                # --- ČIŠĆENJE IZ METADATA ---
+                # Izvlačimo ime constrainta iz komande (grubo, ali radi za logiku čišćenja)
+                con_name = cmd.split('CONSTRAINT "')[1].split('"')[0]
+                conn.execute(text("DELETE FROM metadata.pending_fks WHERE constraint_name = :c"), {"c": con_name})
+
+                print(f"✅ Uspešno vraćen: {con_name}")
+            except Exception as e:
+                print(f"⚠️ [RE-HOOK WARNING] Neuspelo vraćanje: {e}")
 
     def truncate_anon_tables(self, target_schema, ordered_tables):
         from sqlalchemy import text
@@ -1014,20 +1034,146 @@ class DBManager:
 
         # Spajamo tabele: "anon"."customers", "anon"."orders"
         tables_to_clear = ", ".join([f'"{target_schema}"."{t}"' for t in ordered_tables])
-        
+
         # Dodajemo RESTART IDENTITY da ID-evi krenu od 1
         sql = text(f"TRUNCATE TABLE {tables_to_clear} RESTART IDENTITY CASCADE;")
 
         with self.engine.connect() as conn:
             # 1. Isključujemo trigere i FK provere za ovu sesiju
             conn.execute(text("SET session_replication_role = 'replica';"))
-            
+
             print(f"DEBUG: Pokrećem TRUNCATE nad {tables_to_clear}")
             conn.execute(sql)
-            
+
             # 2. Vraćamo u normalu
             conn.execute(text("SET session_replication_role = 'origin';"))
-            
+
             # 3. FORCE COMMIT
             conn.commit()
             print("DEBUG: TRUNCATE uspešno izvršen i potvrđen.")
+
+    def prepare_subset_metadata(self, conn):
+        """
+        Pravi privremenu tabelu i OSIGURAVA da je vidljiva u istoj sesiji.
+        """
+        from sqlalchemy import text
+        
+        # 1. Kreiramo tabelu
+        # Koristimo ON COMMIT PRESERVE ROWS da tabela ne nestane pri svakom malom commitu
+        conn.execute(text("""
+            CREATE TEMP TABLE IF NOT EXISTS subset_tracking (
+                column_name VARCHAR(255),
+                key_value VARCHAR(255),
+                PRIMARY KEY (column_name, key_value)
+            ) ON COMMIT PRESERVE ROWS;
+        """))
+        
+        # 2. KLJUČNO: Moramo potvrditi kreiranje pre nego što bilo šta ubacimo
+        # U SQLAlchemy 2.0 na Connection objektu koristimo commit() 
+        # (ako tvoj setup podržava manualne transakcije unutar bloka)
+        # ili jednostavno idemo odmah na INSERT.
+        
+        print("🛠️ Temp tabela 'subset_tracking' kreirana.")
+
+        # Izmeni onaj debug INSERT da bude bezbedniji
+        try:
+            conn.execute(text("INSERT INTO subset_tracking (column_name, key_value) VALUES ('test', '1') ON CONFLICT DO NOTHING"))
+            print("✅ Debug INSERT uspešan.")
+        except Exception as e:
+            print(f"❌ Greška pri debug INSERT-u: {e}")
+
+    def register_keys(self, conn, column_name, values):
+        """Ubacuje ključeve u temp tabelu za kasniji JOIN."""
+        if not values: return
+
+        # Batch insert ključeva
+        data = [{"c": column_name, "v": str(v)} for v in values]
+        conn.execute(text("""
+            INSERT INTO subset_tracking (column_name, key_value)
+            VALUES (:c, :v)
+            ON CONFLICT DO NOTHING
+        """), data)
+
+    def execute_anonymization_batch(self, selected_schema, target_schema, full_plan, ordered_tables):
+        """
+        Enterprise-grade batch: Subsetting + RI Propagacija + FK Re-Hook.
+        Sve unutar jedne 'begin()' transakcije da TEMP TABLE ne bi nestala.
+        """
+        from sqlalchemy import text
+        import pandas as pd
+
+        all_rehook_commands = []
+
+        # 1. Otvaramo konekciju
+        with self.engine.connect() as conn:
+            # 2. POKREĆEMO TRANSAKCIJU (Ovo drži sesiju i TEMP tabelu živom!)
+            with conn.begin():
+                # Priprema RI Subset mehanizma (sada unutar transakcije)
+                self.prepare_subset_metadata(conn)
+                
+                all_relations = self.get_all_foreign_keys(selected_schema)
+
+                for table_name in ordered_tables:
+                    if table_name not in full_plan:
+                        continue
+
+                    data = full_plan[table_name]
+                    plan = data.get('plan', [])
+                    base_where = data.get('where', "").strip()
+
+                    # --- SUBSET JOIN LOGIKA ---
+                    parent_filters = []
+                    for rel in all_relations:
+                        child_table, child_col, parent_table, parent_col = rel[0], rel[1], rel[2], rel[3]
+                        if child_table == table_name:
+                            parent_filters.append((child_col, parent_col))
+
+                    query = f'SELECT t.* FROM "{selected_schema}"."{table_name}" t'
+                    
+                    if parent_filters:
+                        for i, (c_col, p_col) in enumerate(parent_filters):
+                            alias = f"s{i}"
+                            # Kastujemo u VARCHAR jer temp tabela čuva sve kao stringove
+                            query += f' JOIN subset_tracking {alias} ON t."{c_col}"::VARCHAR = {alias}.key_value'
+                            query += f" AND {alias}.column_name = '{p_col}'"
+
+                    if base_where:
+                        # Dodajemo filter, pazeći na to da li već imamo JOIN/WHERE
+                        query += f" WHERE ({base_where})"
+
+                    print(f"🚀 [BATCH] Procesuiram: {table_name}")
+                    
+                    # Čitanje mora ići preko iste 'conn'
+                    df = pd.read_sql(text(query), conn)
+
+                    if df.empty:
+                        print(f"⚠️ Tabela {table_name} je prazna nakon subsettinga. Preskačem.")
+                        continue
+
+                    # --- REGISTRACIJA KLJUČEVA ---
+                    for rel in all_relations:
+                        if rel[2] == table_name:
+                            p_col = rel[3]
+                            if p_col in df.columns:
+                                unique_keys = df[p_col].unique().tolist()
+                                self.register_keys(conn, p_col, unique_keys)
+
+                    # --- DDL SYNC & SAVE ---
+                    # Prosleđujemo 'conn' da bi align_db_types mogao da piše u pending_fks
+                    table_fks = self.align_db_types(target_schema, table_name, plan, conn=conn)
+                    if table_fks:
+                        all_rehook_commands.extend(table_fks)
+
+                    # Anonimizacija i snimanje (prosleđujemo conn!)
+                    df_anon = self.apply_anonymization_rules(df, plan)
+                    self.save_anonymized_table(df_anon, table_name, target_schema, conn=conn)
+
+                # --- FINALNI KORAK: RE-HOOK ---
+                if all_rehook_commands:
+                    unique_fks = list(set(all_rehook_commands))
+                    self.rehook_foreign_keys(conn, unique_fks)
+                
+                # Na kraju 'with conn.begin():' bloka, SQLAlchemy AUTOMATSKI radi COMMIT.
+                # Ako se desi greška bilo gde iznad, AUTOMATSKI radi ROLLBACK.
+            
+            print("🎯 [COMPLETED] Batch proces uspešno završen.")

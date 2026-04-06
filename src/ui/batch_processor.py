@@ -152,7 +152,7 @@ def handle_batch_execution(db, ordered_tables, selected_schema, target_schema, s
                     st.write("🚀 **Pozivam db.execute_anonymization_batch...**")
                     
                     # IZVRŠAVANJE
-                    db.execute_anonymization_batch(selected_schema, target_schema, full_plan)
+                    db.execute_anonymization_batch(selected_schema, target_schema, full_plan, ordered_tables)
 
                     status.update(label="✅ Success!", state="complete")
                     st.success("Operacija uspešno završena.")
@@ -162,3 +162,4 @@ def handle_batch_execution(db, ordered_tables, selected_schema, target_schema, s
                     # ISPISUJEMO CEO TRACEBACK NA EKRAN DA GA VIDIŠ
                     st.error(f"💥 KRITIČNA GREŠKA: {str(e)}")
                     st.code(traceback.format_exc(), language="python") # Ovo menja terminal!
+                    
