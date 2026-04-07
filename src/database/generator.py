@@ -14,7 +14,7 @@ def generate_bulk_data(conn, num_rows, batch_size):
     cur = conn.cursor()
 
     # Ensure source table exists
-    cur.execute("""
+    cur.execute(""" 
         CREATE TABLE IF NOT EXISTS users_raw (
             id SERIAL PRIMARY KEY,
             full_name VARCHAR(255),

@@ -4,8 +4,8 @@ import pandas as pd
 import time
 from sqlalchemy import text
 from src.ui.batch_processor import handle_batch_execution
+from src.ui.planner import AnonymizationPlanner
 
-# --- 1. OVDE STAVI FUNKCIJU (Vrh fajla) ---
 def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause=""):
     """Pomocna funkcija sa STROGOM validacijom DDL tipova, PII detekcijom i RI sinhronizacijom"""
 
@@ -284,21 +284,40 @@ def render_planner_tab(db):
             </div>
         """, unsafe_allow_html=True)
 
-        # --- NOVO: ACTION BAR (AI Scan, Manual & Refresh) ---
-# --- ACTION BAR ---
-        # --- ACTION BAR ---
         col_btn1, col_btn2, col_btn3, col_btn4 = st.columns([1, 1, 1, 1.5])
 
         with col_btn1:
+            # --- NOVE KONTROLE ZA PRIVATNOST ---
+            st.markdown("### 🔒 Privacy Settings")
+            allow_sampling = st.checkbox(
+                "Dozvoli slanje uzorka podataka AI-ju",
+                value=True,
+                help="Ako je isključeno, AI analizira samo imena kolona. Ako je uključeno, šalje se mali uzorak (PII) radi veće preciznosti."
+            )
+
+            sample_rows = 5
+            if allow_sampling:
+                sample_rows = st.slider("Broj redova za uzorak", min_value=1, max_value=20, value=5)
+
+            st.divider()
+
             if st.button("🤖 AI Scan", width="stretch", type="secondary"):
-                with st.spinner("Consulting AI..."):
-                    raw_df = db.read_table(table_name, schema_name, limit=10)
-                    agent = st.session_state.get('agent')
-                    st.session_state['ai_analysis'] = db.analyze_table_structure(raw_df, agent, schema_name=schema_name)
-                    st.session_state['plan_origin'] = 'new'
-                    if 'plan_snapshot' in st.session_state: del st.session_state['plan_snapshot']
-                    if 'current_plan' in st.session_state: del st.session_state['current_plan']
-                    st.rerun()
+                with st.spinner("Consulting AI with Data Sampling..."):
+                    planner = AnonymizationPlanner(db)
+
+                    # Prosleđujemo nove parametre u metodu
+                    ai_plan, audit_data = planner.generate_suggestion_plan(
+                        schema_name, table_name, allow_sampling, sample_rows
+                    )
+
+                    if ai_plan:
+                        st.session_state['ai_analysis'] = ai_plan
+                        # ČUVAMO AUDIT PODATKE TRAJNO U SESIJI
+                        st.session_state['last_ai_audit'] = audit_data 
+                        st.rerun()
+
+                    else:
+                        st.error("AI Scan nije vratio validan plan.")
 
         with col_btn2:
             if st.button("📂 Load Saved", width="stretch"):
@@ -327,6 +346,12 @@ def render_planner_tab(db):
             # Novo: Dugme samo skroluje ili obaveštava, jer je preview sada dole
             if st.button("👁️ View Data", width="stretch"):
                 st.info("Live Preview is available at the bottom of the page 👇")
+
+# --- DODAJ OVO ISPOD DUGMADI ---
+        # Ovo će se videti UVEK nakon što je skeniranje bar jednom urađeno
+        if 'last_ai_audit' in st.session_state:
+            with st.expander("📡 Poslednji AI Audit Log (Šta je poslato na Azure)"):
+                st.json(st.session_state['last_ai_audit'])
 
         st.divider()
 
@@ -586,10 +611,10 @@ def render_planner_tab(db):
             if st.button("🚀 Run Anonymization Preview", width="stretch", key=f"pre_btn_{table_name}"):
                 current_salt = st.session_state.get('salt_input', 'default_salt')
                 current_where = st.session_state.get(f"where_clause_{table_name}", "")
-                
+
                 # --- KLJUČNA ISPRAVKA: ČIŠĆENJE I DESERIJALIZACIJA ---
                 raw_plan = plan_data # To je ono što dolazi iz editora
-                
+
                 # Ako je plan_data greškom postao string, pretvori ga u listu
                 if isinstance(raw_plan, str):
                     import json
@@ -605,14 +630,14 @@ def render_planner_tab(db):
                     if isinstance(row, dict):
                         clean_plan.append({k: v for k, v in row.items() if k != 'status'})
                 # ---------------------------------------------------
-                
+
                 with st.spinner("Processing preview..."):
                     try:
-                        raw_table = db.read_table(table_name, schema_name, where=current_where) 
-                        
+                        raw_table = db.read_table(table_name, schema_name, where=current_where)
+
                         # Ovde prosleđujemo clean_plan koji je SADA SIGURNO lista rečnika
                         anon_df = db.apply_anonymization_rules(raw_table, clean_plan, salt=current_salt)
-                        
+
                         db.save_anonymized_table(anon_df, table_name, target_schema='anon')
                         st.success(f"✅ Preview saved to 'anon.{table_name}'")
                     except Exception as e:
@@ -801,16 +826,15 @@ def get_all_foreign_keys(db, schema_name):
         print(f"❌ Error fetching foreign keys: {e}")
         return []
 
-# --- OVDE STAVI NOVU FUNKCIJU ---
 def render_global_preview_section(db):
     """Prikazuje live preview podataka na dnu ekrana, nezavisno od tabova."""
-    
+
     if 'selected_table_info' in st.session_state:
         table_name, schema_name = st.session_state['selected_table_info']
         current_full_name = f"{schema_name}.{table_name}"
 
         # --- 1. AUTO-RESET LOGIKA (SINHRONIZACIJA) ---
-        # Ako je korisnik promenio tabelu u Sidebaru, brišemo stari DataFrame 
+        # Ako je korisnik promenio tabelu u Sidebaru, brišemo stari DataFrame
         # da ne bismo prikazivali "stale data" (podatke od prošle tabele)
         if st.session_state.get('last_previewed_table') != current_full_name:
             if 'current_df' in st.session_state:
@@ -827,10 +851,10 @@ def render_global_preview_section(db):
 
                 with p_col1:
                     st.write(f"**Current Context:** `{current_full_name}`")
-                    
+
                     # Hvatanje filtera koji je korisnik ukucao u Planer tabu
                     where_clause = st.session_state.get(f"where_clause_{table_name}", "")
-                    
+
                     if where_clause:
                         st.info(f"🔍 **Active Filter:**\n`{where_clause}`")
                         # DEV-FRIENDLY: Prikazujemo puni SQL query za lakši debug u DBeaver-u
@@ -845,14 +869,14 @@ def render_global_preview_section(db):
                                 # Čitamo podatke koristeći tvoj db_manager
                                 df = db.read_table(table_name, schema_name, where=where_clause, limit=100)
                                 st.session_state['current_df'] = df
-                                st.rerun() 
+                                st.rerun()
                             except Exception as e:
                                 st.error(f"SQL Error: {str(e)}")
 
                 with p_col2:
                     if 'current_df' in st.session_state:
                         df = st.session_state['current_df']
-                        
+
                         # --- 2. HANDLING ZA PRAZNE TABELE ---
                         if df.empty:
                             st.warning("⚠️ This table is empty or no records match your WHERE clause.")

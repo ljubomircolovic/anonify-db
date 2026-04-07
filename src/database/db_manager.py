@@ -99,7 +99,7 @@ class DBManager:
         def _run_save(active_conn):
             # Osiguravamo šemu ako ne postoji
             active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
-            
+
             # Upisujemo podatke koristeći 'append' (TRUNCATE je već odrađen na nivou Batch-a)
             # KLJUČNO: Ovde koristimo active_conn umesto self.engine
             df.to_sql(
@@ -907,7 +907,7 @@ class DBManager:
             except: return []
 
         text_transform_strategies = ['hash', 'mask', 'faker_name', 'faker_email', 'faker_phone', 'mapping']
-        
+
         def _run_alignment(active_conn):
             # 1. Privremeno sklanjamo FK-ove i pamtimo ih (zapisuje i u metadata.pending_fks)
             rehook_commands = self.drop_all_fks_for_table(active_conn, target_schema, table_name)
@@ -936,7 +936,7 @@ class DBManager:
                             USING "{col}"::VARCHAR
                         """)
                         active_conn.execute(alter_sql)
-            
+
             return rehook_commands
 
         # --- LOGIKA KONEKCIJE ---
@@ -1057,7 +1057,7 @@ class DBManager:
         Pravi privremenu tabelu i OSIGURAVA da je vidljiva u istoj sesiji.
         """
         from sqlalchemy import text
-        
+
         # 1. Kreiramo tabelu
         # Koristimo ON COMMIT PRESERVE ROWS da tabela ne nestane pri svakom malom commitu
         conn.execute(text("""
@@ -1067,12 +1067,12 @@ class DBManager:
                 PRIMARY KEY (column_name, key_value)
             ) ON COMMIT PRESERVE ROWS;
         """))
-        
+
         # 2. KLJUČNO: Moramo potvrditi kreiranje pre nego što bilo šta ubacimo
-        # U SQLAlchemy 2.0 na Connection objektu koristimo commit() 
+        # U SQLAlchemy 2.0 na Connection objektu koristimo commit()
         # (ako tvoj setup podržava manualne transakcije unutar bloka)
         # ili jednostavno idemo odmah na INSERT.
-        
+
         print("🛠️ Temp tabela 'subset_tracking' kreirana.")
 
         # Izmeni onaj debug INSERT da bude bezbedniji
@@ -1110,7 +1110,7 @@ class DBManager:
             with conn.begin():
                 # Priprema RI Subset mehanizma (sada unutar transakcije)
                 self.prepare_subset_metadata(conn)
-                
+
                 all_relations = self.get_all_foreign_keys(selected_schema)
 
                 for table_name in ordered_tables:
@@ -1129,7 +1129,7 @@ class DBManager:
                             parent_filters.append((child_col, parent_col))
 
                     query = f'SELECT t.* FROM "{selected_schema}"."{table_name}" t'
-                    
+
                     if parent_filters:
                         for i, (c_col, p_col) in enumerate(parent_filters):
                             alias = f"s{i}"
@@ -1142,7 +1142,7 @@ class DBManager:
                         query += f" WHERE ({base_where})"
 
                     print(f"🚀 [BATCH] Procesuiram: {table_name}")
-                    
+
                     # Čitanje mora ići preko iste 'conn'
                     df = pd.read_sql(text(query), conn)
 
@@ -1172,8 +1172,26 @@ class DBManager:
                 if all_rehook_commands:
                     unique_fks = list(set(all_rehook_commands))
                     self.rehook_foreign_keys(conn, unique_fks)
-                
+
                 # Na kraju 'with conn.begin():' bloka, SQLAlchemy AUTOMATSKI radi COMMIT.
                 # Ako se desi greška bilo gde iznad, AUTOMATSKI radi ROLLBACK.
-            
+
             print("🎯 [COMPLETED] Batch proces uspešno završen.")
+
+    def get_table_sample(self, schema, table, limit=5):
+        """
+        Dohvata uzorak podataka za AI analizu.
+        Sve pretvara u string da bi izbegli probleme sa specifičnim tipovima u JSON-u.
+        """
+        from sqlalchemy import text
+        import pandas as pd
+
+        query = f'SELECT * FROM "{schema}"."{table}" LIMIT {limit}'
+        try:
+            with self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn)
+                # Bitno: pretvaramo sve u stringove pre slanja AI-ju
+                return df.astype(str).to_dict(orient='records')
+        except Exception as e:
+            logger.error(f"⚠️ Error fetching sample for {table}: {e}")
+            return []
