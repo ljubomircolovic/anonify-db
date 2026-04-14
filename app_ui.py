@@ -79,7 +79,6 @@ render_sidebar(agent)
 st.title("🛡️ AnonifyDB Data Engineering Tool")
 
 if 'selected_table_info' in st.session_state:
-    # Prosleđujemo 'db' instancu tabovima (render_tabs će unutar sebe pozvati render_planner_tab)
     render_tabs(db)
 else:
     hour = datetime.datetime.now().hour

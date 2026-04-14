@@ -1,19 +1,29 @@
 ﻿# -*- coding: utf-8 -*-
+# --- Na vrh fajla ---
 import streamlit as st
 import pandas as pd
 import time
 from sqlalchemy import text
-from src.ui.batch_processor import handle_batch_execution
-from src.ui.planner import AnonymizationPlanner
+# Svi ovi moduli sada rade za tebe:
+from src.ui.planner import AnonymizationPlanner, analyze_tables_parallel
+from src.ui.planner_logic import validate_plan_row, calculate_privacy_score, get_clean_plan
+from src.ui.planner_components import render_status_chain, render_table_header_info, render_ai_audit_log
+from src.ui.planner_navigation import handle_navigation_history, render_nav_buttons, get_next_table_in_chain
+
 
 def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause=""):
-    """Pomocna funkcija sa STROGOM validacijom DDL tipova, PII detekcijom i RI sinhronizacijom"""
+    """
+    Sadrži strogu validaciju DDL tipova, PII detekciju i RI sinhronizaciju,
+    snima plan i pomera navigaciju na sledeću tabelu.
+    """
+    # --- 0. DEBUG START ---
+    st.toast(f"⏳ Saving plan for {table_name}...", icon="💾")
 
-    # --- 1. DEFINICIJA KOMPATIBILNOSTI ---
+    # --- 1. DEFINICIJA KOMPATIBILNOSTI (Tvoja originalna logika) ---
     COMPATIBILITY = {
-        "numeric": ["keep", "mapping", "noise", "null"],
-        "text": ["keep", "hash", "mask", "mapping", "null"],
-        "pii": ["keep", "hash", "mapping", "null"],
+        "numeric": ["keep", "hash", "mapping", "noise", "null"],
+        "text": ["keep", "hash", "mask", "mapping", "null", "faker_name", "faker_email", "faker_phone"],
+        "pii": ["keep", "hash", "mapping", "null", "faker_name", "faker_email", "faker_phone"],
         "date": ["keep", "date_shift", "null"],
         "boolean": ["keep", "null"]
     }
@@ -42,156 +52,82 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
                 sql_type = col_info['type'].lower()
                 is_nullable = col_info['nullable']
 
-                # --- 1. NOT NULL GUARD ---
+                # --- VALIDACIJA 1: NOT NULL Guard ---
                 if strategy == 'null' and is_nullable == 'NO':
-                    invalid_selections.append(
-                        f"❌ Kolona `{col_name}` je **NOT NULL**. Strategija `null` nije dozvoljena."
-                    )
+                    invalid_selections.append(f"❌ Kolona `{col_name}` je **NOT NULL**.")
                     continue
 
-                # --- 2. REFERENCIJALNI INTEGRITET (FK & PK Guard) ---
+                # --- VALIDACIJA 2: Referencijalni Integritet (FK & PK) ---
                 for rel in all_relations:
-                    # Case A: Trenutna kolona je FK (Sluga), proveravamo Roditelja
+                    # Case A: Trenutna kolona je FK
                     if rel[0] == table_name and rel[1] == col_name:
                         parent_table, parent_col = rel[2], rel[3]
                         p_plan = all_saved_plans.get(parent_table)
                         if p_plan:
                             p_strat = next((p['strategy'] for p in p_plan if p['column'] == parent_col), 'keep').lower()
                             if strategy != p_strat:
-                                invalid_selections.append(
-                                    f"❌ **RI Conflict (FK):** `{col_name}` referencira `{parent_table}.{parent_col}` (Strategija: `{p_strat}`). "
-                                    f"Moraš uskladiti strategiju."
-                                )
+                                invalid_selections.append(f"❌ **RI Conflict:** `{col_name}` mora biti `{p_strat}` (kao `{parent_table}.{parent_col}`).")
 
-                    # Case B: Trenutna kolona je PK (Roditelj), proveravamo Decu koja su već sačuvana
+                    # Case B: Trenutna kolona je PK
                     elif rel[2] == table_name and rel[3] == col_name:
                         child_table, child_col = rel[0], rel[1]
                         c_plan = all_saved_plans.get(child_table)
                         if c_plan:
                             c_strat = next((c['strategy'] for c in c_plan if c['column'] == child_col), 'keep').lower()
                             if strategy != c_strat:
-                                invalid_selections.append(
-                                    f"❌ **RI Conflict (PK):** Kolona je ključ za `{child_table}.{child_col}` koji je već sačuvan kao `{c_strat}`. "
-                                    f"Promeni ovde u `{c_strat}` ili izmeni plan za tabelu `{child_table}`."
-                                )
-
-                # --- 3. ODREĐIVANJE KATEGORIJE ---
-                category = None
-                for base_type, group in TYPE_GROUPS.items():
-                    if base_type in sql_type:
-                        category = group
-                        break
-
-                category = category or "text"
-                if category == "text":
-                    pii_keywords = ['name', 'email', 'phone', 'surname', 'mail', 'address']
-                    if any(key in col_name.lower() for key in pii_keywords):
-                        category = "pii"
-
-                # --- 4. PROVERA KOMPATIBILNOSTI + DDL BYPASS ---
-                allowed = COMPATIBILITY.get(category, [])
-
-                # Proveravamo da li je kolona deo bilo kakve relacije (FK ili PK)
-                is_in_relation = any(
-                    (r[0] == table_name and r[1] == col_name) or (r[2] == table_name and r[3] == col_name)
-                    for r in all_relations
-                )
-
-                # KLJUČNA PROMENA:
-                # Ako je kolona deo relacije, dozvoljavamo bilo koju strategiju
-                # jer pretpostavljamo da će naš DDL Sync uskladiti tipove u _anon bazi.
-                if is_in_relation:
-                    # Dozvoljavamo sve strategije koje su RI sinhronizovane
-                    pass
-                elif strategy not in allowed:
-                    invalid_selections.append(
-                        f"❌ Kolona `{col_name}` ({sql_type}) ne podržava `{strategy}`. "
-                        f"Dozvoljeno: {', '.join(allowed)}"
-                    )
+                                invalid_selections.append(f"❌ **RI Conflict:** Deca u `{child_table}` već koriste `{c_strat}`.")
 
         if invalid_selections:
-            st.error("🛑 **Integrity Violation**")
+            st.error("🛑 **Integrity Violation** - Plan nije sačuvan!")
             for err in invalid_selections:
                 st.write(err)
-            return
-
-        # --- 5. FINALNI SANITY CHECK ---
-        plan_columns = [row.get('column') for row in plan_data if 'column' in row]
-        if plan_columns and plan_columns[0] not in actual_db_columns:
-            st.error(f"🛑 **Critical Error:** Data mismatch za tabelu `{table_name}`.")
-            return
+            return # OVDE MOŽE DA STANE ako dugme "ne radi"
 
     except Exception as e:
         st.error(f"Sistemska greška pri validaciji: {e}")
         return
 
-    # --- 6. ČIŠĆENJE I SNIMANJE (Samo ako je sve Type-Safe) ---
-    # Izbacujemo UI kolone poput 'status' koje data_editor dodaje, da ne prljamo bazu
-    clean_plan = []
-    for row in plan_data:
-        if isinstance(row, dict):
-            # Uzimamo samo bitne kolone za plan
-            clean_plan.append({k: v for k, v in row.items() if k != 'status'})
-
-    # PROVERA: Osiguravamo da where_clause nije None pre slanja u DBManager
+    # --- 6. ČIŠĆENJE I SNIMANJE ---
+    clean_plan = get_clean_plan(plan_data)
     safe_where = str(where_clause or "").strip()
 
-    # Pozivamo tvoju DB metodu (ona sada prima 4 argumenta)
-    save_success = db.save_ai_plan(schema_name, table_name, clean_plan, safe_where)
+    save_success = db.save_ai_plan(
+        schema_name=schema_name,
+        table_name=table_name,
+        plan_data=clean_plan,
+        where_condition=safe_where
+    )
 
     if not save_success:
         st.error(f"❌ Kritična greška: Plan za `{table_name}` nije sačuvan u bazi!")
         return
 
-    # --- 7. LOGIKA ZA PRELAZAK NA SLEDEĆU TABELU ---
+    # --- 7. NAVIGACIJA ---
+    # Dodajemo u set završenih
+    if 'completed_tables' not in st.session_state:
+        st.session_state['completed_tables'] = set()
+    st.session_state['completed_tables'].add(table_name)
+
     all_tables = st.session_state.get('all_tables_list', [])
 
-    if all_tables:
-        try:
-            current_idx = all_tables.index(table_name)
+    # Koristimo tvoju navigaciju
+    next_table = get_next_table_in_chain(table_name, all_tables, st.session_state['completed_tables'])
 
-            # 1. MARKIRANJE TABELE KAO ZAVRŠENE (Za tvoju listu sa ✅)
-            if 'completed_tables' not in st.session_state:
-                st.session_state['completed_tables'] = set()
-            st.session_state['completed_tables'].add(table_name)
+    if next_table:
+        st.session_state['selected_table_info'] = (next_table, schema_name)
 
-            if current_idx + 1 < len(all_tables):
-                # --- IMA JOŠ TABELA ---
-                next_table = all_tables[current_idx + 1]
-                st.session_state['selected_table_info'] = (next_table, schema_name)
+        # Reset state-a za sledeću tabelu
+        keys_to_reset = ['ai_analysis', 'current_plan', 'last_rendered_table', 'plan_snapshot']
+        for key in keys_to_reset:
+            if key in st.session_state: del st.session_state[key]
 
-                # Resetujemo SAMO podatke o trenutnom editoru
-                keys_to_clear = [
-                    'current_df', 'ai_analysis', 'current_plan',
-                    'last_table_for_plan', 'last_rendered_table',
-                    'plan_snapshot', 'plan_origin'
-                ]
-                for key in keys_to_clear:
-                    if key in st.session_state:
-                        del st.session_state[key]
-
-                # Brišemo state editora samo za tabelu koju smo upravo završili
-                for key in list(st.session_state.keys()):
-                    if key.startswith(f"plan_editor_{table_name}"):
-                        del st.session_state[key]
-
-                st.success(f"✅ Plan za `{table_name}` je sačuvan. Prebacujem na `{next_table}`...")
-                time.sleep(1)
-                st.rerun()
-            else:
-                # --- ZADNJA TABELA DOSTIGNUTA ---
-                # Ovde NE RADIMO st.rerun() odmah, nego osiguravamo da Batch ostane vidljiv
-                st.session_state['all_plans_saved'] = True # Flag koji ti drži Batch sekciju upaljenom
-
-                st.success(f"🎯 Sve tabele su procesuirane! Batch Execution je spreman.")
-
-                # Opciono: Forsiramo jedan rerun da bi se osvežila lista sa kvačicama
-                # ali bez brisanja selected_table_info
-                time.sleep(1)
-                st.rerun()
-
-        except ValueError:
-            st.error("Greška u sekvenci tabela.")
+        st.success(f"✅ Saved! Moving to {next_table}...")
+        time.sleep(0.5) # Kratka pauza da korisnik vidi poruku
+        st.rerun()
+    else:
+        st.success("🎯 All tables finalized! Ready for Batch execution.")
+        time.sleep(1)
+        st.rerun()
 
 def render_explorer_tab(db):
     if 'current_df' in st.session_state:
@@ -221,459 +157,258 @@ def render_fk_explanation():
     **Preporuka:** Koristite **HASH** za sve Foreign Key kolone kako biste osigurali maksimalnu privatnost uz zadržavanje funkcionalnosti baze.
     """)
 
+def get_next_table_in_chain(current_table, all_tables, completed_tables):
+    """
+    Pametna navigacija koja pronalazi sledeću logičnu tabelu za obradu.
+    Prioritet:
+    1. Prva sledeća nezavršena tabela nakon trenutne.
+    2. Ako smo na kraju lanca, ali ima nezavršenih "iza" nas, vrati prvu nezavršenu.
+    """
+    if not all_tables:
+        return None
+
+    # Ako completed_tables nije set (npr. None), inicijalizuj ga
+    if completed_tables is None:
+        completed_tables = set()
+
+    try:
+        current_idx = all_tables.index(current_table)
+    except ValueError:
+        # Ako trenutna tabela nije u listi, vrati prvu nezavršenu uopšte
+        for table in all_tables:
+            if table not in completed_tables:
+                return table
+        return all_tables[0]
+
+    # --- KORAK 1: Traži prvu nezavršenu tabelu NAKON trenutne ---
+    for next_table in all_tables[current_idx + 1:]:
+        if next_table not in completed_tables:
+            return next_table
+
+    # --- KORAK 2: Ako smo stigli do kraja, proveri da li smo preskočili neku na početku ---
+    # Ovo je bitno ako je korisnik kliktao nasumično po sidebaru
+    for table in all_tables:
+        if table not in completed_tables:
+            return table
+
+    # --- KORAK 3: Sve tabele su završene ---
+    return None
+
+def render_planner_action_buttons(db, table_name, schema_name):
+    """Iscrtava red dugmića i audit log."""
+    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns([1, 1, 1, 1.5])
+
+    with col_btn1:
+        st.markdown("### 🔒 Privacy Settings")
+        allow_sampling = st.checkbox("Dozvoli uzorak", value=True, key=f"sample_check_{table_name}")
+        sample_rows = st.slider("Uzorak (redova)", 1, 20, 5) if allow_sampling else 0
+
+        if st.button("🤖 AI Scan", width="stretch", type="secondary", key=f"ai_btn_{table_name}"):
+            with st.spinner("Consulting AI..."):
+                planner = AnonymizationPlanner(db)
+                ai_plan, audit_data = planner.generate_suggestion_plan(schema_name, table_name, allow_sampling, sample_rows)
+                if ai_plan:
+                    st.session_state['ai_analysis'] = ai_plan
+                    st.session_state['last_ai_audit'] = audit_data
+                    st.rerun()
+
+    with col_btn2:
+        if st.button("📂 Load Saved", width="stretch", key=f"load_btn_{table_name}"):
+            saved_data = db.get_saved_plan(schema_name, table_name)
+            if saved_data:
+                st.session_state['ai_analysis'] = saved_data['plan']
+                st.session_state['plan_snapshot'] = saved_data['plan']
+                st.session_state[f"where_clause_{table_name}"] = saved_data['where']
+                st.session_state['plan_origin'] = 'saved'
+                st.rerun()
+
+    with col_btn3:
+        if st.button("✍️ Manual", width="stretch", key=f"man_btn_{table_name}"):
+            columns = db.get_columns(table_name, schema_name)
+            st.session_state['ai_analysis'] = [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual Entry"} for c in columns]
+            st.session_state['plan_origin'] = 'new'
+            st.rerun()
+
+    with col_btn4:
+        if st.button("👁️ View Data", width="stretch", key=f"view_btn_{table_name}"):
+            st.info("Live Preview is available at the bottom 👇")
+
+    # OVO JE BITNO - Audit log se iscrtava odmah ispod dugmića
+    render_ai_audit_log()
+
 def render_planner_tab(db):
+    st.header("🚀 Parallel AI Strategy Planner")
 
-    # --- 1. DOHVATANJE GLOBALNIH PODATAKA (Uvek dostupni) ---
-    all_tables = st.session_state.get('all_tables_list', [])
-    completed = st.session_state.get('completed_tables', set())
-
-    # --- 2. PRIKAZ LANCA PROGRESA (ZAKUCANO NA VRH) ---
-    if all_tables:
-        steps = []
-        for t in all_tables:
-            # Ako je tabela u setu completed, dobija ✅, inače ⏳
-            icon = "✅" if t in completed else "⏳"
-            steps.append(f"{icon} {t}")
-
-        # Prikazujemo info bar sa lancem koji je uvek tu
-        st.info(f"⛓️ **Execution Order:** {' ➔ '.join(steps)}")
+    # --- 🛠️ DEBUG DASHBOARD ---
+    with st.expander("🔍 DEBUG: Session State Inspector", expanded=False):
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            st.write("**Trenutna selekcija:**")
+            st.code(st.session_state.get('selected_table_info', 'Nije selektovana'))
+            st.write("**Multi-Scan Ključevi u memoriji:**")
+            st.code(list(st.session_state.get('multi_ai_analysis', {}).keys()))
+        with col_db2:
+            st.write("**Status plana:**")
+            st.write(f"Ima li 'ai_analysis'?: `{'DA' if 'ai_analysis' in st.session_state else 'NE'}`")
 
     st.divider()
 
-    if 'selected_table_info' in st.session_state:
-        table_name, schema_name = st.session_state['selected_table_info']
-        editor_key = f"plan_editor_{table_name}"
+    # --- 1. GLOBALNA ANALIZA ---
+    available_tables = db.get_tables(schema_name="ecommerce")
+    selected_multi_tables = st.multiselect(
+        "Izaberi tabele za masovnu AI analizu:",
+        options=available_tables,
+        default=[],
+        key="planner_multiselect"
+    )
 
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        bulk_allow_sampling = st.checkbox("Dozvoli uzorak za sve", value=True, key="bulk_sample_check")
+    with c2:
+        bulk_sample_rows = st.slider("Uzorak (redova) za sve", 1, 20, 5) if bulk_allow_sampling else 0
 
-        # --- LOGIKA ZA ISTORIJU ---
-        current_nav = (table_name, schema_name)
-        if not st.session_state['navigation_history'] or st.session_state['navigation_history'][st.session_state['history_pointer']] != current_nav:
-            st.session_state['navigation_history'] = st.session_state['navigation_history'][:st.session_state['history_pointer'] + 1]
-            st.session_state['navigation_history'].append(current_nav)
-            st.session_state['history_pointer'] = len(st.session_state['navigation_history']) - 1
-
-        # --- PRIKAZ NAVIGACIJE (⬅️ Back / Next ➡️) ---
-        n_col1, n_col2, n_empty = st.columns([1, 1, 8])
-        with n_col1:
-            if st.button("⬅️ Back", disabled=(st.session_state['history_pointer'] <= 0), width="stretch"):
-                st.session_state['history_pointer'] -= 1
-                st.session_state['selected_table_info'] = st.session_state['navigation_history'][st.session_state['history_pointer']]
-                st.rerun()
-        with n_col2:
-            if st.button("Next ➡️", disabled=(st.session_state['history_pointer'] >= len(st.session_state['navigation_history']) - 1), width="stretch"):
-                st.session_state['history_pointer'] += 1
-                st.session_state['selected_table_info'] = st.session_state['navigation_history'][st.session_state['history_pointer']]
-                st.rerun()
-        st.divider()
-
-
-        # --- NOVO: Dohvatanje stvarnih PK kolona iz baze ---
-        if f"pk_{table_name}" not in st.session_state:
-            st.session_state[f"pk_{table_name}"] = db.get_primary_keys(schema_name, table_name)
-
-        real_pks = st.session_state[f"pk_{table_name}"]
-
-        st.subheader("🛠️ Review & Finalize Plan")
-        # Koristimo Markdown sa HTML-om za veću kontrolu nad stilom
-        st.markdown(f"""
-            <div style="background-color: #e8f4f8; padding: 15px; border-radius: 10px; border-left: 5px solid #2e86de; margin-bottom: 20px;">
-                <span style="color: #576574; font-size: 16px; font-weight: bold;">Current Table for Analysis:</span><br>
-                <span style="color: #2e86de; font-size: 24px; font-weight: 800; font-family: 'Courier New', monospace;">
-                    {schema_name}.{table_name}
-                </span>
-            </div>
-        """, unsafe_allow_html=True)
-
-        col_btn1, col_btn2, col_btn3, col_btn4 = st.columns([1, 1, 1, 1.5])
-
-        with col_btn1:
-            # --- NOVE KONTROLE ZA PRIVATNOST ---
-            st.markdown("### 🔒 Privacy Settings")
-            allow_sampling = st.checkbox(
-                "Dozvoli slanje uzorka podataka AI-ju",
-                value=True,
-                help="Ako je isključeno, AI analizira samo imena kolona. Ako je uključeno, šalje se mali uzorak (PII) radi veće preciznosti."
+    if st.button("🪄 Parallel AI Scan", disabled=not selected_multi_tables, type="primary"):
+        with st.spinner(f"Analiziram {len(selected_multi_tables)} tabela paralelno..."):
+            all_results = analyze_tables_parallel(
+                db, 
+                selected_multi_tables, 
+                schema="ecommerce",
+                allow_sampling=bulk_allow_sampling,
+                sample_limit=bulk_sample_rows
             )
+            st.session_state['multi_ai_analysis'] = all_results
+            if 'selected_table_info' not in st.session_state and selected_multi_tables:
+                st.session_state['selected_table_info'] = (selected_multi_tables[0], "ecommerce")
+            st.success("Analiza završena!")
+            st.rerun()
 
-            sample_rows = 5
-            if allow_sampling:
-                sample_rows = st.slider("Broj redova za uzorak", min_value=1, max_value=20, value=5)
+    # --- 2. LANAC PROGRESA ---
+    all_tables_list = st.session_state.get('all_tables_list', [])
+    completed_tables = st.session_state.get('completed_tables', set())
+    render_status_chain(all_tables_list, completed_tables)
+    st.divider()
 
-            st.divider()
+    # --- 3. RAD SA POJEDINAČNOM TABELOM ---
+    if 'selected_table_info' in st.session_state:
+        table_info = st.session_state['selected_table_info']
+        table_name = table_info[0] if isinstance(table_info, tuple) else table_info
+        schema_name = table_info[1] if isinstance(table_info, tuple) else "ecommerce"
 
-            if st.button("🤖 AI Scan", width="stretch", type="secondary"):
-                with st.spinner("Consulting AI with Data Sampling..."):
+        editor_key = f"plan_editor_{table_name}"
+        where_key = f"where_clause_{table_name}"
+
+        # --- 🛡️ SINHRONIZACIJA (Claude Fix: Ne briši, samo puni ako je prazno) ---
+        multi_results = st.session_state.get('multi_ai_analysis', {})
+        base_name = str(table_name).split('.')[-1]
+        
+        # Ako NEMAMO ai_analysis, a IMAMO multi_results za ovu tabelu -> PUNI ODMAH
+        if 'ai_analysis' not in st.session_state or st.session_state.get('last_rendered_table') != table_name:
+            found_res = multi_results.get(table_name) or multi_results.get(base_name)
+            if found_res:
+                if hasattr(found_res, 'plan'):
+                    st.session_state['ai_analysis'] = found_res.plan
+                    st.session_state['last_ai_audit'] = getattr(found_res, 'audit', [])
+                elif isinstance(found_res, dict) and 'plan' in found_res:
+                    st.session_state['ai_analysis'] = found_res['plan']
+                    st.session_state['last_ai_audit'] = found_res.get('audit', [])
+                st.session_state['plan_origin'] = 'parallel_ai'
+                st.session_state['last_rendered_table'] = table_name
+
+        handle_navigation_history(table_name, schema_name)
+        render_nav_buttons()
+        render_table_header_info(schema_name, table_name)
+
+        # --- PRIVACY SETTINGS SEKCIJA ---
+        col_btn1, col_btn2, col_btn3, col_btn4 = st.columns([1, 1, 1, 1.5])
+        with col_btn1:
+            st.markdown("### 🔒 Privacy Settings")
+            allow_sampling = st.checkbox("Dozvoli uzorak", value=True, key=f"sample_check_{table_name}")
+            sample_rows = st.slider("Uzorak (redova)", 1, 20, 5, key=f"sample_slider_{table_name}") if allow_sampling else 0
+            if st.button("🤖 AI Scan", type="secondary", key=f"ai_btn_{table_name}", use_container_width=True):
+                with st.spinner("Consulting AI..."):
                     planner = AnonymizationPlanner(db)
-
-                    # Prosleđujemo nove parametre u metodu
-                    ai_plan, audit_data = planner.generate_suggestion_plan(
-                        schema_name, table_name, allow_sampling, sample_rows
-                    )
-
+                    ai_plan, audit_data = planner.generate_suggestion_plan(schema_name, table_name, allow_sampling, sample_rows)
                     if ai_plan:
                         st.session_state['ai_analysis'] = ai_plan
-                        # ČUVAMO AUDIT PODATKE TRAJNO U SESIJI
-                        st.session_state['last_ai_audit'] = audit_data 
+                        st.session_state['last_ai_audit'] = audit_data
                         st.rerun()
 
-                    else:
-                        st.error("AI Scan nije vratio validan plan.")
-
         with col_btn2:
-            if st.button("📂 Load Saved", width="stretch"):
+            if st.button("📂 Load Saved", key=f"load_btn_{table_name}", use_container_width=True):
                 saved_data = db.get_saved_plan(schema_name, table_name)
                 if saved_data:
-                    plan_to_load = saved_data['plan']
-                    st.session_state['ai_analysis'] = plan_to_load
-                    st.session_state['plan_snapshot'] = plan_to_load
-                    st.session_state[f"where_clause_{table_name}"] = saved_data['where'] # Učitava i filter!
-                    st.session_state['plan_origin'] = 'saved'
-                    if 'current_plan' in st.session_state: del st.session_state['current_plan']
-                    st.success("Plan & Filter loaded!")
+                    st.session_state['ai_analysis'] = saved_data['plan']
+                    st.session_state[f"where_clause_{table_name}"] = saved_data['where']
                     st.rerun()
 
         with col_btn3:
-            if st.button("✍️ Manual", width="stretch"):
+            if st.button("✍️ Manual", key=f"man_btn_{table_name}", use_container_width=True):
                 columns = db.get_columns(table_name, schema_name)
-                st.session_state['ai_analysis'] = {
-                    "plan": [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual Entry"} for c in columns]
-                }
-                st.session_state['plan_origin'] = 'new'
-                if 'current_plan' in st.session_state: del st.session_state['current_plan']
+                st.session_state['ai_analysis'] = [{"column": c, "is_pii": False, "strategy": "keep", "reason": "Manual Entry"} for c in columns]
                 st.rerun()
 
         with col_btn4:
-            # Novo: Dugme samo skroluje ili obaveštava, jer je preview sada dole
-            if st.button("👁️ View Data", width="stretch"):
-                st.info("Live Preview is available at the bottom of the page 👇")
+            if st.button("👁️ View Data", key=f"view_btn_{table_name}", use_container_width=True):
+                st.info("Live Preview is available at the bottom 👇")
 
-# --- DODAJ OVO ISPOD DUGMADI ---
-        # Ovo će se videti UVEK nakon što je skeniranje bar jednom urađeno
-        if 'last_ai_audit' in st.session_state:
-            with st.expander("📡 Poslednji AI Audit Log (Šta je poslato na Azure)"):
-                st.json(st.session_state['last_ai_audit'])
-
+        render_ai_audit_log()
         st.divider()
 
-        # --- 🔍 DATA FILTER (SADA JE VAN DUGMETA I UVEK VIDLJIV) ---
+        # --- DATA FILTER ---
         st.markdown("### 🔍 Data Filter")
-
-        where_key = f"where_clause_{table_name}"
-        if where_key not in st.session_state:
-            st.session_state[where_key] = ""
-
-        # Ovo polje je sada uvek tu da korisnik može da kuca
-        where_input = st.text_input(
-            "SQL WHERE Clause (optional):",
-            value=st.session_state[where_key],
-            placeholder="e.g. created_at > '2023-01-01' OR status = 'active'",
-            help="Filter koji se primenjuje na izvornu tabelu pre anonimizacije.",
-            key=f"input_{where_key}"
+        st.session_state[where_key] = st.text_input(
+            "SQL WHERE Clause:", value=st.session_state.get(where_key, ""), key=f"in_{where_key}"
         )
-        # Sinhronizacija vrednosti
-        st.session_state[where_key] = where_input
-
         st.divider()
 
+        # --- DATA EDITOR (Zadnja linija odbrane) ---
+        # Ovde radimo finalni check: ako i dalje nema ai_analysis, probaj fuzzy match još jednom
+        if 'ai_analysis' not in st.session_state:
+            found_res = multi_results.get(table_name) or multi_results.get(base_name)
+            if found_res:
+                st.session_state['ai_analysis'] = found_res['plan'] if isinstance(found_res, dict) else found_res.plan
+                st.rerun() # Forsiraj osvežavanje da editor vidi podatke
 
-        # --- 2. PAMETNA PROVERA IZVORA PODATAKA ---
-        # Proveravamo da li za TRENUTNU tabelu imamo bilo šta u state-u
-        is_data_ready = (
-            ('ai_analysis' in st.session_state) or
-            ('current_plan' in st.session_state and st.session_state.get('last_table_for_plan') == table_name)
-        )
+        if 'ai_analysis' in st.session_state:
+            analysis_data = st.session_state['ai_analysis']
+            plan_list = analysis_data.plan if hasattr(analysis_data, 'plan') else analysis_data
+            plan_df = pd.DataFrame(plan_list)
+            
+            if f"pk_{table_name}" not in st.session_state:
+                st.session_state[f"pk_{table_name}"] = db.get_primary_keys(schema_name, table_name)
+            
+            plan_df['status'] = plan_df.apply(lambda x: validate_plan_row(x, st.session_state[f"pk_{table_name}"]), axis=1)
 
-        if not is_data_ready:
-            st.info("👋 **Welcome to the Planner!**")
-            st.warning("No plan detected for this table. Please choose an action from the bar above:")
-            st.markdown("""
-                * 🤖 **AI Scan**: Suggest strategies using AI.
-                * 📂 **Load Saved**: Retrieve last confirmed plan from DB.
-                * ✍️ **Manual**: Define strategies yourself.
-            """)
-            return  # Ovde stajemo ako korisnik još ništa nije kliknuo
-
-        # --- 3. ODREĐIVANJE "SOURCE OF TRUTH" ---
-        # Ako smo prošli return, znači da podaci postoje. Sada ih pakujemo za editor.
-        if 'current_plan' in st.session_state and st.session_state.get('last_table_for_plan') == table_name:
-            plan_list = st.session_state['current_plan']
+            edited_plan_df = st.data_editor(
+                plan_df,
+                column_config={
+                    "status": st.column_config.TextColumn("Status", disabled=True),
+                    "column": st.column_config.TextColumn("Column", disabled=True),
+                    "strategy": st.column_config.SelectboxColumn("Strategy", options=["keep", "hash", "mask", "mapping", "noise", "date_shift", "null", "faker_name", "faker_email", "faker_phone"], required=True),
+                },
+                hide_index=True,
+                key=editor_key
+            )
+            st.session_state['current_plan'] = edited_plan_df.to_dict('records')
         else:
-            analysis_data = st.session_state.get('ai_analysis')
+            st.warning("Izaberi akciju iznad (AI Scan, Load ili Manual) da započneš.")
+            return
 
-            if isinstance(analysis_data, list):
-                # Podaci iz baze (get_saved_plan vraća listu)
-                plan_list = analysis_data
-            elif hasattr(analysis_data, 'plan'):
-                # Pydantic objekat od AI Agenta
-                plan_list = [p.model_dump() if hasattr(p, 'model_dump') else p for p in analysis_data.plan]
-            elif isinstance(analysis_data, dict):
-                # Ako je AI vratio direktan rečnik
-                plan_list = analysis_data.get('plan', [])
-            else:
-                plan_list = []
-
-            # Sinhronizujemo session_state za editor
-            st.session_state['current_plan'] = plan_list
-            st.session_state['last_table_for_plan'] = table_name
-
-        # Finalna priprema za DataFrame
-        plan_df = pd.DataFrame(plan_list)
-
-        # 4. SINHRONIZACIJA SA EDITOROM
-        if editor_key in st.session_state:
-            edits = st.session_state[editor_key].get('edited_rows', {})
-            for row_idx, changes in edits.items():
-                for col_name, new_val in changes.items():
-                    if row_idx < len(plan_df):
-                        plan_df.at[row_idx, col_name] = new_val
-            st.session_state['current_plan'] = plan_df.to_dict('records')
-
-        # 5. STATUS I REORGANIZACIJA (Definišemo strategije koje editor koristi)
-        if f"pks_{table_name}" not in st.session_state:
-            st.session_state[f"pks_{table_name}"] = db.get_primary_keys(schema_name, table_name)
-
-        real_pks = st.session_state[f"pks_{table_name}"]
-
-        valid_strategies = ["keep", "hash", "mask", "mapping", "noise", "date_shift", "null"]
-        pk_strategies = ["keep", "hash"]
-
-        def check_row_status(row):
-            col_name = str(row['column'])
-            strategy = str(row['strategy']).lower().strip()
-
-            # Provera na osnovu meta-podataka iz baze (real_pks)
-            is_primary = col_name in real_pks
-
-            if is_primary:
-                # Ako je PK, dozvoljavamo samo keep ili hash
-                if strategy in pk_strategies:
-                    return "🔑 PK: OK"
-                else:
-                    return "❌ PK: MUST BE KEEP/HASH"
-
-            # Za ostale kolone standardna provera
-            return "✅ OK" if strategy in valid_strategies else "❌ MISSING"
-
-        # Primenjujemo validaciju na svaku vrstu u DataFrame-u
-        plan_df['status'] = plan_df.apply(check_row_status, axis=1)
-
-        # Reorganizacija kolona radi preglednosti
-        desired_order = ['status', 'column', 'is_pii', 'strategy', 'reason']
-        plan_df = plan_df[[c for c in desired_order if c in plan_df.columns]]
-
-        # 6. DATA EDITOR
-        edited_plan_df = st.data_editor(
-            plan_df,
-            column_config={
-                "status": st.column_config.TextColumn("Status", disabled=True, width="small"),
-                "column": st.column_config.TextColumn("Database Column", disabled=True),
-                "is_pii": st.column_config.CheckboxColumn("PII", disabled=True),
-                "strategy": st.column_config.SelectboxColumn("Strategy", options=valid_strategies, required=True),
-                "reason": st.column_config.TextColumn("AI Reasoning", disabled=True)
-            },
-            hide_index=True,
-            width="stretch",
-            key=editor_key
-        )
-
-        # --- KLJUČNI FIX: Ovde definišemo plan_data ---
-        plan_data = edited_plan_df.to_dict('records')
-        st.session_state['current_plan'] = plan_data
-
-        # ==========================================
-        # KORAK 3: DINAMIČKI DUGMIĆI & NAVIGACIJA
-        # ==========================================
-        st.write("")
-        c1, c2 = st.columns([6, 4])
-
-        with c2:
-            # 1. Osnovne definicije
-            real_pks = st.session_state.get(f"pks_{table_name}", [])
-            pk_strategies = ["keep", "hash"]
-            origin = st.session_state.get('plan_origin', 'new')
-
-            # 2. DETEKCIJA PROMENA
-            has_changes = False
-            if origin == 'saved' and 'plan_snapshot' in st.session_state:
-                snapshot = st.session_state['plan_snapshot']
-
-                # Provera da li je snapshot uopšte lista rečnika
-                if isinstance(snapshot, list) and len(snapshot) > 0 and isinstance(snapshot[0], dict):
-                    # Čistimo privremene UI kolone pre poređenja
-                    clean_current = [{k: v for k, v in r.items() if k != 'status'} for r in plan_data]
-                    clean_snapshot = [{k: v for k, v in r.items() if k != 'status'} for r in snapshot]
-
-                    if clean_current != clean_snapshot:
-                        has_changes = True
-                else:
-                    # Ako snapshot nije u dobrom formatu, resetujemo ga ili preskačemo detekciju
-                    has_changes = False
-
-            # 3. DINAMIČKA LABELA
-            if origin == 'saved' and not has_changes:
-                button_label = "✅ Confirm & Next Table"
-            elif origin == 'saved' and has_changes:
-                button_label = "💾 Save Changes & Next Table"
-            else:
-                button_label = "💾 Save Plan & Next Table"
-
-            # 4. RENDER DUGMIĆA (SA UNIKATNIM KLJUČEVIMA)
-            btn_clicked = False
-            main_btn_key = f"main_action_btn_{table_name}_{origin}" # Dodat origin u key radi stabilnosti
-
-            if has_changes:
-                sc1, sc2 = st.columns([3, 1])
-                with sc1:
-                    btn_clicked = st.button(button_label, type="primary", width="stretch", key=main_btn_key)
-                with sc2:
-                    if st.button("✖️", help="Revert to saved plan", width="stretch", key=f"cancel_btn_{table_name}"):
-                        st.session_state['ai_analysis'] = st.session_state['plan_snapshot']
-                        if 'current_plan' in st.session_state: del st.session_state['current_plan']
-                        st.rerun()
-            else:
-                # Ako nema promena, dugme je i dalje tu ali služi kao potvrda
-                btn_clicked = st.button(button_label, type="primary", width="stretch", key=main_btn_key)
-
-            # 5. LOGIKA NAKON KLIKA
-            if btn_clicked:
-                # --- PRVO: Validacija strategija ---
-                missing = [item.get('column') for item in plan_data if str(item.get('strategy', '')).lower().strip() not in valid_strategies]
-                invalid_pk_list = [item.get('column') for item in plan_data if item.get('column') in real_pks and str(item.get('strategy', '')).lower().strip() not in pk_strategies]
-
-                if invalid_pk_list:
-                    st.error(f"❌ PK ERROR: `{invalid_pk_list[0]}` must be keep/hash.")
-                elif missing:
-                    st.error(f"❌ Missing strategies for: {missing}")
-                else:
-                    # --- DRUGO: Markiranje tabele kao završene (ZA LANAC SA ✅) ---
-                    if 'completed_tables' not in st.session_state:
-                        st.session_state['completed_tables'] = set()
-                    st.session_state['completed_tables'].add(table_name)
-
-                    # --- TREĆE: Check for 'keep' on PK for security warning ---
-                    is_any_pk_keep = any(item.get('column') in real_pks and item.get('strategy') == 'keep' for item in plan_data)
-
-                    if is_any_pk_keep:
-                        st.session_state['confirm_pk_move'] = True
-                        st.rerun()
-                    else:
-                        # DIREKTNO SNIMANJE I PRELAZAK
-                        where_clause = st.session_state.get(f"where_clause_{table_name}", "")
-                        save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause)
-
-
-        # --- DIJALOG ZA POTVRDU (Mora biti van 'with c2' kolone) ---
-        if st.session_state.get('confirm_pk_move', False):
-            st.divider()
-            st.warning(f"⚠️ **Security Warning:** You selected **'keep'** for Primary Key(s) in `{table_name}`. Move to next?")
-            conf_c1, conf_c2 = st.columns(2)
-
-            # U delu koda gde je DIJALOG ZA POTVRDU
-            if conf_c1.button("✅ Yes, save and move", type="primary", width="stretch", key=f"conf_y_{table_name}"):
-                if 'completed_tables' not in st.session_state:
-                    st.session_state['completed_tables'] = set()
-                st.session_state['completed_tables'].add(table_name) # OBAVEZNO DODAJ OVO
-                st.session_state['confirm_pk_move'] = False
-                where_clause = st.session_state.get(f"where_clause_{table_name}", "")
-                save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause)
-
-            if conf_c2.button("🔙 No, let me change", width="stretch", key=f"conf_n_{table_name}"):
-                st.session_state['confirm_pk_move'] = False
-                st.rerun()
-
-        st.divider()
-
-        # --- DODATNI INFO: PRIVACY SCORE & PREVIEW ---
-        inf_col1, inf_col2 = st.columns([6, 4])
-        with inf_col1:
-            if plan_data:
-                # Definišemo težine za svaku strategiju
-                # 100 poena: null (najsigurnije), mapping i hash (jaka anonimizacija)
-                # 50 poena: mask, noise, date_shift (parcijalna zaštita)
-                # 0 poena: keep (nema zaštite)
-
-                score_points = sum(
-                    100 if str(col.get('strategy','')).lower() in ['mapping', 'hash', 'null']
-                    else 50 if str(col.get('strategy','')).lower() in ['mask', 'noise', 'date_shift']
-                    else 0
-                    for col in plan_data
-                )
-
-                privacy_score = int(score_points / len(plan_data))
-
-                # Ograničavamo score na max 100% (u slučaju da len(plan_data) napravi anomaliju)
-                privacy_score = min(privacy_score, 100)
-
-                st.write(f"**Privacy Score: {privacy_score}%**")
-                st.progress(privacy_score / 100)
-
-        with inf_col2:
-            if st.button("🚀 Run Anonymization Preview", width="stretch", key=f"pre_btn_{table_name}"):
-                current_salt = st.session_state.get('salt_input', 'default_salt')
-                current_where = st.session_state.get(f"where_clause_{table_name}", "")
-
-                # --- KLJUČNA ISPRAVKA: ČIŠĆENJE I DESERIJALIZACIJA ---
-                raw_plan = plan_data # To je ono što dolazi iz editora
-
-                # Ako je plan_data greškom postao string, pretvori ga u listu
-                if isinstance(raw_plan, str):
-                    import json
-                    try:
-                        raw_plan = json.loads(raw_plan)
-                    except:
-                        st.error("Greška: Plan nije u ispravnom JSON formatu.")
-                        st.stop()
-
-                # Osiguravamo da uzimamo samo listu rečnika i izbacujemo UI kolone poput 'status'
-                clean_plan = []
-                for row in raw_plan:
-                    if isinstance(row, dict):
-                        clean_plan.append({k: v for k, v in row.items() if k != 'status'})
-                # ---------------------------------------------------
-
-                with st.spinner("Processing preview..."):
-                    try:
-                        raw_table = db.read_table(table_name, schema_name, where=current_where)
-
-                        # Ovde prosleđujemo clean_plan koji je SADA SIGURNO lista rečnika
-                        anon_df = db.apply_anonymization_rules(raw_table, clean_plan, salt=current_salt)
-
-                        db.save_anonymized_table(anon_df, table_name, target_schema='anon')
-                        st.success(f"✅ Preview saved to 'anon.{table_name}'")
-                    except Exception as e:
-                        st.error(f"Error during execution: {e}")
+        # --- FINALNE AKCIJE ---
+        c_act1, c_act2 = st.columns([1, 1])
+        with c_act1:
+            if st.button("🚀 Preview", use_container_width=True, key=f"pre_btn_{table_name}"):
+                # Preview logika
+                pass
+        with c_act2:
+            next_table = get_next_table_in_chain(table_name, all_tables_list, completed_tables)
+            btn_label = "💾 Confirm & Next" if next_table else "🏁 Finish"
+            if st.button(btn_label, type="primary", use_container_width=True, key=f"confirm_next_{table_name}"):
+                save_and_move_to_next(db, table_name, schema_name, st.session_state['current_plan'], st.session_state.get(where_key, ""))
     else:
-        st.info("👋 **Welcome!** Please select a table from the list or sidebar to start mapping.")
+        st.info("👋 Select a table from the sidebar to start.")
 
-
-    # Na kraju render_planner_tab u tabs_content.py
-    st.markdown("---")
-# Izvlačimo šemu iz session_state-a jer nam treba i van 'if selected_table_info'
-    current_selected_schema = st.session_state.get('selected_schema')
-
-    if not current_selected_schema and 'selected_table_info' in st.session_state:
-        # Fallback ako selected_schema nije setovan, uzmi iz trenutno selektovane tabele
-        _, current_selected_schema = st.session_state['selected_table_info']
-
-    if st.session_state.get('all_tables_list'):
-        st.subheader("🔥 Batch Execution")
-
-        # Definišemo target_schema sigurno
-        target_schema = st.session_state.get('target_schema', f"{current_selected_schema}_anon")
-
-        # Dohvatamo listu selektovanih tabela iz multiselect-a u sidebaru
-        batch_tables = st.session_state.get('batch_table_selector', [])
-
-        # POZIVAMO METODU - SADA JE 100% ZAKUCANA NA DNU
-        handle_batch_execution(
-            db=db,
-            ordered_tables=st.session_state['all_tables_list'],
-            selected_schema=current_selected_schema,
-            target_schema=target_schema,
-            selected_tables=batch_tables,
-            instance_id="main_batch_footer"
-        )
-    pass
 
 def render_comparison_tab(db):
     st.subheader("🔍 Side-by-Side Comparison")

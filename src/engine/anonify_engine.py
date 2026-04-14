@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+import concurrent.futures
 import yaml
 import os
 import logging
@@ -5,6 +7,8 @@ import random
 import pandas as pd
 from faker import Faker
 from unidecode import unidecode
+import pandas as pd
+import hashlib
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -42,7 +46,6 @@ def transform_to_bucket(value):
             return f"> 150.000 {euro_symbol}"
     except:
         return "N/A"
-
 
 def load_config():
     """Load transformation rules from YAML config."""
@@ -92,6 +95,7 @@ def get_salary_bucket(salary_val, locale="de_DE"):
 
     except Exception as e:
         return f"[ERROR]"
+
 def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
     """Generate localized fake names using deterministic seeds."""
     fake = Faker(locale)
@@ -101,9 +105,6 @@ def get_name_dynamic(user_id, locale, use_ascii, is_deterministic):
 
     raw_name = fake.name()
     return unidecode(raw_name) if use_ascii else raw_name
-
-import pandas as pd
-import hashlib
 
 def anonymize_dataframe(df, is_deterministic=True):
     """
@@ -135,3 +136,18 @@ def anonymize_dataframe(df, is_deterministic=True):
             )
 
     return anon_df
+
+def process_all_tables_parallel(engine, tables_metadata, max_workers=4):
+    """
+    Paralelno izvršava anonimizaciju više tabela.
+    """
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Ovde pozivaš svoju glavnu funkciju za anonimizaciju jedne tabele
+        futures = [
+            executor.submit(process_single_table, engine, table_meta) 
+            for table_meta in tables_metadata
+        ]
+        
+        for future in concurrent.futures.as_completed(futures):
+            # Logovanje progresa
+            pass

@@ -1,54 +1,45 @@
 ﻿# -*- coding: utf-8 -*-
-import pandas as pd
-from sqlalchemy import create_engine, text, inspect
 import os
 import json
 import hashlib
-from faker import Faker
-
-import os
-from openai import AzureOpenAI
-from dotenv import load_dotenv
-from sqlalchemy import text
-
-
 import random
+import logging
 from datetime import timedelta
+
 import pandas as pd
+from sqlalchemy import create_engine, text, inspect
+from faker import Faker
+from dotenv import load_dotenv
 
+# Konfiguracija logovanja
+logger = logging.getLogger(__name__)
 
-# Učitava varijable iz .env fajla u sistemsko okruženje
+# Učitavanje enviroment varijabli iz .env fajla
 load_dotenv()
 
 class DBManager:
     def __init__(self, db_url=None):
-
+        # 1. Konfiguracija baze podataka
         self.db_url = db_url or os.getenv(
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
         )
+
+        # Koristimo pool_size i max_overflow za stabilan PARALELIZAM
         self.engine = create_engine(
             self.db_url,
-            connect_args={'client_encoding': 'utf8'}
+            connect_args={'client_encoding': 'utf8'},
+            pool_size=10,        # Broj stalnih konekcija u pool-u
+            max_overflow=20      # Koliko dodatnih konekcija dozvoljavamo pod opterećenjem
         )
-        azure_key = os.getenv("AZURE_OPENAI_KEY")
-        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
 
-        if azure_key and azure_endpoint:
-            self.ai_client = AzureOpenAI(
-                api_key=azure_key,
-                api_version=os.getenv("AZURE_OPENAI_VERSION", "2024-02-15-preview"),
-                azure_endpoint=azure_endpoint
-            )
-        else:
-            self.ai_client = None
-            print("⚠️ Azure OpenAI credentials not found in environment.")
-
-
+        # 2. Inicijalizacija Fakera (DACH + US regioni kao što si tražio)
         self.fake = Faker(['de_DE', 'en_US'])
+
+        # 3. Inicijalizacija meta-tabela
         self._init_metadata_table()
 
-
+        logger.info("✅ DBManager uspešno inicijalizovan sa Connection Pool-om.")
 
     def get_all_schemas(self):
         inspector = inspect(self.engine)
@@ -145,7 +136,6 @@ class DBManager:
             print(f"Error fetching columns for {schema_name}.{table_name}: {e}")
             return []
 
-
     def get_ai_ready_metadata(self, table_name, schema='public', sample_size=5):
         inspector = inspect(self.engine)
         columns_info = inspector.get_columns(table_name, schema=schema)
@@ -187,7 +177,6 @@ class DBManager:
                 conn.commit()
         except:
             pass
-
 
     def get_mapping_value(self, original_value, category, locale, salt):
         import hashlib
@@ -313,7 +302,6 @@ class DBManager:
                 )
 
         return df_anon
-    # --- POMOĆNE METODE KOJE MORAŠ IMATI U DBManager KLASI ---
 
     def _get_mapping_values_by_locale(self, category, locale):
         from sqlalchemy import text
@@ -335,7 +323,6 @@ class DBManager:
         hash_int = int(hashlib.sha256(combined).hexdigest(), 16)
         index = hash_int % len(mapping_list)
         return mapping_list[index]
-
 
     def _init_metadata_table(self):
         query = """
@@ -378,7 +365,6 @@ class DBManager:
         import json
         from sqlalchemy import text
 
-        # Koristimo 'where_condition' kolonu koju smo dodali migracijom
         query = text("""
             INSERT INTO metadata.ai_plans (
                 schema_name,
@@ -400,13 +386,14 @@ class DBManager:
                 conn.execute(query, {
                     "s": schema_name,
                     "t": table_name,
-                    "p": json.dumps(plan_data), # Pakujemo listu rečnika u JSON string
-                    "w": where_condition        # Snimamo SQL filter
+                    "p": json.dumps(plan_data),
+                    "w": where_condition
                 })
                 conn.commit()
+                logger.info(f"✅ Plan & Filter successfully saved for {schema_name}.{table_name}")
                 return True
         except Exception as e:
-            print(f"Error saving to metadata.ai_plans: {e}")
+            logger.error(f"❌ Error saving to metadata.ai_plans for {table_name}: {e}")
             return False
 
     def get_saved_plan(self, schema_name, table_name):
@@ -578,8 +565,6 @@ class DBManager:
 
         return ordered_tables
 
-    # U src/database/db_manager.py
-
     def load_forced_mappings_from_db(self, schema_name='ecommerce'):
         from sqlalchemy import text
         # Koristimo duple navodnike za svaki deo naziva da izbegnemo probleme sa Case-Sensitivity
@@ -598,10 +583,6 @@ class DBManager:
             # Ovde ćemo ispisati tačnu grešku u konzolu da je vidimo u Docker logovima
             print(f"❌ DATABASE ERROR: {str(e)}")
             return {}
-
-    # U src/database/db_manager.py
-
-# U src/database/db_manager.py
 
     def analyze_table_structure(self, df_sample, agent, schema_name='ecommerce'):
         columns = df_sample.columns.tolist()
@@ -678,7 +659,6 @@ class DBManager:
         fks = conn.execute(query).fetchall()
         for fk in fks:
             conn.execute(text(f"ALTER TABLE {schema}.{table} DROP CONSTRAINT {fk[0]}"))
-
 
     def restore_foreign_keys(self, source_schema, target_schema, tables):
         """Prebacuje FK constraints sa izvora na target."""
@@ -774,7 +754,6 @@ class DBManager:
         except Exception as e:
             print(f"Error fetching PKs: {e}")
             return []
-
 
     def table_exists(self, table_name, schema_name):
         """Proverava da li tabela postoji u specifičnoj šemi."""
@@ -892,7 +871,6 @@ class DBManager:
             # Ako Postgres baci error, transakcija mora da se "ohladi"
             print(f"❌ Error fetching all saved plans: {e}")
             return {}
-
 
     def align_db_types(self, target_schema, table_name, plan, conn=None):
         """
@@ -1194,4 +1172,26 @@ class DBManager:
                 return df.astype(str).to_dict(orient='records')
         except Exception as e:
             logger.error(f"⚠️ Error fetching sample for {table}: {e}")
+            return []
+
+    def get_tables(self, schema_name='public'):
+        """
+        Vraća listu svih tabela u zadatoj šemi, isključujući interne AnonifyDB tabele.
+        """
+        # Lista tabela koje sistem koristi interno i ne treba da budu ponuđene korisniku
+        excluded_tables = ("anon_forced_mappings", "anonymization_logs", "audit_trail")
+
+        query = f"""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = '{schema_name}'
+            AND table_type = 'BASE TABLE'
+            AND table_name NOT IN {excluded_tables}
+            ORDER BY table_name;
+        """
+        try:
+            df = pd.read_sql(query, self.engine)
+            return df['table_name'].tolist()
+        except Exception as e:
+            logger.error(f"❌ Greška pri listanju tabela: {e}")
             return []
