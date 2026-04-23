@@ -40,24 +40,24 @@ def process_file(input_path, output_path, mappings):
 
         logger.info(f"??  Anonymizing {len(df)} rows...")
 
-        # Apply mappings
-        for idx, row in df.iterrows():
-            # Use 'id' column if exists, otherwise use DataFrame index
-            user_id = int(row.get('id', idx))
+        # Pre-calculate user_ids to avoid repeated lookups
+        if 'id' in df.columns:
+            user_ids = df['id'].astype(int)
+        else:
+            user_ids = df.index.to_series().astype(int)
 
-            for m in mappings:
-                col_source = m['source']
-                col_target = m.get('target', col_source)
-                method = m['method']
+        # Apply mappings using vectorized-like approach where possible
+        for m in mappings:
+            col_source = m['source']
+            col_target = m.get('target', col_source)
+            method = m['method']
 
-                if method == "fake_name":
-                    df.at[idx, col_target] = get_deterministic_name(user_id)
-                elif method == "fake_email":
-                    clean_name = get_deterministic_name(user_id).lower().replace(' ', '.')
-                    df.at[idx, col_target] = f"{clean_name}@example.com"
-                elif method == "salary_bucket":
-                    raw_value = str(row[col_source])
-                    df.at[idx, col_target] = get_salary_bucket(raw_value)
+            if method == "fake_name":
+                df[col_target] = user_ids.apply(get_deterministic_name)
+            elif method == "fake_email":
+                df[col_target] = user_ids.apply(lambda uid: f"{get_deterministic_name(uid).lower().replace(' ', '.')}@example.com")
+            elif method == "salary_bucket":
+                df[col_target] = df[col_source].astype(str).apply(get_salary_bucket)
 
         # Save data based on output extension
         out_ext = os.path.splitext(output_path)[-1].lower()
@@ -69,7 +69,7 @@ def process_file(input_path, output_path, mappings):
         elif out_ext == '.xlsx':
             df.to_excel(output_path, index=False)
         elif out_ext == '.json':
-            # force_ascii=False je klju?an za ?itljiva slova (ü, ö, €, itd.)
+            # force_ascii=False je klju?an za ?itljiva slova (ï¿½, ï¿½, ï¿½, itd.)
             df.to_json(output_path, orient='records', indent=4, force_ascii=False)
 
 

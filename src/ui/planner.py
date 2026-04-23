@@ -8,6 +8,18 @@ import time
 # Inicijalizacija loggera
 logger = logging.getLogger(__name__)
 
+def _enforce_id_strategy(column_name, strategy):
+    """
+    Enforces RI-safe strategy for identifier columns.
+    ID-like columns must never use 'mask' because it breaks joins/lineage.
+    """
+    safe_strategy = (strategy or "keep").lower().strip()
+    col_l = str(column_name or "").lower()
+    is_id_like = any(token in col_l for token in ["id", "pk", "fk"])
+    if is_id_like and safe_strategy == "mask":
+        return "hash"
+    return safe_strategy
+
 class AnonymizationPlanner:
     def __init__(self, db_manager):
         self.db = db_manager
@@ -43,7 +55,7 @@ class AnonymizationPlanner:
 
             # 2. Fallback: Ako sampling nije dozvoljen ili je tabela prazna
             if not allow_sampling:
-                all_columns = self.db.get_columns(schema, table_name)
+                all_columns = self.db.get_columns(table_name, schema)
                 metadata_package = [{"column": col, "sample": []} for col in all_columns]
 
             # 3. Priprema Audit informacija
@@ -63,10 +75,11 @@ class AnonymizationPlanner:
                 # Pretvaramo Pydantic objekte u listu rečnika za stabilan prenos između threadova
                 final_plan = []
                 for p in analysis.plan:
+                    corrected_strategy = _enforce_id_strategy(p.column, p.strategy)
                     final_plan.append({
                         "column": p.column,
                         "is_pii": p.is_pii,
-                        "strategy": p.strategy,
+                        "strategy": corrected_strategy,
                         "reason": p.reason
                     })
 
@@ -113,8 +126,12 @@ def analyze_tables_parallel(db_manager, tables, schema="public", allow_sampling=
                     logger.info(f"✅ Paralelna analiza završena za: {table_name}")
                 else:
                     logger.warning(f"⚠️ Plan za {table_name} je vraćen kao None.")
+                    results[table_name] = {
+                        "error": "AI did not return a usable plan.",
+                        "audit": audit or {},
+                    }
             except Exception as e:
                 logger.error(f"❌ Greška u paralelizaciji za {table_name}: {e}")
-                results[table_name] = None
+                results[table_name] = {"error": str(e)}
 
     return results

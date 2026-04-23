@@ -58,7 +58,7 @@ class DBManager:
         from sqlalchemy import text
         import pandas as pd
 
-        query_str = f'SELECT * FROM "{schema_name}"."{table_name}"'
+        query_str = f"SELECT * FROM {schema_name}.{table_name}"
 
         if where and str(where).strip():
             # 1. Čistimo samo reč "WHERE" ali BEZ .lower() nad celim stringom!
@@ -737,22 +737,22 @@ class DBManager:
 
     def get_primary_keys(self, schema, table):
         """Vraća listu kolona koje su Primary Key za datu tabelu koristeći DDL meta-podatke."""
-        query = """
+        query = text("""
             SELECT kcu.column_name
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
             ON tc.constraint_name = kcu.constraint_name
             AND tc.table_schema = kcu.table_schema
             WHERE tc.constraint_type = 'PRIMARY KEY'
-            AND tc.table_schema = %s
-            AND tc.table_name = %s;
-        """
+            AND tc.table_schema = :schema
+            AND tc.table_name = :table;
+        """)
         try:
-            df = pd.read_sql(query, self.engine, params=(schema, table))
-            print(f"🚀 [BATCH] {table_name}: Učitano {len(df)} redova.")
+            df = pd.read_sql(query, self.engine, params={"schema": schema, "table": table})
+            print(f"🚀 [BATCH] {table}: Pronađeno {len(df)} PK kolona.")
             return df['column_name'].tolist()
         except Exception as e:
-            print(f"Error fetching PKs: {e}")
+            print(f"Error fetching PKs for {table}: {e}")
             return []
 
     def table_exists(self, table_name, schema_name):
@@ -769,8 +769,8 @@ class DBManager:
 
     def get_row_count(self, table_name, schema_name):
         """Vraća broj redova u tabeli."""
-        # Koristimo f-string za ime tabele jer SQLAlchemy ne dozvoljava parametrizaciju imena objekata
-        query = text(f'SELECT COUNT(*) FROM "{schema_name}"."{table_name}"')
+        # Čista SQL sintaksa bez nepotrebnih navodnika
+        query = text(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")
         with self.engine.connect() as conn:
             return conn.execute(query).scalar()
 
@@ -908,11 +908,7 @@ class DBManager:
 
                     if current_type and any(t in current_type.lower() for t in ['int', 'numeric', 'double', 'date', 'timestamp']):
                         print(f"🔧 DDL Sync: Menjam {table_name}.{col} u VARCHAR(255)")
-                        alter_sql = text(f"""
-                            ALTER TABLE "{target_schema}"."{table_name}"
-                            ALTER COLUMN "{col}" TYPE VARCHAR(255)
-                            USING "{col}"::VARCHAR
-                        """)
+                        alter_sql = text(f"ALTER TABLE {target_schema}.{table_name} ALTER COLUMN {col} TYPE VARCHAR(255) USING {col}::VARCHAR")
                         active_conn.execute(alter_sql)
 
             return rehook_commands
@@ -968,7 +964,7 @@ class DBManager:
         rehook_commands = []
 
         for conname, relname, condef in results:
-            rehook_sql = f'ALTER TABLE "{schema}"."{relname}" ADD CONSTRAINT "{conname}" {condef}'
+            rehook_sql = f"ALTER TABLE {schema}.{relname} ADD CONSTRAINT {conname} {condef}"
             rehook_commands.append(rehook_sql)
 
             # Zapis u bazu da imamo trag ako nešto pukne
@@ -1106,13 +1102,13 @@ class DBManager:
                         if child_table == table_name:
                             parent_filters.append((child_col, parent_col))
 
-                    query = f'SELECT t.* FROM "{selected_schema}"."{table_name}" t'
+                    query = f"SELECT t.* FROM {selected_schema}.{table_name} t"
 
                     if parent_filters:
                         for i, (c_col, p_col) in enumerate(parent_filters):
                             alias = f"s{i}"
                             # Kastujemo u VARCHAR jer temp tabela čuva sve kao stringove
-                            query += f' JOIN subset_tracking {alias} ON t."{c_col}"::VARCHAR = {alias}.key_value'
+                            query += f" JOIN subset_tracking {alias} ON t.{c_col}::VARCHAR = {alias}.key_value"
                             query += f" AND {alias}.column_name = '{p_col}'"
 
                     if base_where:
@@ -1164,7 +1160,7 @@ class DBManager:
         from sqlalchemy import text
         import pandas as pd
 
-        query = f'SELECT * FROM "{schema}"."{table}" LIMIT {limit}'
+        query = f"SELECT * FROM {schema}.{table} LIMIT {limit}"
         try:
             with self.engine.connect() as conn:
                 df = pd.read_sql(text(query), conn)
