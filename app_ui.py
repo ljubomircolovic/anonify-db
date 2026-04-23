@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import os
@@ -20,39 +20,34 @@ st.set_page_config(page_title="AnonifyDB", layout="wide")
 if not check_login():
     st.stop()
 
-# --- 2. DYNAMIC HEADER (Desna strana) ---
-h_col1, h_col2 = st.columns([7, 3])
+# --- 2. COMPACT TOP BAR ---
+top_col1, top_col2, top_col3 = st.columns([2, 2, 1])
+top_col1.markdown(f"👤 **{st.session_state.get('user_name', 'Admin')}**")
 
-with h_col2:
-    # Red 1: User & Logout
-    u_col1, u_col2 = st.columns([2, 1])
-    u_col1.markdown(f"👤 **{st.session_state.get('user_name', 'Admin')}**")
+from src.ui.sidebar import DB_CONFIGS
+selected_env = top_col2.selectbox(
+    "🔌 Target Environment",
+    options=list(DB_CONFIGS.keys()),
+    label_visibility="collapsed"
+)
 
-    if u_col2.button("Logout", width="stretch"):
-        st.session_state['authenticated'] = False
-        st.rerun()
+if 'db' not in st.session_state or st.session_state.get('last_env') != selected_env:
+    current_url = DB_CONFIGS[selected_env]
+    st.session_state['db'] = DBManager(db_url=current_url)
+    st.session_state['last_env'] = selected_env
 
-    # Red 2: Connection Manager
-    from src.ui.sidebar import DB_CONFIGS
-    selected_env = st.selectbox(
-        "🔌 Target Environment",
-        options=list(DB_CONFIGS.keys()),
-        label_visibility="collapsed"
-    )
+db = st.session_state['db']
 
-    # Logika za promenu baze
-    if 'db' not in st.session_state or st.session_state.get('last_env') != selected_env:
-        current_url = DB_CONFIGS[selected_env]
-        st.session_state['db'] = DBManager(db_url=current_url)
-        st.session_state['last_env'] = selected_env
+if top_col3.button("Logout", width="stretch"):
+    st.session_state['authenticated'] = False
+    st.rerun()
 
-    db = st.session_state['db']
-
-    # Red 3: Test Connection
-    if st.button("⚡ Test Connection", width="stretch"):
-        success, message = db.test_connection()
-        if success: st.success(message)
-        else: st.error(message)
+if top_col3.button("⚡ Test", width="stretch"):
+    success, message = db.test_connection()
+    if success:
+        st.success(message)
+    else:
+        st.error(message)
 
 # --- 3. INICIJALIZACIJA (State Management) ---
 if 'agent' not in st.session_state:

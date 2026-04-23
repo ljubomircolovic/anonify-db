@@ -7,9 +7,9 @@ def check_login():
         st.session_state['authenticated'] = False
 
     if not st.session_state['authenticated']:
-        left, center, right = st.columns([1.5, 2, 1.5])
+        st.markdown("<h1 style='text-align: center;'>🛡️ AnonifyDB</h1>", unsafe_allow_html=True)
+        left, center, right = st.columns([1, 2, 1])
         with center:
-            st.title("🛡️ AnonifyDB")
             st.caption("Database Anonymization for AI & Dev")
             st.subheader("Sign In")
             with st.form("login_form"):

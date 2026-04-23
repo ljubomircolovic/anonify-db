@@ -81,19 +81,141 @@ class DBManager:
             print(f"Error reading table {table_name}: {e}")
             return pd.DataFrame()
 
-    def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None):
+    def _ensure_target_table_mirror(self, active_conn, source_schema, target_schema, table_name):
+        """Ensures target table exists and mirrors source DDL types exactly."""
+        exists_sql = text("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = :target_schema
+                  AND table_name = :table_name
+            )
+        """)
+        exists = active_conn.execute(
+            exists_sql,
+            {"target_schema": target_schema, "table_name": table_name}
+        ).scalar()
+
+        if not exists:
+            active_conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{target_schema}"'))
+            active_conn.execute(text(f'''
+                CREATE TABLE "{target_schema}"."{table_name}"
+                (LIKE "{source_schema}"."{table_name}" INCLUDING ALL)
+            '''))
+            return
+
+        # Existing table: enforce exact source type signatures column-by-column
+        type_signature_sql = text("""
+            SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS column_type
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = :schema_name
+              AND c.relname = :table_name
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
+        """)
+        source_rows = active_conn.execute(
+            type_signature_sql,
+            {"schema_name": source_schema, "table_name": table_name}
+        ).fetchall()
+        target_rows = active_conn.execute(
+            type_signature_sql,
+            {"schema_name": target_schema, "table_name": table_name}
+        ).fetchall()
+        source_types = {row[0]: row[1] for row in source_rows}
+        target_types = {row[0]: row[1] for row in target_rows}
+
+        for column_name, source_type in source_types.items():
+            if column_name in target_types and target_types[column_name] != source_type:
+                active_conn.execute(text(f'''
+                    ALTER TABLE "{target_schema}"."{table_name}"
+                    ALTER COLUMN "{column_name}" TYPE {source_type}
+                    USING "{column_name}"::{source_type}
+                '''))
+
+    def _cast_dataframe_to_table_types(self, df, active_conn, schema_name, table_name):
+        """
+        Casts DataFrame values to match DB column types before insertion.
+        This prevents invalid input syntax errors for NUMERIC/BIGINT columns.
+        """
+        if df.empty:
+            return df
+
+        type_sql = text("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = :schema_name
+              AND table_name = :table_name
+            ORDER BY ordinal_position
+        """)
+        rows = active_conn.execute(
+            type_sql,
+            {"schema_name": schema_name, "table_name": table_name}
+        ).fetchall()
+        col_types = {row[0]: str(row[1]).lower() for row in rows}
+
+        cast_df = df.copy()
+        for col_name, col_type in col_types.items():
+            if col_name not in cast_df.columns:
+                continue
+
+            if any(token in col_type for token in ["bigint", "integer", "smallint", "int"]):
+                numeric_series = pd.to_numeric(cast_df[col_name], errors='coerce')
+                cast_df[col_name] = numeric_series.apply(
+                    lambda v: int(v) if pd.notnull(v) and float(v).is_integer() else (None if pd.notnull(v) else None)
+                )
+            elif any(token in col_type for token in ["numeric", "decimal", "double", "real"]):
+                coerced = pd.to_numeric(cast_df[col_name], errors='coerce')
+                invalid_mask = coerced.isna() & cast_df[col_name].notna()
+                if invalid_mask.any():
+                    invalid_idx = invalid_mask[invalid_mask].index
+                    fallback_values = pd.to_numeric(df.loc[invalid_idx, col_name], errors='coerce')
+                    fallback_ok = fallback_values.notna()
+                    if fallback_ok.any():
+                        restore_idx = fallback_values[fallback_ok].index
+                        logger.warning(
+                            f"⚠️ Numeric cast fallback on '{col_name}': reverting {int(fallback_ok.sum())} values to original."
+                        )
+                        coerced.loc[restore_idx] = fallback_values[fallback_ok]
+                    remaining_invalid = coerced.isna() & cast_df[col_name].notna()
+                    if remaining_invalid.any():
+                        logger.warning(
+                            f"⚠️ Numeric cast unresolved on '{col_name}': {int(remaining_invalid.sum())} values set to NULL."
+                        )
+                cast_df[col_name] = coerced
+            elif "boolean" in col_type:
+                bool_map = {
+                    "true": True, "false": False,
+                    "t": True, "f": False,
+                    "1": True, "0": False,
+                    "yes": True, "no": False
+                }
+                cast_df[col_name] = cast_df[col_name].apply(
+                    lambda v: bool_map.get(str(v).strip().lower(), v) if pd.notnull(v) else v
+                )
+            elif any(token in col_type for token in ["date", "timestamp", "time"]):
+                cast_df[col_name] = pd.to_datetime(cast_df[col_name], errors='coerce')
+
+        return cast_df
+
+    def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None, source_schema='public'):
         """
         Snima DataFrame u ciljnu tabelu. Ako je 'conn' prisutan, ostaje u istoj sesiji.
         """
         from sqlalchemy import text
 
         def _run_save(active_conn):
+            self._ensure_target_table_mirror(active_conn, source_schema, target_schema, table_name)
+            safe_df = self._cast_dataframe_to_table_types(df, active_conn, target_schema, table_name)
+
             # Osiguravamo šemu ako ne postoji
             active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
 
             # Upisujemo podatke koristeći 'append' (TRUNCATE je već odrađen na nivou Batch-a)
             # KLJUČNO: Ovde koristimo active_conn umesto self.engine
-            df.to_sql(
+            safe_df.to_sql(
                 table_name,
                 active_conn,
                 schema=target_schema,
@@ -223,7 +345,7 @@ class DBManager:
             try:
                 table_plan = json.loads(table_plan)
             except:
-                print("❌ Greška: Neuspešan parsing plana u apply_anonymization_rules")
+                print("❌ Error: Failed to parse plan in apply_anonymization_rules")
                 return df_anon
 
         for item in table_plan:
@@ -234,6 +356,7 @@ class DBManager:
 
             col = item.get('column')
             strategy = str(item.get('strategy', 'keep')).lower()
+            original_series = df_anon[col].copy() if col in df_anon.columns else None
 
             if not col or col not in df_anon.columns or strategy == 'keep':
                 continue
@@ -297,9 +420,50 @@ class DBManager:
 
             # MASK
             elif strategy == 'mask':
-                df_anon[col] = df_anon[col].apply(
-                    lambda x: self.mask_value(x) if pd.notnull(x) else x
-                )
+                is_numeric_like_column = pd.api.types.is_numeric_dtype(original_series)
+                if is_numeric_like_column:
+                    def sanitize_numeric_mask(masked_val, fallback_val):
+                        import re
+                        if pd.isnull(masked_val):
+                            return fallback_val
+                        cleaned = re.sub(r'[^0-9.]', '', str(masked_val))
+                        if cleaned.count('.') > 1:
+                            first_dot = cleaned.find('.')
+                            cleaned = cleaned[:first_dot + 1] + cleaned[first_dot + 1:].replace('.', '')
+                        if cleaned in ("", "."):
+                            logger.warning(
+                                f"⚠️ Numeric sanitization fallback on column '{col}' for value '{masked_val}'. Keeping original value."
+                            )
+                            return fallback_val
+                        try:
+                            return float(cleaned)
+                        except Exception:
+                            logger.warning(
+                                f"⚠️ Numeric cast fallback on column '{col}' for value '{masked_val}'. Keeping original value."
+                            )
+                            return fallback_val
+
+                    masked_series = df_anon[col].apply(
+                        lambda x: self.mask_value(x) if pd.notnull(x) else x
+                    )
+                    df_anon[col] = [
+                        sanitize_numeric_mask(masked_val, fallback_val)
+                        for masked_val, fallback_val in zip(masked_series, original_series)
+                    ]
+                else:
+                    df_anon[col] = df_anon[col].apply(
+                        lambda x: self.mask_value(x) if pd.notnull(x) else x
+                    )
+
+            # Final numeric guard: if transformed numeric-like column is invalid, keep original values.
+            if pd.api.types.is_numeric_dtype(original_series):
+                coerced = pd.to_numeric(df_anon[col], errors='coerce')
+                invalid_mask = coerced.isna() & original_series.notna()
+                if invalid_mask.any():
+                    logger.warning(
+                        f"⚠️ Numeric integrity fallback on '{col}': {int(invalid_mask.sum())} invalid values reverted to original."
+                    )
+                    df_anon.loc[invalid_mask, col] = original_series.loc[invalid_mask]
 
         return df_anon
 
@@ -749,7 +913,7 @@ class DBManager:
         """)
         try:
             df = pd.read_sql(query, self.engine, params={"schema": schema, "table": table})
-            print(f"🚀 [BATCH] {table}: Pronađeno {len(df)} PK kolona.")
+            print(f"🚀 [BATCH] {table}: Found {len(df)} PK columns.")
             return df['column_name'].tolist()
         except Exception as e:
             print(f"Error fetching PKs for {table}: {e}")
@@ -874,59 +1038,10 @@ class DBManager:
 
     def align_db_types(self, target_schema, table_name, plan, conn=None):
         """
-        Usklađuje tipove podataka. Ako je 'conn' prosleđen, koristi ga (unutar transakcije).
-        Ako nije, otvara novu sesiju.
+        Legacy hook retained for batch compatibility.
+        Type mirroring is now enforced from source DDL and should not be altered.
         """
-        import json
-        from sqlalchemy import text
-
-        if isinstance(plan, str):
-            try: plan = json.loads(plan)
-            except: return []
-
-        text_transform_strategies = ['hash', 'mask', 'faker_name', 'faker_email', 'faker_phone', 'mapping']
-
-        def _run_alignment(active_conn):
-            # 1. Privremeno sklanjamo FK-ove i pamtimo ih (zapisuje i u metadata.pending_fks)
-            rehook_commands = self.drop_all_fks_for_table(active_conn, target_schema, table_name)
-
-            for item in plan:
-                if isinstance(item, str):
-                    try: item = json.loads(item)
-                    except: continue
-
-                col = item.get('column')
-                strategy = str(item.get('strategy', 'keep')).lower()
-
-                if strategy in text_transform_strategies:
-                    # Provera trenutnog tipa u bazi
-                    check_sql = text("""
-                        SELECT data_type FROM information_schema.columns
-                        WHERE table_schema = :s AND table_name = :t AND column_name = :c
-                    """)
-                    current_type = active_conn.execute(check_sql, {"s": target_schema, "t": table_name, "c": col}).scalar()
-
-                    if current_type and any(t in current_type.lower() for t in ['int', 'numeric', 'double', 'date', 'timestamp']):
-                        print(f"🔧 DDL Sync: Menjam {table_name}.{col} u VARCHAR(255)")
-                        alter_sql = text(f"ALTER TABLE {target_schema}.{table_name} ALTER COLUMN {col} TYPE VARCHAR(255) USING {col}::VARCHAR")
-                        active_conn.execute(alter_sql)
-
-            return rehook_commands
-
-        # --- LOGIKA KONEKCIJE ---
-        try:
-            if conn:
-                # Koristimo postojeću transakciju iz Batch-a
-                return _run_alignment(conn)
-            else:
-                # Samostalni poziv van Batch-a
-                with self.engine.connect() as standalone_conn:
-                    with standalone_conn.begin():
-                        res = _run_alignment(standalone_conn)
-                        return res
-        except Exception as e:
-            print(f"❌ DDL Sync Failure na {table_name}: {e}")
-            return []
+        return []
 
     def drop_all_fks_for_table(self, conn, schema, table):
         """
@@ -998,7 +1113,7 @@ class DBManager:
                 con_name = cmd.split('CONSTRAINT "')[1].split('"')[0]
                 conn.execute(text("DELETE FROM metadata.pending_fks WHERE constraint_name = :c"), {"c": con_name})
 
-                print(f"✅ Uspešno vraćen: {con_name}")
+                print(f"✅ Successfully restored: {con_name}")
             except Exception as e:
                 print(f"⚠️ [RE-HOOK WARNING] Neuspelo vraćanje: {e}")
 
@@ -1024,7 +1139,7 @@ class DBManager:
 
             # 3. FORCE COMMIT
             conn.commit()
-            print("DEBUG: TRUNCATE uspešno izvršen i potvrđen.")
+            print("DEBUG: TRUNCATE executed and committed successfully.")
 
     def prepare_subset_metadata(self, conn):
         """
@@ -1054,7 +1169,7 @@ class DBManager:
             conn.execute(text("INSERT INTO subset_tracking (column_name, key_value) VALUES ('test', '1') ON CONFLICT DO NOTHING"))
             print("✅ Debug INSERT uspešan.")
         except Exception as e:
-            print(f"❌ Greška pri debug INSERT-u: {e}")
+            print(f"❌ Error during debug INSERT: {e}")
 
     def register_keys(self, conn, column_name, values):
         """Ubacuje ključeve u temp tabelu za kasniji JOIN."""
@@ -1140,7 +1255,13 @@ class DBManager:
 
                     # Anonimizacija i snimanje (prosleđujemo conn!)
                     df_anon = self.apply_anonymization_rules(df, plan)
-                    self.save_anonymized_table(df_anon, table_name, target_schema, conn=conn)
+                    self.save_anonymized_table(
+                        df_anon,
+                        table_name,
+                        target_schema,
+                        conn=conn,
+                        source_schema=selected_schema
+                    )
 
                 # --- FINALNI KORAK: RE-HOOK ---
                 if all_rehook_commands:
@@ -1189,5 +1310,5 @@ class DBManager:
             df = pd.read_sql(query, self.engine)
             return df['table_name'].tolist()
         except Exception as e:
-            logger.error(f"❌ Greška pri listanju tabela: {e}")
+            logger.error(f"❌ Error listing tables: {e}")
             return []

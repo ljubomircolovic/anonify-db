@@ -110,7 +110,7 @@ def handle_batch_execution(db, ordered_tables, selected_schema, target_schema, s
                     db.truncate_anon_tables(target_schema, ordered_tables)
                     st.success("✅ Ciljna šema je očišćena.")
                 except Exception as e:
-                    st.error(f"❌ Greška pri čišćenju šeme: {e}")
+                    st.error(f"❌ Error while cleaning schema: {e}")
                     st.stop() # Zaustavljamo proces ako čišćenje ne uspe
                 # ------------------------------------------
 
@@ -155,7 +155,7 @@ def handle_batch_execution(db, ordered_tables, selected_schema, target_schema, s
                     db.execute_anonymization_batch(selected_schema, target_schema, full_plan, ordered_tables)
 
                     status.update(label="✅ Success!", state="complete")
-                    st.success("Operacija uspešno završena.")
+                    st.success("Operation completed successfully.")
 
                 except Exception as e:
                     import traceback
