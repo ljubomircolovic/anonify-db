@@ -15,6 +15,15 @@ from src.ui.planner_navigation import handle_navigation_history, get_next_table_
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_plan_salt(db, schema_name, table_name):
+    """Returns per-plan salt, creating one if missing."""
+    saved = db.get_saved_plan(schema_name, table_name)
+    if saved and saved.get("salt"):
+        return saved.get("salt")
+    salt_val, _, _ = db.ensure_plan_security_metadata(schema_name, table_name)
+    return salt_val
+
 # Helper function for dynamic quoting based on DDL type
 def _get_quoted_value(column_name, col_details, value):
     if column_name in col_details:
@@ -138,12 +147,13 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
     # --- 6. Clean and save ---
     clean_plan = get_clean_plan(plan_data)
     safe_where = str(where_clause or "").strip()
+    plan_salt = _resolve_plan_salt(db, schema_name, table_name)
 
     # --- 6b. Pre-save type validation using transformed sample ---
     try:
         raw_sample = db.read_table(table_name, schema_name, where=safe_where, limit=10)
         if not raw_sample.empty:
-            anon_sample = db.apply_anonymization_rules(raw_sample, clean_plan)
+            anon_sample = db.apply_anonymization_rules(raw_sample, clean_plan, salt=plan_salt)
             for col_name, col_meta in col_details.items():
                 if col_name not in anon_sample.columns:
                     continue
@@ -185,6 +195,9 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
     if not save_success:
         st.error(f"❌ Critical error: Plan for `{table_name}` was not saved to the database.")
         return False
+    saved_now = db.get_saved_plan(schema_name, table_name)
+    if saved_now and saved_now.get("source_list_mismatch"):
+        st.warning("⚠️ Source list version mismatch: Anonymization consistency may be affected.")
 
     # --- 7. Navigation ---
     # Add table to completed set
@@ -214,6 +227,8 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
             st.session_state['ai_analysis'] = next_table_plan['plan']
             st.session_state['plan_snapshot'] = next_table_plan['plan']
             st.session_state[f"where_clause_{next_table}"] = next_table_plan['where']
+            if next_table_plan.get("source_list_mismatch"):
+                st.warning("⚠️ Source list version mismatch: Anonymization consistency may be affected.")
             st.session_state['plan_origin'] = 'saved'
         else:
             st.session_state['plan_active'] = False
@@ -391,6 +406,8 @@ def render_planner_tab(db):
                 st.warning(f"⚠️ Parallel scan failed for `{next_table}`: {found_error}")
             saved_data = db.get_saved_plan(schema_name, next_table)
             if saved_data:
+                if saved_data.get("source_list_mismatch"):
+                    st.warning("⚠️ Source list version mismatch: Anonymization consistency may be affected.")
                 st.session_state['ai_analysis'] = saved_data['plan']
                 st.session_state['plan_snapshot'] = saved_data['plan']
                 st.session_state[f"where_clause_{next_table}"] = saved_data['where']
@@ -572,6 +589,9 @@ def render_planner_tab(db):
             table_info = st.session_state['selected_table_info']
             table_name = table_info[0] if isinstance(table_info, tuple) else table_info
             schema_name = table_info[1] if isinstance(table_info, tuple) else selected_schema
+            current_saved_plan_meta = db.get_saved_plan(schema_name, table_name)
+            if current_saved_plan_meta and current_saved_plan_meta.get("source_list_mismatch"):
+                st.warning("⚠️ Source list version mismatch: Anonymization consistency may be affected.")
             editor_key = f"plan_editor_{table_name}"
 
             multi_results = st.session_state.get('multi_ai_analysis', {})
@@ -591,6 +611,8 @@ def render_planner_tab(db):
                         st.error(f"❌ Parallel scan failed for `{table_name}`: {found_error}")
                     saved_data = db.get_saved_plan(schema_name, table_name)
                     if saved_data:
+                        if saved_data.get("source_list_mismatch"):
+                            st.warning("⚠️ Source list version mismatch: Anonymization consistency may be affected.")
                         st.session_state['ai_analysis'] = saved_data['plan']
                         st.session_state['plan_snapshot'] = saved_data['plan']
                         st.session_state[f"where_clause_{table_name}"] = saved_data['where']
@@ -803,6 +825,7 @@ def render_planner_tab(db):
                         clean_plan = get_clean_plan(st.session_state.get('current_plan', []))
                         with st.spinner(f"Saving to anon.{table_name}..."):
                             try:
+                                table_plan_salt = _resolve_plan_salt(db, schema_name, table_name)
                                 table_ready, table_create_msg = db.create_anonymized_table(
                                     source_schema=schema_name,
                                     table_name=table_name,
@@ -812,7 +835,7 @@ def render_planner_tab(db):
                                     st.error(f"❌ Failed preparing target table: {table_create_msg}")
                                     st.stop()
                                 full_data = db.read_table(table_name, schema_name, where=st.session_state.get(where_key, ""))
-                                final_df = db.apply_anonymization_rules(full_data, clean_plan)
+                                final_df = db.apply_anonymization_rules(full_data, clean_plan, salt=table_plan_salt)
                                 db.save_anonymized_table(final_df, table_name, target_schema='anon', source_schema=schema_name)
                                 st.success("✅ Migration completed successfully.")
                             except Exception as e:
@@ -865,7 +888,7 @@ def render_comparison_tab(db):
     if 'current_plan' in st.session_state and 'selected_table_info' in st.session_state:
         table_name, schema_name = st.session_state['selected_table_info']
         current_plan = st.session_state['current_plan']
-        current_salt = st.session_state.get('salt_input', 'default_salt')
+        current_salt = _resolve_plan_salt(db, schema_name, table_name)
         current_locale = st.session_state.get('selected_locale', 'de')  # New
 
         # Fetch sample for comparison

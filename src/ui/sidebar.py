@@ -38,7 +38,15 @@ def render_sidebar(agent):
 
         # --- SECURITY SEKCIJA ---
         st.subheader("🔑 Security")
-        st.session_state['salt_input'] = st.text_input("Secret Salt", value="default_salt", type="password")
+        st.session_state['salt_input'] = st.text_input(
+            "Secret Salt",
+            value=st.session_state.get('salt_input', 'default_salt'),
+            type="password",
+            help=(
+                "Salting: A unique secret string added to your data before masking. "
+                "This ensures high security and guarantees consistent output within this plan."
+            )
+        )
         st.session_state['selected_locale'] = st.selectbox("Target Locale", options=["de", "us"], index=0)
 
         st.divider()

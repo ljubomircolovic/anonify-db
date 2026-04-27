@@ -5,6 +5,7 @@ import hashlib
 import random
 import logging
 import re
+import secrets
 from datetime import timedelta
 from urllib.parse import quote_plus
 
@@ -61,6 +62,97 @@ class DBManager:
         self._init_metadata_table()
 
         logger.info("✅ [DB_MANAGER] DBManager successfully initialized with Connection Pool.")
+
+    @staticmethod
+    def _generate_plan_salt():
+        """Creates cryptographically-strong per-plan salt."""
+        return secrets.token_hex(32)
+
+    def _compute_source_list_hash(self):
+        """
+        Computes deterministic fingerprint of replacement sources.
+        Includes Faker version + mapping catalog/value payload.
+        """
+        payload = {
+            "faker_version": getattr(Faker, "VERSION", "unknown"),
+            "mapping_catalog": [],
+        }
+        query = text("""
+            SELECT c.category_name, c.locale, v.fake_value
+            FROM _anon_metadata.mapping_catalog c
+            LEFT JOIN _anon_metadata.mapping_values v ON v.catalog_id = c.id
+            ORDER BY c.category_name ASC, c.locale ASC, v.fake_value ASC
+        """)
+        try:
+            with self.target_engine.connect() as conn:
+                rows = conn.execute(query).fetchall()
+            payload["mapping_catalog"] = [
+                {"category": row[0], "locale": row[1], "value": row[2]}
+                for row in rows
+            ]
+        except Exception as e:
+            logger.warning(f"⚠️ [DB_MANAGER] Failed to read mapping sources for fingerprint: {e}")
+        payload_json = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+    def ensure_plan_security_metadata(self, schema_name, table_name):
+        """
+        Ensures per-plan salt + source list fingerprint exist and remain queryable.
+        Returns tuple: (salt_value, source_list_hash, mismatch_flag)
+        """
+        current_hash = self._compute_source_list_hash()
+        query = text("""
+            SELECT salt, source_list_hash
+            FROM _anon_metadata.ai_plans
+            WHERE schema_name = :s AND table_name = :t
+            LIMIT 1
+        """)
+        upsert = text("""
+            INSERT INTO _anon_metadata.ai_plans
+                (schema_name, table_name, plan_json, where_condition, salt, source_list_hash, last_updated)
+            VALUES
+                (:s, :t, '[]'::jsonb, '', :salt, :source_hash, CURRENT_TIMESTAMP)
+            ON CONFLICT (schema_name, table_name)
+            DO UPDATE SET
+                salt = COALESCE(_anon_metadata.ai_plans.salt, EXCLUDED.salt),
+                source_list_hash = COALESCE(_anon_metadata.ai_plans.source_list_hash, EXCLUDED.source_list_hash)
+        """)
+        mirror_upsert = text("""
+            INSERT INTO metadata.plans
+                (schema_name, table_name, plan_json, where_condition, salt, source_list_hash, last_updated)
+            VALUES
+                (:s, :t, '[]'::jsonb, '', :salt, :source_hash, CURRENT_TIMESTAMP)
+            ON CONFLICT (schema_name, table_name)
+            DO UPDATE SET
+                salt = COALESCE(metadata.plans.salt, EXCLUDED.salt),
+                source_list_hash = COALESCE(metadata.plans.source_list_hash, EXCLUDED.source_list_hash)
+        """)
+        with self.target_engine.connect() as conn:
+            row = conn.execute(query, {"s": schema_name, "t": table_name}).fetchone()
+            existing_salt = row[0] if row and row[0] else None
+            stored_hash = row[1] if row and row[1] else None
+            plan_salt = existing_salt or self._generate_plan_salt()
+            if not row or not existing_salt or not stored_hash:
+                conn.execute(upsert, {
+                    "s": schema_name,
+                    "t": table_name,
+                    "salt": plan_salt,
+                    "source_hash": stored_hash or current_hash,
+                })
+                conn.execute(mirror_upsert, {
+                    "s": schema_name,
+                    "t": table_name,
+                    "salt": plan_salt,
+                    "source_hash": stored_hash or current_hash,
+                })
+                conn.commit()
+            mismatch = bool(stored_hash and stored_hash != current_hash)
+            effective_hash = stored_hash or current_hash
+        logger.info(
+            f"✅ [DB_MANAGER] Plan security context {schema_name}.{table_name} | "
+            f"salt={plan_salt} | source_list_hash={effective_hash}"
+        )
+        return plan_salt, effective_hash, mismatch
 
     @staticmethod
     def _quote_ident(identifier):
@@ -533,7 +625,7 @@ class DBManager:
 
         return pool[index]
 
-    def apply_anonymization_rules(self, df, table_plan, salt="secret_123"):
+    def apply_anonymization_rules(self, df, table_plan, salt=None):
         """
         Transformacija podataka prema Type-Safe pravilima.
         SADA SA ZAŠTITOM OD 'TypeError' I PROVEROM TIPOVA.
@@ -556,6 +648,8 @@ class DBManager:
             except:
                 logger.error("❌ [AI_SCAN] Failed to parse plan in apply_anonymization_rules")
                 return df_anon
+
+        effective_salt = salt or "default_plan_salt"
 
         for item in table_plan:
             # --- 2. KLJUČNA ISPRAVKA ZA TVOJ BUG ---
@@ -616,14 +710,14 @@ class DBManager:
                 m_list = self._get_mapping_values_by_locale(category, 'de')
                 if m_list:
                     df_anon[col] = df_anon[col].apply(
-                        lambda x: self._deterministic_map(x, m_list, salt) if pd.notnull(x) else x
+                        lambda x: self._deterministic_map(x, m_list, effective_salt) if pd.notnull(x) else x
                     )
 
             # HASH (SHA-256 sa solju)
             elif strategy == 'hash':
                 def secure_hash(val):
                     if pd.isnull(val): return val
-                    hash_obj = hashlib.sha256(f"{val}{salt}".encode())
+                    hash_obj = hashlib.sha256(f"{val}{effective_salt}".encode())
                     return hash_obj.hexdigest()[:12]
                 df_anon[col] = df_anon[col].apply(secure_hash)
 
@@ -700,16 +794,33 @@ class DBManager:
     def _init_metadata_table(self):
         query = """
         CREATE SCHEMA IF NOT EXISTS _anon_metadata;
+        CREATE SCHEMA IF NOT EXISTS metadata;
         CREATE TABLE IF NOT EXISTS _anon_metadata.ai_plans (
             schema_name TEXT,
             table_name TEXT,
             plan_json JSONB,
             where_condition TEXT DEFAULT '',
+            salt TEXT,
+            source_list_hash TEXT,
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (schema_name, table_name)
         );
         ALTER TABLE _anon_metadata.ai_plans
             ADD COLUMN IF NOT EXISTS where_condition TEXT DEFAULT '';
+        ALTER TABLE _anon_metadata.ai_plans
+            ADD COLUMN IF NOT EXISTS salt TEXT;
+        ALTER TABLE _anon_metadata.ai_plans
+            ADD COLUMN IF NOT EXISTS source_list_hash TEXT;
+        CREATE TABLE IF NOT EXISTS metadata.plans (
+            schema_name TEXT,
+            table_name TEXT,
+            plan_json JSONB,
+            where_condition TEXT DEFAULT '',
+            salt TEXT,
+            source_list_hash TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (schema_name, table_name)
+        );
         CREATE TABLE IF NOT EXISTS _anon_metadata.global_id_mapping (
             column_name TEXT,
             original_value TEXT,
@@ -762,19 +873,42 @@ class DBManager:
         import json
         from sqlalchemy import text
 
+        plan_salt, current_source_hash, source_mismatch = self.ensure_plan_security_metadata(schema_name, table_name)
+
         query = text("""
             INSERT INTO _anon_metadata.ai_plans (
                 schema_name,
                 table_name,
                 plan_json,
                 where_condition,
+                salt,
+                source_list_hash,
                 last_updated
             )
-            VALUES (:s, :t, :p, :w, CURRENT_TIMESTAMP)
+            VALUES (:s, :t, :p, :w, :salt, :source_hash, CURRENT_TIMESTAMP)
             ON CONFLICT (schema_name, table_name)
             DO UPDATE SET
                 plan_json = EXCLUDED.plan_json,
                 where_condition = EXCLUDED.where_condition,
+                last_updated = CURRENT_TIMESTAMP
+        """)
+        mirror_query = text("""
+            INSERT INTO metadata.plans (
+                schema_name,
+                table_name,
+                plan_json,
+                where_condition,
+                salt,
+                source_list_hash,
+                last_updated
+            )
+            VALUES (:s, :t, :p, :w, :salt, :source_hash, CURRENT_TIMESTAMP)
+            ON CONFLICT (schema_name, table_name)
+            DO UPDATE SET
+                plan_json = EXCLUDED.plan_json,
+                where_condition = EXCLUDED.where_condition,
+                salt = EXCLUDED.salt,
+                source_list_hash = EXCLUDED.source_list_hash,
                 last_updated = CURRENT_TIMESTAMP
         """)
 
@@ -784,9 +918,24 @@ class DBManager:
                     "s": schema_name,
                     "t": table_name,
                     "p": json.dumps(plan_data),
-                    "w": where_condition
+                    "w": where_condition,
+                    "salt": plan_salt,
+                    "source_hash": current_source_hash,
+                })
+                conn.execute(mirror_query, {
+                    "s": schema_name,
+                    "t": table_name,
+                    "p": json.dumps(plan_data),
+                    "w": where_condition,
+                    "salt": plan_salt,
+                    "source_hash": current_source_hash,
                 })
                 conn.commit()
+                if source_mismatch:
+                    logger.warning(
+                        f"⚠️ [DB_MANAGER] Source list version mismatch for {schema_name}.{table_name}: "
+                        f"stored hash differs from current replacement source hash."
+                    )
                 logger.info(f"✅ Plan & Filter successfully saved for {schema_name}.{table_name}")
                 return True
         except Exception as e:
@@ -802,7 +951,7 @@ class DBManager:
         from sqlalchemy import text
 
         query = text("""
-            SELECT plan_json, where_condition
+            SELECT plan_json, where_condition, salt, source_list_hash
             FROM _anon_metadata.ai_plans
             WHERE schema_name = :s AND table_name = :t
             LIMIT 1
@@ -815,6 +964,12 @@ class DBManager:
                 if result:
                     raw_plan = result[0]
                     where_cond = result[1] or ""
+                    plan_salt = result[2]
+                    stored_source_hash = result[3]
+                    current_source_hash = self._compute_source_list_hash()
+                    source_list_mismatch = bool(
+                        stored_source_hash and current_source_hash and stored_source_hash != current_source_hash
+                    )
 
                     # --- KRITIČNA ZONA: DESERIJALIZACIJA ---
                     # 1. Ako je raw_plan string (JSON u bazi), pretvori ga u Python objekat
@@ -848,7 +1003,11 @@ class DBManager:
 
                     return {
                         "plan": final_plan,
-                        "where": where_cond
+                        "where": where_cond,
+                        "salt": plan_salt,
+                        "source_list_hash": stored_source_hash,
+                        "source_list_hash_current": current_source_hash,
+                        "source_list_mismatch": source_list_mismatch,
                     }
 
                 return None
@@ -1504,7 +1663,8 @@ class DBManager:
                         all_rehook_commands.extend(table_fks)
 
                     # Anonimizacija i snimanje (prosleđujemo conn!)
-                    df_anon = self.apply_anonymization_rules(df, plan)
+                    table_salt, _, _ = self.ensure_plan_security_metadata(selected_schema, table_name)
+                    df_anon = self.apply_anonymization_rules(df, plan, salt=table_salt)
                     self.save_anonymized_table(
                         df_anon,
                         table_name,
