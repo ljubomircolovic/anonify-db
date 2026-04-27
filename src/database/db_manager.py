@@ -4,10 +4,13 @@ import json
 import hashlib
 import random
 import logging
+import re
 from datetime import timedelta
+from urllib.parse import quote_plus
 
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.engine import make_url
 from faker import Faker
 from dotenv import load_dotenv
 
@@ -17,21 +20,39 @@ logger = logging.getLogger(__name__)
 # Učitavanje enviroment varijabli iz .env fajla
 load_dotenv()
 
+def slugify_name(text_value):
+    """Converts a plan name into a Postgres-safe identifier fragment."""
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(text_value or "").strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return (normalized or "default_plan")[:63]
+
 class DBManager:
     def __init__(self, db_url=None):
         # 1. Konfiguracija baze podataka
-        self.db_url = db_url or os.getenv(
+        self.source_db_url = db_url or os.getenv(
             "DATABASE_URL",
             "postgresql://user:password@db:5432/anonify_db"
         )
+        self.target_db_url = self.source_db_url
+        self.db_url = self.target_db_url
+        self.metadata_schema = "_anon_metadata"
 
-        # Koristimo pool_size i max_overflow za stabilan PARALELIZAM
-        self.engine = create_engine(
-            self.db_url,
+        # Source engine: reads schema/tables from the original database
+        self.source_engine = create_engine(
+            self.source_db_url,
             connect_args={'client_encoding': 'utf8'},
-            pool_size=10,        # Broj stalnih konekcija u pool-u
-            max_overflow=20      # Koliko dodatnih konekcija dozvoljavamo pod opterećenjem
+            pool_size=10,
+            max_overflow=20
         )
+        # Target engine: metadata + anonymized writes
+        self.target_engine = create_engine(
+            self.target_db_url,
+            connect_args={'client_encoding': 'utf8'},
+            pool_size=10,
+            max_overflow=20
+        )
+        # Backward compatibility for modules still using db.engine directly
+        self.engine = self.target_engine
 
         # 2. Inicijalizacija Fakera (DACH + US regioni kao što si tražio)
         self.fake = Faker(['de_DE', 'en_US'])
@@ -39,17 +60,126 @@ class DBManager:
         # 3. Inicijalizacija meta-tabela
         self._init_metadata_table()
 
-        logger.info("✅ DBManager uspešno inicijalizovan sa Connection Pool-om.")
+        logger.info("✅ [DB_MANAGER] DBManager successfully initialized with Connection Pool.")
+
+    @staticmethod
+    def _quote_ident(identifier):
+        safe = str(identifier).replace('"', '""')
+        return f'"{safe}"'
+
+    def quote_identifier(self, identifier):
+        """Public identifier quoting helper for SQL names."""
+        return self._quote_ident(identifier)
+
+    def _get_source_type_signatures(self, source_schema, table_name):
+        type_signature_sql = text("""
+            SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS column_type
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = :schema_name
+              AND c.relname = :table_name
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
+        """)
+        with self.source_engine.connect() as source_conn:
+            source_conn.execute(text(f"SET search_path TO {self.quote_identifier(source_schema)}, public;"))
+            return source_conn.execute(
+                type_signature_sql,
+                {"schema_name": source_schema, "table_name": table_name}
+            ).fetchall()
+
+    def _build_target_db_name(self, plan_name):
+        source_db_name = make_url(self.source_db_url).database or "source"
+        slugified = slugify_name(plan_name)
+        return f"anon_{source_db_name}_{slugified}"[:63]
+
+    def _build_database_url(self, database_name):
+        parsed = make_url(self.source_db_url)
+        drivername = parsed.drivername
+        username = parsed.username or ""
+        password = parsed.password
+        host = parsed.host or "localhost"
+        port = f":{parsed.port}" if parsed.port else ""
+        encoded_password = quote_plus(password) if password is not None else ""
+        auth_segment = username
+        if encoded_password:
+            auth_segment = f"{username}:{encoded_password}"
+        if auth_segment:
+            auth_segment = f"{auth_segment}@"
+        return f"{drivername}://{auth_segment}{host}{port}/{database_name}"
+
+    def _build_postgres_admin_url(self):
+        return self._build_database_url("postgres")
+
+    def _set_target_engine(self, db_url):
+        self.target_db_url = db_url
+        self.db_url = db_url
+        self.target_engine = create_engine(
+            self.target_db_url,
+            connect_args={'client_encoding': 'utf8'},
+            pool_size=10,
+            max_overflow=20
+        )
+        self.engine = self.target_engine
+
+    def bootstrap_plan_database(self, plan_name):
+        target_db_name = self._build_target_db_name(plan_name)
+        admin_url = self._build_postgres_admin_url()
+        admin_engine = create_engine(admin_url, connect_args={'client_encoding': 'utf8'})
+        created_now = False
+
+        try:
+            with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.execute(text(f'CREATE DATABASE "{target_db_name}"'))
+                created_now = True
+        except Exception as e:
+            error_text = str(e).lower()
+            if "already exists" not in error_text and "duplicate_database" not in error_text:
+                raise
+        finally:
+            admin_engine.dispose()
+
+        target_url = self._build_database_url(target_db_name)
+        self._set_target_engine(target_url)
+        self._init_metadata_table()
+        return target_db_name, created_now
+
+    def connect_to_existing_plan_database(self, plan_db_name):
+        target_url = self._build_database_url(plan_db_name)
+        self._set_target_engine(target_url)
+        self._init_metadata_table()
+        return plan_db_name
+
+    def list_existing_plan_databases(self):
+        source_db_name = make_url(self.source_db_url).database or "source"
+        prefix = f"anon_{source_db_name}_"
+        admin_engine = create_engine(self._build_postgres_admin_url(), connect_args={'client_encoding': 'utf8'})
+        try:
+            with admin_engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT datname
+                        FROM pg_database
+                        WHERE datname LIKE :prefix
+                        ORDER BY datname
+                    """),
+                    {"prefix": f"{prefix}%"}
+                ).fetchall()
+                return [row[0] for row in rows]
+        finally:
+            admin_engine.dispose()
 
     def get_all_schemas(self):
-        inspector = inspect(self.engine)
+        inspector = inspect(self.source_engine)
         all_schemas = inspector.get_schema_names()
         # Isključujemo sistemske šeme i sve što sadrži 'anon'
-        forbidden = ['information_schema', 'pg_catalog', 'metadata']
+        forbidden = ['information_schema', 'pg_catalog', 'metadata', '_anon_metadata']
         return [s for s in all_schemas if s not in forbidden and 'anon' not in s.lower()]
 
     def get_tables_in_schema(self, schema='public'):
-        inspector = inspect(self.engine)
+        inspector = inspect(self.source_engine)
         all_tables = inspector.get_table_names(schema=schema)
         # Vraćamo samo tabele koje nemaju 'anon' u nazivu
         return [t for t in all_tables if 'anon' not in t.lower()]
@@ -58,7 +188,9 @@ class DBManager:
         from sqlalchemy import text
         import pandas as pd
 
-        query_str = f"SELECT * FROM {schema_name}.{table_name}"
+        quoted_schema = self._quote_ident(schema_name)
+        quoted_table = self._quote_ident(table_name)
+        query_str = f"SELECT * FROM {quoted_schema}.{quoted_table}"
 
         if where and str(where).strip():
             # 1. Čistimo samo reč "WHERE" ali BEZ .lower() nad celim stringom!
@@ -74,11 +206,13 @@ class DBManager:
         query = text(query_str)
 
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
+                conn.execute(text(f"SET search_path TO {quoted_schema}, public;"))
                 result = conn.execute(query, params or {})
+                logger.info(f"✅ [DB_MANAGER] Read preview from {schema_name}.{table_name}")
                 return pd.DataFrame(result.fetchall(), columns=result.keys())
         except Exception as e:
-            print(f"Error reading table {table_name}: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error reading table {schema_name}.{table_name}: {e}")
             return pd.DataFrame()
 
     def _ensure_target_table_mirror(self, active_conn, source_schema, target_schema, table_name):
@@ -95,13 +229,21 @@ class DBManager:
             exists_sql,
             {"target_schema": target_schema, "table_name": table_name}
         ).scalar()
+        quoted_target_schema = self.quote_identifier(target_schema)
+        quoted_table_name = self.quote_identifier(table_name)
+        source_rows = self._get_source_type_signatures(source_schema, table_name)
+        source_types = {row[0]: row[1] for row in source_rows}
 
         if not exists:
-            active_conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{target_schema}"'))
-            active_conn.execute(text(f'''
-                CREATE TABLE "{target_schema}"."{table_name}"
-                (LIKE "{source_schema}"."{table_name}" INCLUDING ALL)
-            '''))
+            active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quoted_target_schema}"))
+            columns_sql = ", ".join(
+                f'{self.quote_identifier(col_name)} {col_type}'
+                for col_name, col_type in source_types.items()
+            )
+            active_conn.execute(text(
+                f"CREATE TABLE {quoted_target_schema}.{quoted_table_name} ({columns_sql})"
+            ))
+            logger.info(f"✅ [DB_MANAGER] Created target table {target_schema}.{table_name} from source schema {source_schema}")
             return
 
         # Existing table: enforce exact source type signatures column-by-column
@@ -116,24 +258,86 @@ class DBManager:
               AND NOT a.attisdropped
             ORDER BY a.attnum
         """)
-        source_rows = active_conn.execute(
-            type_signature_sql,
-            {"schema_name": source_schema, "table_name": table_name}
-        ).fetchall()
         target_rows = active_conn.execute(
             type_signature_sql,
             {"schema_name": target_schema, "table_name": table_name}
         ).fetchall()
-        source_types = {row[0]: row[1] for row in source_rows}
         target_types = {row[0]: row[1] for row in target_rows}
 
         for column_name, source_type in source_types.items():
             if column_name in target_types and target_types[column_name] != source_type:
-                active_conn.execute(text(f'''
-                    ALTER TABLE "{target_schema}"."{table_name}"
-                    ALTER COLUMN "{column_name}" TYPE {source_type}
-                    USING "{column_name}"::{source_type}
-                '''))
+                quoted_col = self.quote_identifier(column_name)
+                active_conn.execute(text(
+                    f"ALTER TABLE {quoted_target_schema}.{quoted_table_name} "
+                    f"ALTER COLUMN {quoted_col} TYPE {source_type} "
+                    f"USING {quoted_col}::{source_type}"
+                ))
+                logger.info(f"✅ [DB_MANAGER] Aligned type {target_schema}.{table_name}.{column_name} -> {source_type}")
+
+    def create_anonymized_table(self, source_schema, table_name, target_db, target_schema="anon"):
+        """
+        Creates target anonymized table in active anon_* database from source schema/table.
+        Keeps SQL handling in DB layer and logs routing details.
+        """
+        source_schema = source_schema or "ecommerce"
+        quoted_source_schema = self.quote_identifier(source_schema)
+        quoted_target_schema = self.quote_identifier(target_schema)
+        quoted_table = self.quote_identifier(table_name)
+        target_db_name = target_db or (make_url(self.target_db_url).database or "target_db")
+
+        create_schema_sql = text(f"CREATE SCHEMA IF NOT EXISTS {quoted_target_schema}")
+        ctas_sql = text(
+            f"CREATE TABLE {quoted_target_schema}.{quoted_table} AS "
+            f"SELECT * FROM {quoted_source_schema}.{quoted_table} WITH NO DATA"
+        )
+        target_engine_for_op = self.target_engine
+        temp_engine = None
+        if target_db_name != (make_url(self.target_db_url).database or "target_db"):
+            temp_engine = create_engine(
+                self._build_database_url(target_db_name),
+                connect_args={'client_encoding': 'utf8'},
+                pool_size=10,
+                max_overflow=20
+            )
+            target_engine_for_op = temp_engine
+
+        try:
+            with target_engine_for_op.connect() as target_conn:
+                with target_conn.begin():
+                    target_conn.execute(create_schema_sql)
+                    target_conn.execute(ctas_sql)
+                    logger.info(
+                        f"✅ [DB_MANAGER] Created {target_db_name}.{target_schema}.{table_name} "
+                        f"from source schema {source_schema} using CTAS."
+                    )
+                    return True, "created_via_ctas"
+        except Exception as e:
+            logger.warning(
+                f"⚠️ [DB_MANAGER] CTAS unavailable for {table_name} ({source_schema} -> {target_db_name}). "
+                f"Falling back to type-mirror create. Reason: {e}"
+            )
+            try:
+                with target_engine_for_op.connect() as target_conn:
+                    with target_conn.begin():
+                        self._ensure_target_table_mirror(
+                            target_conn,
+                            source_schema=source_schema,
+                            target_schema=target_schema,
+                            table_name=table_name
+                        )
+                logger.info(
+                    f"✅ [DB_MANAGER] Created/aligned {target_db_name}.{target_schema}.{table_name} "
+                    f"from source schema {source_schema} using mirror fallback."
+                )
+                return True, "created_via_mirror_fallback"
+            except Exception as fallback_error:
+                logger.error(
+                    f"❌ [DB_MANAGER] Failed to create anonymized table {target_schema}.{table_name}: {fallback_error}"
+                )
+                return False, str(fallback_error)
+        finally:
+            if temp_engine is not None:
+                temp_engine.dispose()
 
     def _cast_dataframe_to_table_types(self, df, active_conn, schema_name, table_name):
         """
@@ -211,7 +415,7 @@ class DBManager:
             safe_df = self._cast_dataframe_to_table_types(df, active_conn, target_schema, table_name)
 
             # Osiguravamo šemu ako ne postoji
-            active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
+            active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.quote_identifier(target_schema)}"))
 
             # Upisujemo podatke koristeći 'append' (TRUNCATE je već odrađen na nivou Batch-a)
             # KLJUČNO: Ovde koristimo active_conn umesto self.engine
@@ -224,6 +428,11 @@ class DBManager:
                 method='multi',
                 chunksize=1000
             )
+            target_db_name = make_url(self.target_db_url).database or "target_db"
+            logger.info(
+                f"✅ [DB_MANAGER] Inserted anonymized rows into {target_db_name}.{target_schema}.{table_name} "
+                f"from source schema {source_schema}"
+            )
             return True
 
         try:
@@ -232,11 +441,11 @@ class DBManager:
                 return _run_save(conn)
             else:
                 # Samostalni upis
-                with self.engine.connect() as standalone_conn:
+                with self.target_engine.connect() as standalone_conn:
                     with standalone_conn.begin():
                         return _run_save(standalone_conn)
         except Exception as e:
-            print(f"❌ Error saving to {target_schema}.{table_name}: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error saving to {target_schema}.{table_name}: {e}")
             return False
 
     def mask_value(self, val):
@@ -251,22 +460,22 @@ class DBManager:
         """Vra?a listu naziva kolona za datu tabelu koriste?i SQLAlchemy inspect."""
         from sqlalchemy import inspect
         try:
-            inspector = inspect(self.engine)
+            inspector = inspect(self.source_engine)
             columns = inspector.get_columns(table_name, schema=schema_name)
             return [col['name'] for col in columns]
         except Exception as e:
-            print(f"Error fetching columns for {schema_name}.{table_name}: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error fetching columns for {schema_name}.{table_name}: {e}")
             return []
 
     def get_ai_ready_metadata(self, table_name, schema='public', sample_size=5):
-        inspector = inspect(self.engine)
+        inspector = inspect(self.source_engine)
         columns_info = inspector.get_columns(table_name, schema=schema)
         metadata_package = []
         for col in columns_info:
             col_name = col['name']
             query = text(f'SELECT "{col_name}" FROM "{schema}"."{table_name}" LIMIT 50')
             try:
-                raw_sample = pd.read_sql(query, self.engine)[col_name].dropna().unique().tolist()[:sample_size]
+                raw_sample = pd.read_sql(query, self.source_engine)[col_name].dropna().unique().tolist()[:sample_size]
                 masked_sample = [self.mask_value(v) for v in raw_sample]
             except:
                 masked_sample = []
@@ -276,11 +485,11 @@ class DBManager:
     def get_global_mapping(self, col_name, orig_val, salt):
         """Proverava da li vec imamo anonimizovanu vrednost za ovaj ID i Salt."""
         query = text("""
-            SELECT anonymized_value FROM metadata.global_id_mapping
+            SELECT anonymized_value FROM _anon_metadata.global_id_mapping
             WHERE column_name = :c AND original_value = :o AND salt_used = :s
         """)
         try:
-            with self.engine.connect() as conn:
+            with self.target_engine.connect() as conn:
                 res = conn.execute(query, {"c": col_name, "o": str(orig_val), "s": salt}).fetchone()
                 return res[0] if res else None
         except:
@@ -289,12 +498,12 @@ class DBManager:
     def save_global_mapping(self, col_name, orig_val, anon_val, salt):
         """Skladisti novu vezu u globalnu mapu."""
         query = text("""
-            INSERT INTO metadata.global_id_mapping (column_name, original_value, anonymized_value, salt_used)
+            INSERT INTO _anon_metadata.global_id_mapping (column_name, original_value, anonymized_value, salt_used)
             VALUES (:c, :o, :a, :s)
             ON CONFLICT DO NOTHING
         """)
         try:
-            with self.engine.connect() as conn:
+            with self.target_engine.connect() as conn:
                 conn.execute(query, {"c": col_name, "o": str(orig_val), "a": str(anon_val), "s": salt})
                 conn.commit()
         except:
@@ -302,12 +511,12 @@ class DBManager:
 
     def get_mapping_value(self, original_value, category, locale, salt):
         import hashlib
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             # 1. Uzmi sve dostupne fejk vrednosti za kategoriju i jezik, SORTIRANO
             query = text("""
                 SELECT v.fake_value
-                FROM metadata.mapping_values v
-                JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
+                FROM _anon_metadata.mapping_values v
+                JOIN _anon_metadata.mapping_catalog c ON v.catalog_id = c.id
                 WHERE c.category_name = :cat AND c.locale = :loc
                 ORDER BY v.fake_value ASC
             """)
@@ -345,7 +554,7 @@ class DBManager:
             try:
                 table_plan = json.loads(table_plan)
             except:
-                print("❌ Error: Failed to parse plan in apply_anonymization_rules")
+                logger.error("❌ [AI_SCAN] Failed to parse plan in apply_anonymization_rules")
                 return df_anon
 
         for item in table_plan:
@@ -471,12 +680,12 @@ class DBManager:
         from sqlalchemy import text
         query = text("""
             SELECT v.fake_value
-            FROM metadata.mapping_values v
-            JOIN metadata.mapping_catalog c ON v.catalog_id = c.id
+            FROM _anon_metadata.mapping_values v
+            JOIN _anon_metadata.mapping_catalog c ON v.catalog_id = c.id
             WHERE c.category_name = :cat AND c.locale = :loc
             ORDER BY v.fake_value ASC
         """)
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             res = conn.execute(query, {"cat": category, "loc": locale})
             return [row[0] for row in res]
 
@@ -490,12 +699,18 @@ class DBManager:
 
     def _init_metadata_table(self):
         query = """
-        CREATE SCHEMA IF NOT EXISTS metadata;
-        CREATE TABLE IF NOT EXISTS metadata.ai_plans (
-            schema_name TEXT, table_name TEXT, plan_json JSONB, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CREATE SCHEMA IF NOT EXISTS _anon_metadata;
+        CREATE TABLE IF NOT EXISTS _anon_metadata.ai_plans (
+            schema_name TEXT,
+            table_name TEXT,
+            plan_json JSONB,
+            where_condition TEXT DEFAULT '',
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (schema_name, table_name)
         );
-        CREATE TABLE IF NOT EXISTS metadata.global_id_mapping (
+        ALTER TABLE _anon_metadata.ai_plans
+            ADD COLUMN IF NOT EXISTS where_condition TEXT DEFAULT '';
+        CREATE TABLE IF NOT EXISTS _anon_metadata.global_id_mapping (
             column_name TEXT,
             original_value TEXT,
             anonymized_value TEXT,
@@ -503,7 +718,7 @@ class DBManager:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (column_name, original_value, salt_used)
         );
-        CREATE TABLE IF NOT EXISTS metadata.audit_log (
+        CREATE TABLE IF NOT EXISTS _anon_metadata.audit_log (
             id SERIAL PRIMARY KEY,
             execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             user_name TEXT,
@@ -513,24 +728,42 @@ class DBManager:
             salt_used TEXT,
             status TEXT
         );
+        CREATE TABLE IF NOT EXISTS _anon_metadata.pending_fks (
+            id SERIAL PRIMARY KEY,
+            target_schema TEXT,
+            table_name TEXT,
+            constraint_name TEXT,
+            rehook_sql TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS _anon_metadata.mapping_catalog (
+            id SERIAL PRIMARY KEY,
+            category_name TEXT NOT NULL,
+            locale TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS _anon_metadata.mapping_values (
+            id SERIAL PRIMARY KEY,
+            catalog_id INTEGER REFERENCES _anon_metadata.mapping_catalog(id) ON DELETE CASCADE,
+            fake_value TEXT NOT NULL
+        );
         """
         try:
-            with self.engine.connect() as conn:
+            with self.target_engine.connect() as conn:
                 conn.execute(text(query))
                 conn.commit()
         except Exception as e:
-            print(f"Metadata init error: {e}")
+            logger.error(f"❌ [DB_MANAGER] Metadata init error: {e}")
 
     def save_ai_plan(self, schema_name, table_name, plan_data, where_condition=""):
         """
         Saves the entire plan as a single JSON and the WHERE filter
-        into the metadata.ai_plans table.
+        into the _anon_metadata.ai_plans table.
         """
         import json
         from sqlalchemy import text
 
         query = text("""
-            INSERT INTO metadata.ai_plans (
+            INSERT INTO _anon_metadata.ai_plans (
                 schema_name,
                 table_name,
                 plan_json,
@@ -546,7 +779,7 @@ class DBManager:
         """)
 
         try:
-            with self.engine.connect() as conn:
+            with self.target_engine.connect() as conn:
                 conn.execute(query, {
                     "s": schema_name,
                     "t": table_name,
@@ -557,7 +790,7 @@ class DBManager:
                 logger.info(f"✅ Plan & Filter successfully saved for {schema_name}.{table_name}")
                 return True
         except Exception as e:
-            logger.error(f"❌ Error saving to metadata.ai_plans for {table_name}: {e}")
+            logger.error(f"❌ Error saving to _anon_metadata.ai_plans for {table_name}: {e}")
             return False
 
     def get_saved_plan(self, schema_name, table_name):
@@ -570,13 +803,13 @@ class DBManager:
 
         query = text("""
             SELECT plan_json, where_condition
-            FROM metadata.ai_plans
+            FROM _anon_metadata.ai_plans
             WHERE schema_name = :s AND table_name = :t
             LIMIT 1
         """)
 
         try:
-            with self.engine.connect() as conn:
+            with self.target_engine.connect() as conn:
                 result = conn.execute(query, {"s": schema_name, "t": table_name}).fetchone()
 
                 if result:
@@ -589,7 +822,7 @@ class DBManager:
                         try:
                             plan_data = json.loads(raw_plan)
                         except json.JSONDecodeError:
-                            print(f"❌ JSON greška za {table_name}: Neispravan format u bazi.")
+                            logger.error(f"❌ [DB_MANAGER] JSON error for {table_name}: Invalid format in database.")
                             plan_data = []
                     else:
                         plan_data = raw_plan
@@ -610,7 +843,7 @@ class DBManager:
                     # 4. FINALNA PROVERA TIPA (Batch procesor zaštita)
                     # Ako final_plan nije lista, pretvaramo ga u praznu listu da izbegnemo pad
                     if not isinstance(final_plan, list):
-                        print(f"⚠️ Warning: Plan za {table_name} nije lista nego {type(final_plan)}")
+                        logger.warning(f"⚠️ [DB_MANAGER] Plan for {table_name} is not a list but {type(final_plan)}")
                         final_plan = []
 
                     return {
@@ -620,31 +853,48 @@ class DBManager:
 
                 return None
         except Exception as e:
-            print(f"❌ Error loading from metadata.ai_plans: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error loading _anon_metadata.ai_plans: {e}")
             return None
 
     def log_action(self, user, schema, table, score, salt, status="SUCCESS"):
         """Upisuje detalje o izvrsenoj anonimizaciji u bazu."""
         query = text("""
-            INSERT INTO metadata.audit_log (user_name, schema_name, table_name, privacy_score, salt_used, status)
+            INSERT INTO _anon_metadata.audit_log (user_name, schema_name, table_name, privacy_score, salt_used, status)
             VALUES (:u, :s, :t, :score, :salt, :status)
         """)
         try:
-            with self.engine.connect() as conn:
+            with self.target_engine.connect() as conn:
                 conn.execute(query, {
                     "u": user, "s": schema, "t": table,
                     "score": score, "salt": salt, "status": status
                 })
                 conn.commit()
         except Exception as e:
-            print(f"Logging error: {e}")
+            logger.error(f"❌ [DB_MANAGER] Audit logging error: {e}")
+
+    def get_audit_logs(self, limit=50):
+        query = text(f"""
+            SELECT * FROM {self.metadata_schema}.audit_log
+            ORDER BY execution_time DESC
+            LIMIT :limit_val
+        """)
+        try:
+            with self.target_engine.connect() as conn:
+                result = conn.execute(query, {"limit_val": int(limit)})
+                return pd.DataFrame(result.fetchall(), columns=result.keys())
+        except Exception as e:
+            error_text = str(e).lower()
+            if "does not exist" in error_text or "undefined_table" in error_text:
+                return pd.DataFrame()
+            logger.error(f"❌ [DB_MANAGER] Audit log read error: {e}")
+            return pd.DataFrame()
 
     def test_connection(self):
         """Proverava da li je baza dostupna i da li imamo osnovni pristup."""
         # VAŽNO: Uvozimo text unutar metode ako nije uvezena na vrhu fajla
         from sqlalchemy import text
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
                 # Izvršavamo prost upit da potvrdimo 'handshake'
                 conn.execute(text("SELECT 1"))
                 return True, "Connection successful! ✅"
@@ -679,15 +929,15 @@ class DBManager:
         """)
 
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
                 result = conn.execute(query, {"schema": schema_name})
                 df_rel = pd.DataFrame(result.fetchall(), columns=result.keys())
 
                 # Logujemo broj pronađenih relacija u konzolu radi lakšeg debugginga
-                print(f"📊 [Dependency Engine] Found {len(df_rel)} relations in schema '{schema_name}'")
+                logger.info(f"✅ [DB_MANAGER] Dependency engine found {len(df_rel)} relations in schema {schema_name}")
                 return df_rel
         except Exception as e:
-            print(f"❌ Error fetching Postgres relations: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error fetching Postgres relations: {e}")
             return pd.DataFrame()
 
     def get_execution_order(self, selected_tables, schema_name='public'):
@@ -735,7 +985,7 @@ class DBManager:
         query = text(f'SELECT column_name, is_pii, strategy, reason FROM "{schema_name}"."anon_forced_mappings"')
 
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
                 result = conn.execute(query)
                 # Vraćamo rečnik sa malim slovima radi lakšeg poređenja
                 return {row.column_name.lower(): {
@@ -745,7 +995,7 @@ class DBManager:
                 } for row in result}
         except Exception as e:
             # Ovde ćemo ispisati tačnu grešku u konzolu da je vidimo u Docker logovima
-            print(f"❌ DATABASE ERROR: {str(e)}")
+            logger.error(f"❌ [DB_MANAGER] Database error: {str(e)}")
             return {}
 
     def analyze_table_structure(self, df_sample, agent, schema_name='ecommerce'):
@@ -789,12 +1039,12 @@ class DBManager:
         """
         Faza 1: Kreira šemu i tabele sa indeksima, ali BEZ stranih ključeva.
         """
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             # 1. Osiguraj da target šema postoji
             conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {target_schema}"))
 
             for table in ordered_tables:
-                print(f"🏗️  Kreiram skeleton za: {target_schema}.{table}")
+                logger.info(f"✅ [DB_MANAGER] Creating skeleton for {target_schema}.{table}")
 
                 # Brišemo staru tabelu ako postoji (CASCADE čisti i stare veze)
                 conn.execute(text(f"DROP TABLE IF EXISTS {target_schema}.{table} CASCADE"))
@@ -835,7 +1085,7 @@ class DBManager:
             AND conrelid::regclass::text LIKE :schema_prefix
         """)
 
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             # Tražimo sve FK-ove u izvornoj šemi
             res = conn.execute(query, {"schema_prefix": f"{source_schema}.%"})
             for row in res:
@@ -853,12 +1103,12 @@ class DBManager:
                     try:
                         conn.execute(text(f'ALTER TABLE "{target_schema}"."{tab_name}" ADD CONSTRAINT "{con_name}" {new_def}'))
                     except Exception as e:
-                        print(f"⚠️ Mismatch on FK {con_name}: {e}")
+                        logger.warning(f"⚠️ [DB_MANAGER] FK mismatch on {con_name}: {e}")
             conn.commit()
 
     def drop_all_fks_for_table(self, conn, schema, table):
         """
-        Pronalazi FK-ove, zapisuje ih u metadata.pending_fks i briše ih.
+        Pronalazi FK-ove, zapisuje ih u _anon_metadata.pending_fks i briše ih.
         """
         from sqlalchemy import text
 
@@ -884,18 +1134,18 @@ class DBManager:
 
             # --- ZAPIS U METADATA TABELU ---
             conn.execute(text("""
-                INSERT INTO metadata.pending_fks (target_schema, table_name, constraint_name, rehook_sql)
+                INSERT INTO _anon_metadata.pending_fks (target_schema, table_name, constraint_name, rehook_sql)
                 VALUES (:s, :t, :c, :sql)
             """), {"s": schema, "t": relname, "c": conname, "sql": rehook_sql})
 
-            print(f"💾 [META] Zapisan FK '{conname}' u pending_fks")
+            logger.info(f"✅ [DB_MANAGER] Stored FK {conname} in pending_fks")
             conn.execute(text(f'ALTER TABLE "{schema}"."{relname}" DROP CONSTRAINT IF EXISTS "{conname}"'))
 
         return rehook_commands
 
     def drop_target_schema(self, target_schema):
         from sqlalchemy import text
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{target_schema}" CASCADE'))
             conn.commit()
 
@@ -912,11 +1162,11 @@ class DBManager:
             AND tc.table_name = :table;
         """)
         try:
-            df = pd.read_sql(query, self.engine, params={"schema": schema, "table": table})
-            print(f"🚀 [BATCH] {table}: Found {len(df)} PK columns.")
+            df = pd.read_sql(query, self.source_engine, params={"schema": schema, "table": table})
+            logger.info(f"✅ [DB_MANAGER] Batch {table}: found {len(df)} PK columns")
             return df['column_name'].tolist()
         except Exception as e:
-            print(f"Error fetching PKs for {table}: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error fetching PKs for {table}: {e}")
             return []
 
     def table_exists(self, table_name, schema_name):
@@ -928,14 +1178,14 @@ class DBManager:
                 AND table_name = :t
             )
         """)
-        with self.engine.connect() as conn:
+        with self.source_engine.connect() as conn:
             return conn.execute(query, {"s": schema_name.lower(), "t": table_name.lower()}).scalar()
 
     def get_row_count(self, table_name, schema_name):
         """Vraća broj redova u tabeli."""
         # Čista SQL sintaksa bez nepotrebnih navodnika
         query = text(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")
-        with self.engine.connect() as conn:
+        with self.source_engine.connect() as conn:
             return conn.execute(query).scalar()
 
     def get_column_details(self, table_name, schema_name):
@@ -951,7 +1201,7 @@ class DBManager:
             WHERE table_schema = :s AND table_name = :t
             ORDER BY ordinal_position
         """)
-        with self.engine.connect() as conn:
+        with self.source_engine.connect() as conn:
             result = conn.execute(query, {"s": schema_name, "t": table_name})
 
             # Pakujemo u rečnik gde je ključ ime kolone,
@@ -989,12 +1239,12 @@ class DBManager:
         """)
 
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
                 result = conn.execute(query, {"s": schema_name})
                 # Vraćamo listu torki za lakšu iteraciju u validaciji
                 return [(row[0], row[1], row[2], row[3]) for row in result]
         except Exception as e:
-            print(f"Error fetching foreign keys: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error fetching foreign keys: {e}")
             return []
 
     def get_all_saved_plans(self, schema_name):
@@ -1007,12 +1257,12 @@ class DBManager:
         # Popravljeno ime kolone: plan -> plan_json
         query = text("""
             SELECT table_name, plan_json
-            FROM metadata.ai_plans
+            FROM _anon_metadata.ai_plans
             WHERE schema_name = :s
         """)
 
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
                 result = conn.execute(query, {"s": schema_name})
                 plans = {}
                 for row in result:
@@ -1033,7 +1283,7 @@ class DBManager:
                 return plans
         except Exception as e:
             # Ako Postgres baci error, transakcija mora da se "ohladi"
-            print(f"❌ Error fetching all saved plans: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error fetching all saved plans: {e}")
             return {}
 
     def align_db_types(self, target_schema, table_name, plan, conn=None):
@@ -1045,7 +1295,7 @@ class DBManager:
 
     def drop_all_fks_for_table(self, conn, schema, table):
         """
-        Pronalazi FK-ove, zapisuje ih u metadata.pending_fks i briše ih.
+        Pronalazi FK-ove, zapisuje ih u _anon_metadata.pending_fks i briše ih.
         Pazi: 'table' je argument funkcije koji prosleđujemo SQL-u.
         """
         from sqlalchemy import text
@@ -1084,7 +1334,7 @@ class DBManager:
 
             # Zapis u bazu da imamo trag ako nešto pukne
             conn.execute(text("""
-                INSERT INTO metadata.pending_fks (target_schema, table_name, constraint_name, rehook_sql)
+                INSERT INTO _anon_metadata.pending_fks (target_schema, table_name, constraint_name, rehook_sql)
                 VALUES (:s, :t, :c, :sql)
             """), {
                 "s": schema,
@@ -1093,17 +1343,17 @@ class DBManager:
                 "sql": rehook_sql
             })
 
-            print(f"💾 [META] Zapisan FK '{conname}' za tabelu '{relname}'")
+            logger.info(f"✅ [DB_MANAGER] Stored FK {conname} for table {relname}")
             conn.execute(text(f'ALTER TABLE "{schema}"."{relname}" DROP CONSTRAINT IF EXISTS "{conname}"'))
 
         return rehook_commands
 
     def rehook_foreign_keys(self, conn, commands):
         """
-        Vraća FK integritet i čisti metadata.pending_fks.
+        Vraća FK integritet i čisti _anon_metadata.pending_fks.
         """
         from sqlalchemy import text
-        print(f"\n⚓ [RE-HOOK] Vraćam {len(commands)} Foreign Key-eva...")
+        logger.info(f"✅ [DB_MANAGER] Re-hooking {len(commands)} foreign keys")
 
         for cmd in commands:
             try:
@@ -1111,11 +1361,11 @@ class DBManager:
                 # --- ČIŠĆENJE IZ METADATA ---
                 # Izvlačimo ime constrainta iz komande (grubo, ali radi za logiku čišćenja)
                 con_name = cmd.split('CONSTRAINT "')[1].split('"')[0]
-                conn.execute(text("DELETE FROM metadata.pending_fks WHERE constraint_name = :c"), {"c": con_name})
+                conn.execute(text("DELETE FROM _anon_metadata.pending_fks WHERE constraint_name = :c"), {"c": con_name})
 
-                print(f"✅ Successfully restored: {con_name}")
+                logger.info(f"✅ [DB_MANAGER] Successfully restored foreign key: {con_name}")
             except Exception as e:
-                print(f"⚠️ [RE-HOOK WARNING] Neuspelo vraćanje: {e}")
+                logger.warning(f"⚠️ [DB_MANAGER] Re-hook warning: {e}")
 
     def truncate_anon_tables(self, target_schema, ordered_tables):
         from sqlalchemy import text
@@ -1127,11 +1377,11 @@ class DBManager:
         # Dodajemo RESTART IDENTITY da ID-evi krenu od 1
         sql = text(f"TRUNCATE TABLE {tables_to_clear} RESTART IDENTITY CASCADE;")
 
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             # 1. Isključujemo trigere i FK provere za ovu sesiju
             conn.execute(text("SET session_replication_role = 'replica';"))
 
-            print(f"DEBUG: Pokrećem TRUNCATE nad {tables_to_clear}")
+            logger.info(f"✅ [DB_MANAGER] Running TRUNCATE on {tables_to_clear}")
             conn.execute(sql)
 
             # 2. Vraćamo u normalu
@@ -1139,7 +1389,7 @@ class DBManager:
 
             # 3. FORCE COMMIT
             conn.commit()
-            print("DEBUG: TRUNCATE executed and committed successfully.")
+            logger.info("✅ [DB_MANAGER] TRUNCATE executed and committed successfully")
 
     def prepare_subset_metadata(self, conn):
         """
@@ -1162,14 +1412,14 @@ class DBManager:
         # (ako tvoj setup podržava manualne transakcije unutar bloka)
         # ili jednostavno idemo odmah na INSERT.
 
-        print("🛠️ Temp tabela 'subset_tracking' kreirana.")
+        logger.info("✅ [DB_MANAGER] Temp table subset_tracking created")
 
         # Izmeni onaj debug INSERT da bude bezbedniji
         try:
             conn.execute(text("INSERT INTO subset_tracking (column_name, key_value) VALUES ('test', '1') ON CONFLICT DO NOTHING"))
-            print("✅ Debug INSERT uspešan.")
+            logger.info("✅ [DB_MANAGER] Debug INSERT succeeded")
         except Exception as e:
-            print(f"❌ Error during debug INSERT: {e}")
+            logger.error(f"❌ [DB_MANAGER] Error during debug INSERT: {e}")
 
     def register_keys(self, conn, column_name, values):
         """Ubacuje ključeve u temp tabelu za kasniji JOIN."""
@@ -1194,7 +1444,7 @@ class DBManager:
         all_rehook_commands = []
 
         # 1. Otvaramo konekciju
-        with self.engine.connect() as conn:
+        with self.target_engine.connect() as conn:
             # 2. POKREĆEMO TRANSAKCIJU (Ovo drži sesiju i TEMP tabelu živom!)
             with conn.begin():
                 # Priprema RI Subset mehanizma (sada unutar transakcije)
@@ -1230,13 +1480,13 @@ class DBManager:
                         # Dodajemo filter, pazeći na to da li već imamo JOIN/WHERE
                         query += f" WHERE ({base_where})"
 
-                    print(f"🚀 [BATCH] Procesuiram: {table_name}")
+                    logger.info(f"✅ [DB_MANAGER] Batch processing {table_name}")
 
                     # Čitanje mora ići preko iste 'conn'
                     df = pd.read_sql(text(query), conn)
 
                     if df.empty:
-                        print(f"⚠️ Tabela {table_name} je prazna nakon subsettinga. Preskačem.")
+                        logger.warning(f"⚠️ [DB_MANAGER] Table {table_name} is empty after subsetting. Skipping")
                         continue
 
                     # --- REGISTRACIJA KLJUČEVA ---
@@ -1271,7 +1521,7 @@ class DBManager:
                 # Na kraju 'with conn.begin():' bloka, SQLAlchemy AUTOMATSKI radi COMMIT.
                 # Ako se desi greška bilo gde iznad, AUTOMATSKI radi ROLLBACK.
 
-            print("🎯 [COMPLETED] Batch proces uspešno završen.")
+            logger.info("✅ [DB_MANAGER] Batch process completed successfully")
 
     def get_table_sample(self, schema, table, limit=5):
         """
@@ -1281,14 +1531,18 @@ class DBManager:
         from sqlalchemy import text
         import pandas as pd
 
-        query = f"SELECT * FROM {schema}.{table} LIMIT {limit}"
+        quoted_schema = self._quote_ident(schema)
+        quoted_table = self._quote_ident(table)
+        query = f"SELECT * FROM {quoted_schema}.{quoted_table} LIMIT {limit}"
         try:
-            with self.engine.connect() as conn:
+            with self.source_engine.connect() as conn:
+                conn.execute(text(f"SET search_path TO {quoted_schema}, public;"))
                 df = pd.read_sql(text(query), conn)
                 # Bitno: pretvaramo sve u stringove pre slanja AI-ju
+                logger.info(f"✅ [AI_SCAN] Sample loaded from {schema}.{table}")
                 return df.astype(str).to_dict(orient='records')
         except Exception as e:
-            logger.error(f"⚠️ Error fetching sample for {table}: {e}")
+            logger.error(f"❌ [AI_SCAN] Error fetching sample for {schema}.{table}: {e}")
             return []
 
     def get_tables(self, schema_name='public'):
@@ -1307,7 +1561,7 @@ class DBManager:
             ORDER BY table_name;
         """
         try:
-            df = pd.read_sql(query, self.engine)
+            df = pd.read_sql(query, self.source_engine)
             return df['table_name'].tolist()
         except Exception as e:
             logger.error(f"❌ Error listing tables: {e}")

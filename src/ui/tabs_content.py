@@ -4,9 +4,11 @@ import streamlit as st
 import pandas as pd
 import time
 import logging
+import json
+import html
 from sqlalchemy import text
 # Shared planner modules
-from src.ui.planner import AnonymizationPlanner, analyze_tables_parallel
+from src.ui.planner import analyze_tables_parallel
 from src.ui.planner_logic import validate_plan_row, calculate_privacy_score, get_clean_plan
 from src.ui.planner_components import render_status_chain, render_ai_audit_log
 from src.ui.planner_navigation import handle_navigation_history, get_next_table_in_chain
@@ -293,19 +295,6 @@ def get_next_table_in_chain(current_table, all_tables, completed_tables):
 
 def render_planner_action_buttons(db, table_name, schema_name):
     """Renders stacked action buttons and audit log."""
-    allow_sampling = st.checkbox("Enable sampling", value=True, key=f"sample_check_{table_name}")
-    sample_rows = st.slider("Sample rows", 1, 20, 5) if allow_sampling else 0
-
-    if st.button("🤖 AI Scan", width="stretch", type="secondary", key=f"ai_btn_{table_name}"):
-        with st.spinner("Consulting AI..."):
-            planner = AnonymizationPlanner(db)
-            ai_plan, audit_data = planner.generate_suggestion_plan(schema_name, table_name, allow_sampling, sample_rows)
-            if ai_plan:
-                st.session_state['ai_analysis'] = ai_plan
-                st.session_state['last_ai_audit'] = audit_data
-                st.session_state['plan_active'] = True
-                st.rerun()
-
     if st.button("📂 Load Saved", width="stretch", key=f"load_btn_{table_name}"):
         saved_data = db.get_saved_plan(schema_name, table_name)
         if saved_data:
@@ -322,9 +311,6 @@ def render_planner_action_buttons(db, table_name, schema_name):
         st.session_state['plan_origin'] = 'new'
         st.session_state['plan_active'] = True
         st.rerun()
-
-    if st.button("👁️ View Data", width="stretch", key=f"view_btn_{table_name}"):
-        st.info("Live Preview is available below.")
 
     # Important: render audit log immediately below action buttons
     render_ai_audit_log()
@@ -373,6 +359,8 @@ def _pick_first_table_by_execution_order(result_keys, execution_order):
 def render_planner_tab(db):
     st.subheader("Parallel AI Strategy Planner")
     st.caption("Scan selected tables first, then review and refine anonymization plans in dependency order.")
+    # Always initialize early so downstream button disabled state is safe.
+    violation_found = False
     selected_schema = st.session_state.get('selected_schema', 'public')
     if 'active_table_index' not in st.session_state:
         st.session_state['active_table_index'] = 0
@@ -429,7 +417,14 @@ def render_planner_tab(db):
 
     # 2. Global integrity settings (sidebar)
     with st.sidebar:
-        st.markdown("### ⛓️ Integrity Lock Settings")
+        lock_title_col, lock_help_col = st.columns([12, 1], gap="small")
+        with lock_title_col:
+            st.markdown("### ⛓️ Integrity Lock Settings")
+        with lock_help_col:
+            st.markdown(
+                '<div style="padding-top: 0.6rem; font-size: 1.1rem;" title="Controls foreign key enforcement. Strict ensures all relations are valid.">⭐</div>',
+                unsafe_allow_html=True
+            )
         global_lock = st.checkbox("Force Referential Integrity", value=True, key="global_lock_check")
         global_integrity_val = st.text_input("Global ID Sync:", value="1", key="global_integrity_val")
 
@@ -462,27 +457,42 @@ def render_planner_tab(db):
     # Filter out tables that no longer exist
     initial_multiselect_default = [t for t in initial_multiselect_default if t in available_tables]
 
-    with st.expander("1) 🪄 Scanning", expanded=True):
+    all_tables_list = st.session_state.get('all_tables_list', [])
+    completed_tables = st.session_state.get('completed_tables', set())
+
+    with st.expander("1) ⚙️ Anonymization Strategy & Design", expanded=True):
         st.caption(f"Schema: `{selected_schema}`")
-        selected_multi_tables = st.multiselect("Tables for parallel scan",
-                                               options=available_tables,
-                                               default=initial_multiselect_default,
-                                               key="planner_multiselect")
+        selected_multi_tables = st.multiselect(
+            "Tables for parallel scan",
+            options=available_tables,
+            default=initial_multiselect_default,
+            key="planner_multiselect"
+        )
         st.session_state['selected_tables'] = selected_multi_tables
 
         c1, c2 = st.columns([1, 2])
         with c1:
             bulk_allow_sampling = st.checkbox("Enable sampling", value=True, key="bulk_allow_sample")
         with c2:
-            bulk_sample_rows = st.slider("Sample rows", 1, 20, 5, key="bulk_sample_rows") if bulk_allow_sampling else 0
+            bulk_sample_rows = st.number_input(
+                "Sample rows",
+                min_value=1,
+                max_value=5000,
+                value=int(st.session_state.get("bulk_sample_rows", 5)),
+                step=1,
+                help="Tip: focus this field, then use keyboard Up/Down arrows for precise adjustments.",
+                key="bulk_sample_rows"
+            ) if bulk_allow_sampling else 0
 
         if st.button("🪄 Parallel AI Scan", disabled=not selected_multi_tables, type="primary"):
             with st.status("Running parallel scan...", expanded=True) as scan_status:
                 tables_to_scan = st.session_state.get('planner_multiselect', selected_multi_tables)
                 scan_status.write(f"Queued tables: {', '.join(tables_to_scan)}")
                 scan_status.write("Submitting scan tasks...")
-                all_results = analyze_tables_parallel(db, tables_to_scan, schema=selected_schema,
-                                                   allow_sampling=bulk_allow_sampling, sample_limit=bulk_sample_rows)
+                all_results = analyze_tables_parallel(
+                    db, tables_to_scan, schema=selected_schema,
+                    allow_sampling=bulk_allow_sampling, sample_limit=bulk_sample_rows
+                )
                 scan_status.write("Collecting results...")
                 st.session_state['multi_ai_analysis'] = all_results
                 if all_results:
@@ -522,41 +532,26 @@ def render_planner_tab(db):
                 scan_status.update(label="Parallel scan completed", state="complete")
                 st.rerun()
 
-        if st.session_state.get('multi_ai_analysis'):
-            st.write("**Scan results**")
-            st.json(st.session_state.get('multi_ai_analysis', {}))
+        if 'selected_table_info' not in st.session_state and st.session_state.get('multi_ai_analysis'):
+            multi_results = st.session_state['multi_ai_analysis']
+            execution_order = st.session_state.get('all_tables_list', [])
+            if not execution_order:
+                fallback_selected = st.session_state.get('selected_tables', [])
+                if fallback_selected:
+                    execution_order = db.get_execution_order(fallback_selected, selected_schema)
+                    st.session_state['all_tables_list'] = execution_order
+            fallback_table = _pick_first_table_by_execution_order(multi_results.keys(), execution_order)
+            if not fallback_table:
+                first_result_key = next(iter(multi_results.keys()), None)
+                fallback_table = str(first_result_key).split('.')[-1] if first_result_key else None
+            if fallback_table:
+                if fallback_table in execution_order:
+                    _set_active_table_by_index(execution_order.index(fallback_table), execution_order, selected_schema)
+                else:
+                    _set_active_table_by_index(0, execution_order, selected_schema)
 
-    # --- 2. Progress chain ---
-    all_tables_list = st.session_state.get('all_tables_list', [])
-    completed_tables = st.session_state.get('completed_tables', set())
-
-    # --- 3. Single-table workflow ---
-    if 'selected_table_info' not in st.session_state and st.session_state.get('multi_ai_analysis'):
-        multi_results = st.session_state['multi_ai_analysis']
-        execution_order = st.session_state.get('all_tables_list', [])
-        if not execution_order:
-            fallback_selected = st.session_state.get('selected_tables', [])
-            if fallback_selected:
-                execution_order = db.get_execution_order(fallback_selected, selected_schema)
-                st.session_state['all_tables_list'] = execution_order
-
-        fallback_table = _pick_first_table_by_execution_order(
-            multi_results.keys(),
-            execution_order
-        )
-        if not fallback_table:
-            first_result_key = next(iter(multi_results.keys()), None)
-            fallback_table = str(first_result_key).split('.')[-1] if first_result_key else None
-
-        if fallback_table:
-            if fallback_table in execution_order:
-                _set_active_table_by_index(execution_order.index(fallback_table), execution_order, selected_schema)
-            else:
-                _set_active_table_by_index(0, execution_order, selected_schema)
-
-    remaining_count = max(0, len(all_tables_list) - len(completed_tables)) if all_tables_list else 0
-    planning_expanded = remaining_count > 0 and bool(st.session_state.get('selected_table_info') or st.session_state.get('multi_ai_analysis'))
-    with st.expander("2) 📋 Planning", expanded=planning_expanded):
+        all_tables_list = st.session_state.get('all_tables_list', [])
+        completed_tables = st.session_state.get('completed_tables', set())
         render_status_chain(all_tables_list, completed_tables)
 
         selectable_tables = all_tables_list or st.session_state.get('selected_tables', [])
@@ -573,18 +568,12 @@ def render_planner_tab(db):
                 st.rerun()
 
         st.info("ℹ️ ID/PK/FK columns are protected. If AI proposes `mask`, it is automatically forced to `hash`.")
-
         if 'selected_table_info' in st.session_state:
             table_info = st.session_state['selected_table_info']
             table_name = table_info[0] if isinstance(table_info, tuple) else table_info
             schema_name = table_info[1] if isinstance(table_info, tuple) else selected_schema
-
-            # Initialize vital variables
-            violation_found = False
             editor_key = f"plan_editor_{table_name}"
-            where_key = f"where_clause_{table_name}"
 
-            # Synchronization (auto-load)
             multi_results = st.session_state.get('multi_ai_analysis', {})
             if 'ai_analysis' not in st.session_state or st.session_state.get('last_rendered_table') != table_name:
                 found_res = _find_multi_result(multi_results, table_name, schema_name)
@@ -595,54 +584,45 @@ def render_planner_tab(db):
                     st.session_state['ai_analysis'] = found_plan
                     st.session_state['last_ai_audit'] = found_audit or []
                     st.session_state['last_rendered_table'] = table_name
-                    st.session_state['plan_active'] = True  # Set plan active
+                    st.session_state['plan_active'] = True
                 else:
                     if found_error:
+                        violation_found = True
                         st.error(f"❌ Parallel scan failed for `{table_name}`: {found_error}")
-                    # No plan in multi_ai_analysis, try loading from saved DB plans
                     saved_data = db.get_saved_plan(schema_name, table_name)
                     if saved_data:
                         st.session_state['ai_analysis'] = saved_data['plan']
-                        st.session_state['plan_snapshot'] = saved_data['plan']  # Keep plan_snapshot consistent
+                        st.session_state['plan_snapshot'] = saved_data['plan']
                         st.session_state[f"where_clause_{table_name}"] = saved_data['where']
                         st.session_state['plan_origin'] = 'saved'
                         st.session_state['last_rendered_table'] = table_name
-                        st.session_state['plan_active'] = True  # Set plan active
+                        st.session_state['plan_active'] = True
                     else:
-                        # If plan is not found anywhere, clear ai_analysis and set plan_active False
                         if 'ai_analysis' in st.session_state:
                             del st.session_state['ai_analysis']
                         st.session_state['plan_active'] = False
 
             handle_navigation_history(table_name, schema_name)
-            # FK/PK identification
             current_table_col_details = db.get_column_details(table_name, schema_name)
             current_table_fks = [fk[1] for fk in all_fks if fk[0] == table_name]
             if f"pk_{table_name}" not in st.session_state:
                 st.session_state[f"pk_{table_name}"] = db.get_primary_keys(schema_name, table_name)
             real_pks = st.session_state[f"pk_{table_name}"]
-            table_columns = list(current_table_col_details.keys())
 
             left_col, right_col = st.columns([1, 2.2], gap="large")
-
             with left_col:
                 render_planner_action_buttons(db, table_name, schema_name)
-
             with right_col:
-                # --- Data editor and validation ---
                 if 'ai_analysis' in st.session_state and st.session_state['ai_analysis']:
                     plan_df = pd.DataFrame(st.session_state['ai_analysis'])
-
-                    # If DataFrame is empty (no rows)
                     if plan_df.empty:
+                        violation_found = True
                         st.warning("⚠️ Anonymization plan is empty. Run scan again.")
                         return
-
-                    # Defensive column validation
                     available_cols = plan_df.columns.tolist()
                     col_key = next((c for c in available_cols if c.lower() == 'column'), None)
-
                     if col_key is None:
+                        violation_found = True
                         st.error(f"❌ Data structure error. Found columns: {available_cols}")
                         return
 
@@ -655,15 +635,12 @@ def render_planner_tab(db):
                     plan_df['guard'] = plan_df[col_key].apply(
                         lambda c: "ℹ️ Mask disabled for ID safety" if any(token in str(c).lower() for token in ["id", "pk", "fk"]) else ""
                     )
-
-                    # Auto-fix for FK/PK columns: mask is not allowed on identifiers
                     locked_mask = plan_df['status'].str.contains("Locked|Dependent", na=False)
                     id_name_mask = plan_df[col_key].astype(str).str.contains(r"id|pk|fk", case=False, regex=True)
                     if 'strategy' in plan_df.columns:
                         plan_df.loc[(locked_mask | id_name_mask) & (plan_df['strategy'] == 'mask'), 'strategy'] = 'hash'
-
-                    editor_col_1, editor_col_2, editor_col_3 = st.columns([1, 1, 2], gap="small")
-                    with editor_col_3:
+                    editor_left, editor_center, editor_right = st.columns([0.2, 4, 0.2], gap="small")
+                    with editor_center:
                         edited_plan_df = st.data_editor(
                             plan_df,
                             column_config={
@@ -674,94 +651,42 @@ def render_planner_tab(db):
                             },
                             hide_index=True, key=editor_key, width="stretch"
                         )
-                    # Hard post-edit constraint: ID-like columns cannot remain as mask.
                     if 'strategy' in edited_plan_df.columns:
                         edited_id_mask = edited_plan_df[col_key].astype(str).str.contains(r"id|pk|fk", case=False, regex=True)
                         edited_plan_df.loc[edited_id_mask & (edited_plan_df['strategy'] == 'mask'), 'strategy'] = 'hash'
                     st.session_state['current_plan'] = edited_plan_df.to_dict('records')
-
-                    st.markdown("#### Live Data Preview")
-                    preview_rows = st.slider(
-                        "Preview rows",
-                        min_value=5,
-                        max_value=10,
-                        value=5,
-                        key=f"planner_live_preview_rows_{table_name}"
-                    )
-                    live_preview_df = db.read_table(
-                        table_name,
-                        schema_name,
-                        where=st.session_state.get(where_key, ""),
-                        limit=preview_rows
-                    )
-                    st.dataframe(live_preview_df, height=200, width="stretch")
                 else:
                     st.info("💡 Select a table and run analysis to view the anonymization plan.")
-
-                st.write("")
-                if st.button("🚀 Run & Save to Anon", width="stretch", disabled=violation_found, key=f"run_btn_{table_name}"):
-                    clean_plan = get_clean_plan(st.session_state.get('current_plan', []))
-                    with st.spinner(f"Saving to anon.{table_name}..."):
-                        try:
-                            full_data = db.read_table(table_name, schema_name, where=st.session_state.get(where_key, ""))
-                            final_df = db.apply_anonymization_rules(full_data, clean_plan)
-                            db.save_anonymized_table(final_df, table_name, target_schema='anon', source_schema=schema_name)
-                            st.success("✅ Migration completed successfully.")
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-
-                next_t = get_next_table_in_chain(table_name, all_tables_list, completed_tables)
-                confirm_label = "💾 Confirm & Next" if next_t else "🏁 Finish"
-
-            nav_cols = st.columns([1, 1, 2])
-            ordered_tables = all_tables_list or selectable_tables
-            current_idx = st.session_state.get('active_table_index', 0)
-            current_idx = max(0, min(current_idx, len(ordered_tables) - 1)) if ordered_tables else -1
-            with nav_cols[0]:
-                if st.button("⬅️ Back", disabled=(current_idx <= 0), width="stretch", key=f"flow_back_{table_name}"):
-                    _set_active_table_by_index(current_idx - 1, ordered_tables, schema_name)
-                    st.rerun()
-            with nav_cols[1]:
-                if st.button("Next ➡️", disabled=not (ordered_tables and current_idx < len(ordered_tables) - 1), width="stretch", key=f"flow_next_{table_name}"):
-                    _set_active_table_by_index(current_idx + 1, ordered_tables, schema_name)
-                    st.rerun()
-            with nav_cols[2]:
-                if st.button(confirm_label, type="primary", width="stretch", disabled=violation_found, key=f"conf_btn_{table_name}"):
-                    current_plan = st.session_state.get('current_plan') or st.session_state.get('ai_analysis')
-                    current_table_ref = st.session_state.get('selected_table_info')
-                    if current_plan is None or not current_table_ref:
-                        st.error("No active table plan found to save.")
-                        st.stop()
-
-                    save_ok = save_and_move_to_next(
-                        db,
-                        table_name,
-                        schema_name,
-                        current_plan,
-                        st.session_state.get(where_key, ""),
-                        advance=False
-                    )
-                    if not save_ok:
-                        st.stop()
-
-                    current_idx = st.session_state.get('active_table_index', 0)
-                    if ordered_tables and current_idx < len(ordered_tables) - 1:
-                        _set_active_table_by_index(current_idx + 1, ordered_tables, schema_name)
-                        st.success(f"Plan saved. Moving to {ordered_tables[st.session_state['active_table_index']]}...")
-                    else:
-                        st.success("🎉 All tables in the execution chain have been planned!")
-                        st.session_state['plan_active'] = False
-
-                    st.rerun()
-
-            if all_tables_list:
-                in_middle = 0 < current_idx < (len(all_tables_list) - 1)
-                if not in_middle:
-                    st.caption("Execution Order: " + " -> ".join(all_tables_list))
         else:
             st.info("👋 Select a table to start.")
 
-    with st.expander("3) 🔒 Privacy", expanded=False):
+        if st.session_state.get('multi_ai_analysis'):
+            scan_results = st.session_state.get('multi_ai_analysis', {})
+            raw_scan_results_json = html.escape(json.dumps(scan_results, indent=2, ensure_ascii=False))
+            st.markdown("<div style='margin-top: 1rem;'></div>", unsafe_allow_html=True)
+            st.markdown(
+                """
+                <style>
+                    details.system-trace > summary { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 0.55rem 0.75rem; cursor: pointer; font-weight: 600; list-style: none; }
+                    details.system-trace > summary::-webkit-details-marker { display: none; }
+                    details.system-trace > .system-trace-box { margin-top: 0.5rem; max-height: 400px; overflow-y: auto; border: 1px solid #2d2d2d; border-radius: 8px; background: #1e1e1e; padding: 0.7rem 0.85rem; }
+                    details.system-trace > .system-trace-box pre { margin: 0; white-space: pre; }
+                    details.system-trace > .system-trace-box code { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; color: #93c5fd; font-size: 0.8rem; line-height: 1.35; }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+            st.markdown(
+                f"""
+                <details class="system-trace">
+                    <summary>🛠️ System Trace: AI Scan Payload</summary>
+                    <div class="system-trace-box"><pre><code>{raw_scan_results_json}</code></pre></div>
+                </details>
+                """,
+                unsafe_allow_html=True
+            )
+
+    with st.expander("2) 🔗 Integrity & Relationships", expanded=False):
         p_col1, p_col2, p_col3 = st.columns(3)
         with p_col1:
             st.session_state['anonify_level'] = st.selectbox(
@@ -782,7 +707,7 @@ def render_planner_tab(db):
             )
         st.caption("Privacy settings are applied as policy guidance for planning and execution.")
 
-    with st.expander("4) ⚙️ Filter & Consistency", expanded=False):
+    with st.expander("3) 🔍 Filter, Consistency & Preview", expanded=False):
         if 'selected_table_info' in st.session_state:
             table_info = st.session_state['selected_table_info']
             table_name = table_info[0] if isinstance(table_info, tuple) else table_info
@@ -793,7 +718,19 @@ def render_planner_tab(db):
 
             is_locked = st.session_state.get('global_lock_check', False)
             g_val = st.session_state.get('global_integrity_val', '1')
-            row_limit = st.number_input("Row preview limit", min_value=10, max_value=1000, value=100, step=10, key=f"row_limit_{table_name}")
+            preview_limit_col, preview_refresh_col = st.columns([3, 1], gap="small", vertical_alignment="bottom")
+            with preview_limit_col:
+                row_limit = st.number_input(
+                    "Row preview limit",
+                    min_value=1,
+                    max_value=1000,
+                    value=int(st.session_state.get(f"row_limit_{table_name}", 100)),
+                    step=1,
+                    help="Tip: focus this field, then use keyboard Up/Down arrows for precise adjustments.",
+                    key=f"row_limit_{table_name}"
+                )
+            with preview_refresh_col:
+                refresh_preview = st.button("👁️ Refresh Preview", width="stretch", key=f"refresh_preview_{table_name}")
             st.session_state['last_limit_val'] = int(row_limit)
             integrity_where = None
             if is_locked:
@@ -809,7 +746,14 @@ def render_planner_tab(db):
                     integrity_where = f"order_id IN (SELECT order_id FROM {schema_name}.orders WHERE customer_id = {q_val})"
 
             if is_locked and integrity_where:
-                use_suggestion = st.checkbox("Use deep integrity sync", value=True, key=f"suggest_chk_{table_name}")
+                deep_sync_col, deep_sync_help_col = st.columns([12, 1], gap="small")
+                with deep_sync_col:
+                    use_suggestion = st.checkbox("Use deep integrity sync", value=True, key=f"suggest_chk_{table_name}")
+                with deep_sync_help_col:
+                    st.markdown(
+                        '<div style="padding-top: 0.35rem; font-size: 1.05rem;" title="Performs recursive updates across related tables to maintain referential integrity.">⭐</div>',
+                        unsafe_allow_html=True
+                    )
                 if use_suggestion:
                     if st.session_state.get(where_key) != integrity_where:
                         st.session_state[where_key] = integrity_where
@@ -827,6 +771,91 @@ def render_planner_tab(db):
                     value=st.session_state.get(where_key, ""),
                     key=f"in_{where_key}"
                 )
+
+            st.divider()
+            st.markdown("#### Live Data Preview")
+
+            preview_cache_key = f"live_preview_df_{schema_name}_{table_name}"
+            if refresh_preview or preview_cache_key not in st.session_state:
+                st.session_state[preview_cache_key] = db.read_table(
+                    table_name,
+                    schema_name,
+                    where=st.session_state.get(where_key, ""),
+                    limit=int(row_limit)
+                )
+            live_preview_df = st.session_state.get(preview_cache_key)
+            st.dataframe(live_preview_df, height=200, width="stretch")
+
+            next_t = get_next_table_in_chain(table_name, all_tables_list, completed_tables)
+            confirm_label = "💾 Confirm & Next" if next_t else "🏁 Finish"
+            ordered_tables = all_tables_list or selectable_tables
+            current_idx = st.session_state.get('active_table_index', 0)
+            current_idx = max(0, min(current_idx, len(ordered_tables) - 1)) if ordered_tables else -1
+            st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+            with st.container():
+                action_cols = st.columns([1, 2, 1], gap="small")
+                with action_cols[0]:
+                    if st.button("⬅️ Back", disabled=(current_idx <= 0), width="stretch", key=f"flow_back_{table_name}"):
+                        _set_active_table_by_index(current_idx - 1, ordered_tables, schema_name)
+                        st.rerun()
+                with action_cols[1]:
+                    if st.button("🚀 Run & Save to Anon", type="primary", width="stretch", disabled=violation_found, key=f"run_btn_{table_name}"):
+                        clean_plan = get_clean_plan(st.session_state.get('current_plan', []))
+                        with st.spinner(f"Saving to anon.{table_name}..."):
+                            try:
+                                table_ready, table_create_msg = db.create_anonymized_table(
+                                    source_schema=schema_name,
+                                    table_name=table_name,
+                                    target_db=db.target_db_url.split("/")[-1]
+                                )
+                                if not table_ready:
+                                    st.error(f"❌ Failed preparing target table: {table_create_msg}")
+                                    st.stop()
+                                full_data = db.read_table(table_name, schema_name, where=st.session_state.get(where_key, ""))
+                                final_df = db.apply_anonymization_rules(full_data, clean_plan)
+                                db.save_anonymized_table(final_df, table_name, target_schema='anon', source_schema=schema_name)
+                                st.success("✅ Migration completed successfully.")
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                with action_cols[2]:
+                    if st.button("Next ➡️", disabled=not (ordered_tables and current_idx < len(ordered_tables) - 1), width="stretch", key=f"flow_next_{table_name}"):
+                        _set_active_table_by_index(current_idx + 1, ordered_tables, schema_name)
+                        st.rerun()
+
+                st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+                confirm_cols = st.columns([2, 2], gap="small")
+                with confirm_cols[1]:
+                    if st.button(confirm_label, type="primary", width="stretch", disabled=violation_found, key=f"conf_btn_{table_name}"):
+                        current_plan = st.session_state.get('current_plan') or st.session_state.get('ai_analysis')
+                        current_table_ref = st.session_state.get('selected_table_info')
+                        if current_plan is None or not current_table_ref:
+                            st.error("No active table plan found to save.")
+                            st.stop()
+
+                        save_ok = save_and_move_to_next(
+                            db,
+                            table_name,
+                            schema_name,
+                            current_plan,
+                            st.session_state.get(where_key, ""),
+                            advance=False
+                        )
+                        if not save_ok:
+                            st.stop()
+
+                        current_idx = st.session_state.get('active_table_index', 0)
+                        if ordered_tables and current_idx < len(ordered_tables) - 1:
+                            _set_active_table_by_index(current_idx + 1, ordered_tables, schema_name)
+                            st.success(f"Plan saved. Moving to {ordered_tables[st.session_state['active_table_index']]}...")
+                        else:
+                            st.success("🎉 All tables in the execution chain have been planned!")
+                            st.session_state['plan_active'] = False
+
+                        st.rerun()
+            if all_tables_list:
+                in_middle = 0 < current_idx < (len(all_tables_list) - 1)
+                if not in_middle:
+                    st.caption("Execution Order: " + " -> ".join(all_tables_list))
         else:
             st.info("Select a table in Planning to configure filters.")
 
@@ -900,13 +929,12 @@ def render_tabs(db):
         render_comparison_tab(db)
 
     with tabs[2]:
-        # Audit log fetch
-        log_query = "SELECT * FROM metadata.audit_log ORDER BY execution_time DESC LIMIT 50"
-        try:
-            log_df = pd.read_sql(log_query, db.engine)
-            st.dataframe(log_df, width="stretch")
-        except:
+        # Audit log fetch (safe on first-run metadata bootstrapping)
+        log_df = db.get_audit_logs(limit=50)
+        if log_df.empty:
             st.info("No audit logs found yet.")
+        else:
+            st.dataframe(log_df, width="stretch")
 
 
 def sync_anon_ddl_with_plan(db, target_schema, table_name, plan):
@@ -932,7 +960,7 @@ def sync_anon_ddl_with_plan(db, target_schema, table_name, plan):
                 current_type = conn.execute(check_query, {"s": target_schema, "t": table_name, "c": col}).scalar()
 
                 if current_type and any(num_type in current_type.lower() for num_type in ['int', 'numeric', 'double', 'real']):
-                    print(f"🔧 DDL Sync: Menjam {table_name}.{col} iz {current_type} u VARCHAR(255)...")
+                    logger.info(f"✅ [DB_MANAGER] DDL sync: converting {table_name}.{col} from {current_type} to VARCHAR(255)")
 
                     alter_query = text(f"""
                         ALTER TABLE "{target_schema}"."{table_name}"
@@ -941,7 +969,7 @@ def sync_anon_ddl_with_plan(db, target_schema, table_name, plan):
                     """)
                     conn.execute(alter_query)
                     conn.commit()
-                    print(f"✅ DDL Aligned: {table_name}.{col} converted to VARCHAR")
+                    logger.info(f"✅ [DB_MANAGER] DDL aligned: {table_name}.{col} converted to VARCHAR")
 
 def get_all_foreign_keys(db, schema_name):
     """
@@ -972,7 +1000,7 @@ def get_all_foreign_keys(db, schema_name):
             result = conn.execute(query, {"s": schema_name})
             return [(row[0], row[1], row[2], row[3]) for row in result]
     except Exception as e:
-        print(f"❌ Error fetching foreign keys: {e}")
+        logger.error(f"❌ [DB_MANAGER] Error fetching foreign keys: {e}")
         return []
 
 def render_global_preview_section(db):
