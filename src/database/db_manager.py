@@ -6,6 +6,7 @@ import random
 import logging
 import re
 import secrets
+from decimal import Decimal, InvalidOperation
 from datetime import timedelta
 from urllib.parse import quote_plus
 
@@ -376,6 +377,8 @@ class DBManager:
         quoted_target_schema = self.quote_identifier(target_schema)
         quoted_table = self.quote_identifier(table_name)
         target_db_name = target_db or (make_url(self.target_db_url).database or "target_db")
+        source_db_name = make_url(self.source_db_url).database or "source_db"
+        cross_database_mode = target_db_name != source_db_name
 
         create_schema_sql = text(f"CREATE SCHEMA IF NOT EXISTS {quoted_target_schema}")
         ctas_sql = text(
@@ -394,44 +397,60 @@ class DBManager:
             target_engine_for_op = temp_engine
 
         try:
-            with target_engine_for_op.connect() as target_conn:
-                with target_conn.begin():
-                    target_conn.execute(create_schema_sql)
-                    target_conn.execute(ctas_sql)
-                    logger.info(
-                        f"✅ [DB_MANAGER] Created {target_db_name}.{target_schema}.{table_name} "
-                        f"from source schema {source_schema} using CTAS."
-                    )
-                    return True, "created_via_ctas"
-        except Exception as e:
-            logger.warning(
-                f"⚠️ [DB_MANAGER] CTAS unavailable for {table_name} ({source_schema} -> {target_db_name}). "
-                f"Falling back to type-mirror create. Reason: {e}"
-            )
-            try:
+            if not cross_database_mode:
                 with target_engine_for_op.connect() as target_conn:
                     with target_conn.begin():
-                        self._ensure_target_table_mirror(
-                            target_conn,
-                            source_schema=source_schema,
-                            target_schema=target_schema,
-                            table_name=table_name
+                        target_conn.execute(create_schema_sql)
+                        target_conn.execute(text(f"SET search_path TO {quoted_target_schema}, public;"))
+                        target_conn.execute(ctas_sql)
+                        logger.info(
+                            f"✅ [DB_MANAGER] Created {target_db_name}.{target_schema}.{table_name} "
+                            f"from source schema {source_schema} using CTAS."
                         )
-                logger.info(
-                    f"✅ [DB_MANAGER] Created/aligned {target_db_name}.{target_schema}.{table_name} "
-                    f"from source schema {source_schema} using mirror fallback."
-                )
-                return True, "created_via_mirror_fallback"
-            except Exception as fallback_error:
-                logger.error(
-                    f"❌ [DB_MANAGER] Failed to create anonymized table {target_schema}.{table_name}: {fallback_error}"
-                )
-                return False, str(fallback_error)
+                        return True, "created_via_ctas"
+        except Exception as e:
+            # CTAS failures are expected in some environments. Fall through silently to mirror create.
+            pass
+        try:
+            with target_engine_for_op.connect() as target_conn:
+                with target_conn.begin():
+                    target_conn.execute(text(f"SET search_path TO {quoted_target_schema}, public;"))
+                    self._ensure_target_table_mirror(
+                        target_conn,
+                        source_schema=source_schema,
+                        target_schema=target_schema,
+                        table_name=table_name
+                    )
+            logger.info(
+                f"✅ [DB_MANAGER] Table aligned via mirror: {target_db_name}.{target_schema}.{table_name}"
+            )
+            return True, "created_via_mirror"
+        except Exception as fallback_error:
+            logger.error(
+                f"❌ [DB_MANAGER] Failed to create anonymized table {target_schema}.{table_name}: {fallback_error}"
+            )
+            return False, str(fallback_error)
         finally:
             if temp_engine is not None:
                 temp_engine.dispose()
 
-    def _cast_dataframe_to_table_types(self, df, active_conn, schema_name, table_name):
+    @staticmethod
+    def _coerce_decimal_for_sql(value):
+        """Ensures NUMERIC/DECIMAL-compatible python values before INSERT."""
+        if value is None or pd.isna(value):
+            return None
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    def _cast_dataframe_to_table_types(self, df, active_conn, schema_name, table_name, preserve_native_columns=None):
         """
         Casts DataFrame values to match DB column types before insertion.
         This prevents invalid input syntax errors for NUMERIC/BIGINT columns.
@@ -452,17 +471,26 @@ class DBManager:
         ).fetchall()
         col_types = {row[0]: str(row[1]).lower() for row in rows}
 
+        preserve_native_columns = set(preserve_native_columns or [])
         cast_df = df.copy()
         for col_name, col_type in col_types.items():
             if col_name not in cast_df.columns:
                 continue
 
             if any(token in col_type for token in ["bigint", "integer", "smallint", "int"]):
+                if col_name in preserve_native_columns:
+                    cast_df[col_name] = cast_df[col_name].apply(
+                        lambda v: v if v is None or pd.isna(v) else int(v)
+                    )
+                    continue
                 numeric_series = pd.to_numeric(cast_df[col_name], errors='coerce')
                 cast_df[col_name] = numeric_series.apply(
                     lambda v: int(v) if pd.notnull(v) and float(v).is_integer() else (None if pd.notnull(v) else None)
                 )
             elif any(token in col_type for token in ["numeric", "decimal", "double", "real"]):
+                if col_name in preserve_native_columns:
+                    cast_df[col_name] = cast_df[col_name].apply(self._coerce_decimal_for_sql)
+                    continue
                 coerced = pd.to_numeric(cast_df[col_name], errors='coerce')
                 invalid_mask = coerced.isna() & cast_df[col_name].notna()
                 if invalid_mask.any():
@@ -496,7 +524,7 @@ class DBManager:
 
         return cast_df
 
-    def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None, source_schema='public'):
+    def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None, source_schema='public', preserve_native_columns=None):
         """
         Snima DataFrame u ciljnu tabelu. Ako je 'conn' prisutan, ostaje u istoj sesiji.
         """
@@ -504,7 +532,9 @@ class DBManager:
 
         def _run_save(active_conn):
             self._ensure_target_table_mirror(active_conn, source_schema, target_schema, table_name)
-            safe_df = self._cast_dataframe_to_table_types(df, active_conn, target_schema, table_name)
+            safe_df = self._cast_dataframe_to_table_types(
+                df, active_conn, target_schema, table_name, preserve_native_columns=preserve_native_columns
+            )
 
             # Osiguravamo šemu ako ne postoji
             active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.quote_identifier(target_schema)}"))
@@ -661,7 +691,11 @@ class DBManager:
             strategy = str(item.get('strategy', 'keep')).lower()
             original_series = df_anon[col].copy() if col in df_anon.columns else None
 
-            if not col or col not in df_anon.columns or strategy == 'keep':
+            if not col or col not in df_anon.columns:
+                continue
+            if strategy == 'keep':
+                # Strict keep: preserve original python/native values without string conversion.
+                df_anon[col] = original_series
                 continue
 
             # --- 3. LOGIKA PO STRATEGIJAMA ---
@@ -836,9 +870,12 @@ class DBManager:
             schema_name TEXT,
             table_name TEXT,
             privacy_score INTEGER,
+            estimated_tokens INTEGER,
             salt_used TEXT,
             status TEXT
         );
+        ALTER TABLE _anon_metadata.audit_log
+            ADD COLUMN IF NOT EXISTS estimated_tokens INTEGER;
         CREATE TABLE IF NOT EXISTS _anon_metadata.pending_fks (
             id SERIAL PRIMARY KEY,
             target_schema TEXT,
@@ -1030,6 +1067,31 @@ class DBManager:
                 conn.commit()
         except Exception as e:
             logger.error(f"❌ [DB_MANAGER] Audit logging error: {e}")
+
+    def log_unified_ai_scan(self, user, schema, tables, status="UNIFIED_AI_SCAN", score=0, salt="unified_batch", estimated_tokens=0):
+        """
+        Records one audit_log event for a unified batch AI scan.
+        Stores analyzed table list as JSON string in table_name field.
+        """
+        table_list_payload = json.dumps(list(tables or []), ensure_ascii=False)
+        query = text("""
+            INSERT INTO _anon_metadata.audit_log (user_name, schema_name, table_name, privacy_score, estimated_tokens, salt_used, status)
+            VALUES (:u, :s, :t, :score, :estimated_tokens, :salt, :status)
+        """)
+        try:
+            with self.target_engine.connect() as conn:
+                conn.execute(query, {
+                    "u": user or "system",
+                    "s": schema,
+                    "t": table_list_payload,
+                    "score": int(score or 0),
+                    "estimated_tokens": int(estimated_tokens or 0),
+                    "salt": salt,
+                    "status": status,
+                })
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ [DB_MANAGER] Unified AI audit logging error: {e}")
 
     def get_audit_logs(self, limit=50):
         query = text(f"""
@@ -1670,7 +1732,11 @@ class DBManager:
                         table_name,
                         target_schema,
                         conn=conn,
-                        source_schema=selected_schema
+                        source_schema=selected_schema,
+                        preserve_native_columns=[
+                            i.get("column") for i in plan
+                            if isinstance(i, dict) and str(i.get("strategy", "keep")).lower() == "keep"
+                        ],
                     )
 
                 # --- FINALNI KORAK: RE-HOOK ---
@@ -1704,6 +1770,29 @@ class DBManager:
         except Exception as e:
             logger.error(f"❌ [AI_SCAN] Error fetching sample for {schema}.{table}: {e}")
             return []
+
+    def get_unified_ai_scan_payload(self, schema, tables, sample_limit=5):
+        """
+        Builds table-scoped metadata + representative row samples for a unified AI request.
+        Always caps row sampling to 5 rows per table for scalability.
+        """
+        payload = []
+        strict_limit = max(0, min(int(sample_limit or 0), 5))
+
+        for table_name in tables or []:
+            column_details = self.get_column_details(table_name, schema) or {}
+            sample_rows = self.get_table_sample(schema, table_name, limit=strict_limit) if strict_limit > 0 else []
+            payload.append({
+                "schema": schema,
+                "table": table_name,
+                "columns": [
+                    {"column": col_name, "type": details.get("type", "")}
+                    for col_name, details in column_details.items()
+                ],
+                "sample_rows": sample_rows[:5],
+            })
+
+        return payload
 
     def get_tables(self, schema_name='public'):
         """

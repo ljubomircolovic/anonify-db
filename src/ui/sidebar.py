@@ -1,9 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 import streamlit as st
 from src.database.db_manager import DBManager
-import time
 import os
-from src.ui.batch_processor import handle_batch_execution
 
 
 def get_all_connections():
@@ -36,21 +34,6 @@ def render_sidebar(agent):
 
         db = st.session_state['db']
 
-        # --- SECURITY SEKCIJA ---
-        st.subheader("🔑 Security")
-        st.session_state['salt_input'] = st.text_input(
-            "Secret Salt",
-            value=st.session_state.get('salt_input', 'default_salt'),
-            type="password",
-            help=(
-                "Salting: A unique secret string added to your data before masking. "
-                "This ensures high security and guarantees consistent output within this plan."
-            )
-        )
-        st.session_state['selected_locale'] = st.selectbox("Target Locale", options=["de", "us"], index=0)
-
-        st.divider()
-
         # --- DATA SOURCE ---
         st.subheader("📂 Data Source")
         source_mode = st.radio("Input Type", ["PostgreSQL Database", "CSV Files"])
@@ -79,34 +62,8 @@ def render_sidebar(agent):
 
                     if selected_tables:
                         ordered_tables = st.session_state.get('all_tables_list', [])
-
-                        # --- VIZUELNI STATUS (OVO JE DOBRO) ---
-                        status_icons = []
-                        for t in ordered_tables:
-                            if t in st.session_state.get('completed_tables', set()):
-                                status_icons.append(f"✅ `{t}`")
-                            else:
-                                # Provera u bazi ako nije u session_state
-                                if db.get_saved_plan(selected_schema, t):
-                                    status_icons.append(f"✅ `{t}`")
-                                    if 'completed_tables' not in st.session_state: st.session_state['completed_tables'] = set()
-                                    st.session_state['completed_tables'].add(t)
-                                else:
-                                    status_icons.append(f"⏳ `{t}`")
-
-                        st.info(f"⛓️ **Execution Order:** \n{' ➔ '.join(status_icons)}")
-
-                        # --- DUGME ZA START ---
-                        if st.button("🚀 Start Planning / Load", type="primary", width="stretch"):
-                            # Postavljamo na prvu tabelu SAMO kad se klikne Start
-                            first_table = ordered_tables[0]
-                            st.session_state['selected_table_info'] = (first_table, selected_schema)
-
-                            # Čistimo stare podatke da bi Planner učitao sveže
-                            for key in ['ai_analysis', 'current_plan', 'plan_snapshot', 'last_rendered_table']:
-                                if key in st.session_state: del st.session_state[key]
-
-                            st.rerun()
+                        ordered_text = " ➔ ".join(ordered_tables) if ordered_tables else "-"
+                        st.info(f"⛓️ **Execution Order:**\n{ordered_text}")
 
                     else:
                         st.warning("👈 Please select tables.")
