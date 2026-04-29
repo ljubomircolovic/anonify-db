@@ -1,4 +1,4 @@
-# Use a slim Python image for efficiency
+﻿# Use a slim Python image for efficiency
 FROM python:3.11-slim
 
 # Set the working directory inside the container
@@ -17,8 +17,8 @@ COPY . .
 RUN mkdir -p logs exports
 
 # U Dockerfile dodaj pre CMD-a ili Run-a
-ENV LANG C.UTF-8
-ENV LC_ALL C.UTF-8
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 # Command to run the application
 CMD ["python", "src/main.py"]
