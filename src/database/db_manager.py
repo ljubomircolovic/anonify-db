@@ -38,11 +38,14 @@ class DBManager:
         self.target_db_url = self.source_db_url
         self.db_url = self.target_db_url
         self.metadata_schema = "_anon_metadata"
+        self.runtime_salt = os.getenv("ANONIFY_SALT", "default_plan_salt")
 
         # Source engine: reads schema/tables from the original database
         self.source_engine = create_engine(
             self.source_db_url,
             connect_args={'client_encoding': 'utf8'},
+            pool_pre_ping=True,
+            pool_recycle=1800,
             pool_size=10,
             max_overflow=20
         )
@@ -50,19 +53,38 @@ class DBManager:
         self.target_engine = create_engine(
             self.target_db_url,
             connect_args={'client_encoding': 'utf8'},
+            pool_pre_ping=True,
+            pool_recycle=1800,
             pool_size=10,
             max_overflow=20
         )
         # Backward compatibility for modules still using db.engine directly
         self.engine = self.target_engine
 
-        # 2. Inicijalizacija Fakera (DACH + US regioni kao što si tražio)
-        self.fake = Faker(['de_DE', 'en_US'])
+        # 2. Inicijalizacija Fakera (strict global locale for deterministic shadow parity)
+        self.fake = Faker("en_US")
+        self._apply_runtime_seed()
 
         # 3. Inicijalizacija meta-tabela
         self._init_metadata_table()
 
         logger.info("✅ [DB_MANAGER] DBManager successfully initialized with Connection Pool.")
+
+    def _runtime_seed_int(self):
+        seed_hex = hashlib.sha256(str(self.runtime_salt).encode("utf-8")).hexdigest()[:16]
+        return int(seed_hex, 16)
+
+    def _apply_runtime_seed(self):
+        """
+        Aligns random/Faker streams with ANONIFY_SALT so legacy and shadow paths
+        produce deterministic equivalent outputs.
+        """
+        seed_value = self._runtime_seed_int()
+        random.seed(seed_value)
+        try:
+            self.fake.seed_instance(seed_value)
+        except Exception:
+            pass
 
     @staticmethod
     def _generate_plan_salt():
@@ -212,6 +234,8 @@ class DBManager:
         self.target_engine = create_engine(
             self.target_db_url,
             connect_args={'client_encoding': 'utf8'},
+            pool_pre_ping=True,
+            pool_recycle=1800,
             pool_size=10,
             max_overflow=20
         )
@@ -310,6 +334,9 @@ class DBManager:
 
     def _ensure_target_table_mirror(self, active_conn, source_schema, target_schema, table_name):
         """Ensures target table exists and mirrors source DDL types exactly."""
+        active_conn.execute(text(
+            f"SET search_path TO {self.quote_identifier(target_schema)}, public;"
+        ))
         exists_sql = text("""
             SELECT EXISTS (
                 SELECT 1
@@ -326,6 +353,7 @@ class DBManager:
         quoted_table_name = self.quote_identifier(table_name)
         source_rows = self._get_source_type_signatures(source_schema, table_name)
         source_types = {row[0]: row[1] for row in source_rows}
+        created_now = False
 
         if not exists:
             active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quoted_target_schema}"))
@@ -337,35 +365,166 @@ class DBManager:
                 f"CREATE TABLE {quoted_target_schema}.{quoted_table_name} ({columns_sql})"
             ))
             logger.info(f"✅ [DB_MANAGER] Created target table {target_schema}.{table_name} from source schema {source_schema}")
-            return
+            created_now = True
 
-        # Existing table: enforce exact source type signatures column-by-column
-        type_signature_sql = text("""
-            SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS column_type
-            FROM pg_attribute a
-            JOIN pg_class c ON a.attrelid = c.oid
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = :schema_name
-              AND c.relname = :table_name
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-            ORDER BY a.attnum
+        if not created_now:
+            # Existing table: enforce exact source type signatures column-by-column
+            type_signature_sql = text("""
+                SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS column_type
+                FROM pg_attribute a
+                JOIN pg_class c ON a.attrelid = c.oid
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = :schema_name
+                  AND c.relname = :table_name
+                  AND a.attnum > 0
+                  AND NOT a.attisdropped
+                ORDER BY a.attnum
+            """)
+            target_rows = active_conn.execute(
+                type_signature_sql,
+                {"schema_name": target_schema, "table_name": table_name}
+            ).fetchall()
+            target_types = {row[0]: row[1] for row in target_rows}
+
+            for column_name, source_type in source_types.items():
+                if column_name in target_types and target_types[column_name] != source_type:
+                    quoted_col = self.quote_identifier(column_name)
+                    active_conn.execute(text(
+                        f"ALTER TABLE {quoted_target_schema}.{quoted_table_name} "
+                        f"ALTER COLUMN {quoted_col} TYPE {source_type} "
+                        f"USING {quoted_col}::{source_type}"
+                    ))
+                    logger.info(f"✅ [DB_MANAGER] Aligned type {target_schema}.{table_name}.{column_name} -> {source_type}")
+
+        self._sync_pk_unique_constraints(active_conn, source_schema, target_schema, table_name)
+        self._sync_non_constraint_indexes(active_conn, source_schema, target_schema, table_name)
+
+    @staticmethod
+    def _rewrite_schema_references(sql_def, source_schema, target_schema):
+        source_schema_q = f'"{source_schema}"'
+        target_schema_q = f'"{target_schema}"'
+        rewritten = str(sql_def)
+        rewritten = rewritten.replace(f"{source_schema_q}.", f"{target_schema_q}.")
+        rewritten = rewritten.replace(f"{source_schema}.", f"{target_schema}.")
+        return rewritten
+
+    def _constraint_exists(self, active_conn, schema_name, table_name, constraint_name):
+        exists_sql = text("""
+            SELECT 1
+            FROM information_schema.table_constraints
+            WHERE table_schema = :schema_name
+              AND table_name = :table_name
+              AND constraint_name = :constraint_name
+            LIMIT 1
         """)
-        target_rows = active_conn.execute(
-            type_signature_sql,
-            {"schema_name": target_schema, "table_name": table_name}
-        ).fetchall()
-        target_types = {row[0]: row[1] for row in target_rows}
+        row = active_conn.execute(
+            exists_sql,
+            {
+                "schema_name": schema_name,
+                "table_name": table_name,
+                "constraint_name": constraint_name,
+            },
+        ).fetchone()
+        return row is not None
 
-        for column_name, source_type in source_types.items():
-            if column_name in target_types and target_types[column_name] != source_type:
-                quoted_col = self.quote_identifier(column_name)
-                active_conn.execute(text(
-                    f"ALTER TABLE {quoted_target_schema}.{quoted_table_name} "
-                    f"ALTER COLUMN {quoted_col} TYPE {source_type} "
-                    f"USING {quoted_col}::{source_type}"
+    def _index_exists(self, active_conn, schema_name, index_name):
+        exists_sql = text("SELECT to_regclass(:idx_name)")
+        reg_name = f'"{schema_name}"."{index_name}"'
+        row = active_conn.execute(exists_sql, {"idx_name": reg_name}).fetchone()
+        return bool(row and row[0])
+
+    def _sync_pk_unique_constraints(self, active_conn, source_schema, target_schema, table_name):
+        source_constraints_sql = text("""
+            SELECT con.conname, pg_get_constraintdef(con.oid) AS condef
+            FROM pg_constraint con
+            JOIN pg_class rel ON rel.oid = con.conrelid
+            JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+            WHERE nsp.nspname = :schema_name
+              AND rel.relname = :table_name
+              AND con.contype IN ('p', 'u')
+            ORDER BY con.contype DESC, con.conname ASC
+        """)
+        with self.source_engine.connect() as source_conn:
+            source_rows = source_conn.execute(
+                source_constraints_sql,
+                {"schema_name": source_schema, "table_name": table_name},
+            ).fetchall()
+
+        for row in source_rows:
+            con_name, con_def = row[0], row[1]
+            if self._constraint_exists(active_conn, target_schema, table_name, con_name):
+                continue
+            rewritten_def = self._rewrite_schema_references(con_def, source_schema, target_schema)
+            alter_sql = text(
+                f'ALTER TABLE {self.quote_identifier(target_schema)}.{self.quote_identifier(table_name)} '
+                f'ADD CONSTRAINT {self.quote_identifier(con_name)} {rewritten_def}'
+            )
+            active_conn.execute(alter_sql)
+
+    def _sync_non_constraint_indexes(self, active_conn, source_schema, target_schema, table_name):
+        source_indexes_sql = text("""
+            SELECT idx.indexname, idx.indexdef
+            FROM pg_indexes idx
+            LEFT JOIN pg_class cls ON cls.relname = idx.indexname
+            LEFT JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace AND nsp.nspname = idx.schemaname
+            LEFT JOIN pg_index pi ON pi.indexrelid = cls.oid
+            LEFT JOIN pg_constraint con ON con.conindid = pi.indexrelid
+            WHERE idx.schemaname = :schema_name
+              AND idx.tablename = :table_name
+              AND con.oid IS NULL
+            ORDER BY idx.indexname ASC
+        """)
+        with self.source_engine.connect() as source_conn:
+            source_rows = source_conn.execute(
+                source_indexes_sql,
+                {"schema_name": source_schema, "table_name": table_name},
+            ).fetchall()
+
+        for row in source_rows:
+            index_name, index_def = row[0], row[1]
+            if self._index_exists(active_conn, target_schema, index_name):
+                continue
+            rewritten_def = self._rewrite_schema_references(index_def, source_schema, target_schema)
+            active_conn.execute(text(rewritten_def))
+
+    def sync_foreign_keys_for_tables(self, source_schema, target_schema, ordered_tables):
+        if not ordered_tables:
+            return
+        fk_sql = text("""
+            SELECT con.conname, rel.relname AS table_name, pg_get_constraintdef(con.oid) AS condef
+            FROM pg_constraint con
+            JOIN pg_class rel ON rel.oid = con.conrelid
+            JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+            WHERE nsp.nspname = :schema_name
+              AND rel.relname = :table_name
+              AND con.contype = 'f'
+            ORDER BY con.conname ASC
+        """)
+        with self.target_engine.connect() as target_conn:
+            with target_conn.begin():
+                target_conn.execute(text(
+                    f"SET search_path TO {self.quote_identifier(target_schema)}, public;"
                 ))
-                logger.info(f"✅ [DB_MANAGER] Aligned type {target_schema}.{table_name}.{column_name} -> {source_type}")
+                for table_name in ordered_tables:
+                    with self.source_engine.connect() as source_conn:
+                        fk_rows = source_conn.execute(
+                            fk_sql,
+                            {"schema_name": source_schema, "table_name": table_name},
+                        ).fetchall()
+                    for fk_row in fk_rows:
+                        con_name, child_table, con_def = fk_row[0], fk_row[1], fk_row[2]
+                        if self._constraint_exists(target_conn, target_schema, child_table, con_name):
+                            continue
+                        rewritten_def = self._rewrite_schema_references(con_def, source_schema, target_schema)
+                        try:
+                            target_conn.execute(text(
+                                f'ALTER TABLE {self.quote_identifier(target_schema)}.{self.quote_identifier(child_table)} '
+                                f'ADD CONSTRAINT {self.quote_identifier(con_name)} {rewritten_def}'
+                            ))
+                        except Exception as e:
+                            logger.warning(
+                                f"⚠️ [DB_MANAGER] FK sync warning for {child_table}.{con_name}: {e}"
+                            )
 
     def create_anonymized_table(self, source_schema, table_name, target_db, target_schema="anon"):
         """
@@ -524,6 +683,54 @@ class DBManager:
 
         return cast_df
 
+    def _infer_sql_type_from_series(self, series):
+        if pd.api.types.is_bool_dtype(series):
+            return "BOOLEAN"
+        if pd.api.types.is_integer_dtype(series):
+            return "BIGINT"
+        if pd.api.types.is_float_dtype(series):
+            return "DOUBLE PRECISION"
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return "TIMESTAMP"
+        return "VARCHAR(255)"
+
+    def _ensure_target_table_from_dataframe(self, active_conn, target_schema, table_name, df):
+        """
+        Auto-DDL fallback for empty/new Docker environments where source table
+        metadata may be unavailable at write time.
+        """
+        quoted_target_schema = self.quote_identifier(target_schema)
+        quoted_table_name = self.quote_identifier(table_name)
+        active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quoted_target_schema}"))
+        exists_sql = text("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = :target_schema
+                  AND table_name = :table_name
+            )
+        """)
+        exists = active_conn.execute(
+            exists_sql, {"target_schema": target_schema, "table_name": table_name}
+        ).scalar()
+        if exists:
+            return
+        if df is None or df.empty or len(df.columns) == 0:
+            # Last-resort minimal table so downstream write path does not crash.
+            active_conn.execute(
+                text(f"CREATE TABLE IF NOT EXISTS {quoted_target_schema}.{quoted_table_name} (id BIGINT)")
+            )
+            return
+
+        column_defs = []
+        for col in df.columns:
+            sql_type = self._infer_sql_type_from_series(df[col])
+            column_defs.append(f'{self.quote_identifier(col)} {sql_type}')
+        ddl = ", ".join(column_defs)
+        active_conn.execute(
+            text(f"CREATE TABLE IF NOT EXISTS {quoted_target_schema}.{quoted_table_name} ({ddl})")
+        )
+
     def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None, source_schema='public', preserve_native_columns=None):
         """
         Snima DataFrame u ciljnu tabelu. Ako je 'conn' prisutan, ostaje u istoj sesiji.
@@ -531,7 +738,14 @@ class DBManager:
         from sqlalchemy import text
 
         def _run_save(active_conn):
-            self._ensure_target_table_mirror(active_conn, source_schema, target_schema, table_name)
+            try:
+                self._ensure_target_table_mirror(active_conn, source_schema, target_schema, table_name)
+            except Exception as mirror_err:
+                logger.warning(
+                    f"⚠️ [DB_MANAGER] Mirror DDL failed for {target_schema}.{table_name}: {mirror_err}. "
+                    "Falling back to DataFrame-based auto-DDL."
+                )
+                self._ensure_target_table_from_dataframe(active_conn, target_schema, table_name, df)
             safe_df = self._cast_dataframe_to_table_types(
                 df, active_conn, target_schema, table_name, preserve_native_columns=preserve_native_columns
             )
@@ -680,6 +894,7 @@ class DBManager:
                 return df_anon
 
         effective_salt = salt or "default_plan_salt"
+        self._apply_runtime_seed()
 
         for item in table_plan:
             # --- 2. KLJUČNA ISPRAVKA ZA TVOJ BUG ---

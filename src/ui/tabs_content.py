@@ -9,6 +9,7 @@ import html
 import numbers
 from decimal import Decimal
 from sqlalchemy import text
+from src.core.domain.services.unsaved_changes_guard import UnsavedChangesGuard
 # Shared planner modules
 from src.ui.planner import analyze_tables_parallel
 from src.ui.planner_logic import validate_plan_row, calculate_privacy_score, get_clean_plan
@@ -16,6 +17,7 @@ from src.ui.planner_components import render_ai_audit_log
 from src.ui.planner_navigation import handle_navigation_history, get_next_table_in_chain
 
 logger = logging.getLogger(__name__)
+unsaved_changes_guard = UnsavedChangesGuard()
 def _get_live_preview_once(db, schema_name, table_name, where_clause, row_limit, force_refresh=False):
     """Session-level lock/cache to avoid duplicate preview reads on reruns."""
     cache_df_key = f"live_preview_df_{schema_name}_{table_name}"
@@ -157,7 +159,44 @@ def _set_current_plan_data(schema_name, table_name, plan_rows, where_clause, dir
 
 def _get_unsaved_tables():
     current_data = st.session_state.get("current_plan_data", {})
-    return [k for k, v in current_data.items() if isinstance(v, dict) and v.get("dirty")]
+    return unsaved_changes_guard.get_unsaved_tables(current_data)
+
+
+def _is_sensitive_row(row):
+    if not isinstance(row, dict):
+        return False
+    return bool(row.get("is_sensitive", row.get("is_pii", False)))
+
+
+def _get_sensitive_keep_violations(plan_rows, table_name=None):
+    violations = []
+    for row in plan_rows or []:
+        if not isinstance(row, dict):
+            continue
+        if not _is_sensitive_row(row):
+            continue
+        strategy = str(row.get("strategy", "keep")).lower()
+        if strategy == "keep":
+            col_name = str(row.get("column", ""))
+            if table_name:
+                violations.append(f"{table_name}.{col_name}")
+            else:
+                violations.append(col_name)
+    return violations
+
+
+def _collect_sensitive_keep_violations(db, schema_name, table_names):
+    violations = []
+    current_data = st.session_state.get("current_plan_data", {})
+    for table_name in table_names or []:
+        table_key = f"{schema_name}.{table_name}"
+        if table_key in current_data and isinstance(current_data.get(table_key), dict):
+            plan_rows = current_data.get(table_key, {}).get("plan", [])
+        else:
+            saved = db.get_saved_plan(schema_name, table_name)
+            plan_rows = saved.get("plan", []) if saved else []
+        violations.extend(_get_sensitive_keep_violations(plan_rows, table_name))
+    return violations
 
 
 def _finalize_close_project():
@@ -182,7 +221,14 @@ def _render_finalize_confirmation_dialog():
             _finalize_close_project()
 
 
-def run_all_anonymization(db, schema_name, execution_order, progress_slot=None, status_slot=None):
+def run_all_anonymization(
+    db,
+    schema_name,
+    execution_order,
+    progress_slot=None,
+    status_slot=None,
+    write_mode="overwrite",
+):
     if not execution_order:
         st.error("No execution order found. Run AI scan first.")
         return False
@@ -191,6 +237,15 @@ def run_all_anonymization(db, schema_name, execution_order, progress_slot=None, 
     status = status_slot if status_slot is not None else st.empty()
     progress.progress(0.0)
     total = len(execution_order)
+
+    if str(write_mode).lower() == "overwrite":
+        status.info("Applying overwrite mode: truncating target tables before insert...")
+        try:
+            db.truncate_anon_tables("anon", execution_order)
+        except Exception as e:
+            st.error(f"Failed truncating target tables: {e}")
+            status.error("Stopped before execution due to truncate failure.")
+            return False
 
     for idx, table_name in enumerate(execution_order, start=1):
         pct = int((idx / total) * 100)
@@ -233,6 +288,17 @@ def run_all_anonymization(db, schema_name, execution_order, progress_slot=None, 
             status.error(f"Stopped at `{table_name}`. Downstream tables were skipped for RI safety.")
             return False
         progress.progress(idx / total)
+
+    try:
+        db.sync_foreign_keys_for_tables(
+            source_schema=schema_name,
+            target_schema="anon",
+            ordered_tables=execution_order,
+        )
+    except Exception as e:
+        st.error(f"Failed restoring foreign keys/indexes: {e}")
+        status.error("Execution finished with structural sync errors.")
+        return False
 
     status.success("✅ Run & Save All completed for execution order.")
     return True
@@ -298,6 +364,13 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
                 col_info = col_details[col_name]
                 sql_type = col_info['type'].lower()
                 is_nullable = col_info['nullable']
+                is_sensitive = _is_sensitive_row(row)
+
+                if is_sensitive and strategy == "keep":
+                    invalid_selections.append(
+                        f"❌ Sensitive column `{col_name}` cannot use strategy `keep`."
+                    )
+                    continue
 
                 # --- VALIDATION 0: Strategy compatibility with DB type ---
                 type_group = "text"
@@ -1039,6 +1112,10 @@ def render_planner_tab(db):
                         return "✅ Normal"
 
                     plan_df['status'] = plan_df[col_key].apply(get_col_status)
+                    plan_df["is_sensitive"] = plan_df.apply(
+                        lambda r: bool(r.get("is_sensitive", r.get("is_pii", False))),
+                        axis=1
+                    )
                     plan_df['guard'] = plan_df[col_key].apply(
                         lambda c: "ℹ️ Mask disabled for ID safety" if any(token in str(c).lower() for token in ["id", "pk", "fk"]) else ""
                     )
@@ -1052,6 +1129,7 @@ def render_planner_tab(db):
                             plan_df,
                             column_config={
                                 "status": st.column_config.TextColumn("Status", disabled=True),
+                                "is_sensitive": st.column_config.CheckboxColumn("Sensitive", disabled=True),
                                 "guard": st.column_config.TextColumn("Constraint", disabled=True),
                                 col_key: st.column_config.TextColumn("Column", disabled=True),
                                 "strategy": st.column_config.SelectboxColumn("Strategy", options=["keep", "hash", "mask", "null", "faker_name"], required=True),
@@ -1061,6 +1139,15 @@ def render_planner_tab(db):
                     if 'strategy' in edited_plan_df.columns:
                         edited_id_mask = edited_plan_df[col_key].astype(str).str.contains(r"id|pk|fk", case=False, regex=True)
                         edited_plan_df.loc[edited_id_mask & (edited_plan_df['strategy'] == 'mask'), 'strategy'] = 'hash'
+                        if "is_sensitive" in edited_plan_df.columns:
+                            sensitive_keep_mask = edited_plan_df["is_sensitive"] & (edited_plan_df["strategy"] == "keep")
+                            if sensitive_keep_mask.any():
+                                violation_found = True
+                                blocked_cols = edited_plan_df.loc[sensitive_keep_mask, col_key].astype(str).tolist()
+                                st.error(
+                                    "Sensitive columns cannot use `keep`. Update strategies for: "
+                                    f"{', '.join(blocked_cols)}."
+                                )
                     st.session_state['current_plan'] = edited_plan_df.to_dict('records')
                     _track_manual_overrides_for_table(table_name, st.session_state['current_plan'])
                     st.session_state['active_plan_by_table'][table_cache_key] = st.session_state['current_plan']
@@ -1240,7 +1327,7 @@ def render_planner_tab(db):
         confirm_label = "💾 Save and Next" if next_t else "🏁 Finalize & Close Project"
         where_key = f"where_clause_{table_name}"
 
-        action_cols = st.columns([1, 1, 2, 1], gap="small")
+        action_cols = st.columns([1, 1, 1], gap="small")
         with action_cols[0]:
             if st.button("⬅️ Previous", width="stretch", disabled=(current_idx <= 0), key=f"global_prev_{schema_name}_{table_name}"):
                 _go_to_table_by_index(current_idx - 1, ordered_tables, schema_name)
@@ -1248,17 +1335,6 @@ def render_planner_tab(db):
             if st.button("Next ➡️", width="stretch", disabled=not (ordered_tables and current_idx < len(ordered_tables) - 1), key=f"global_next_{schema_name}_{table_name}"):
                 _go_to_table_by_index(current_idx + 1, ordered_tables, schema_name)
         with action_cols[2]:
-            if st.button("🚀 Execute Anonymization Pipeline", type="primary", width="stretch", key="global_run_all_tables"):
-                with st.spinner("Running execution-order batch anonymization..."):
-                    run_all_anonymization(
-                        db=db,
-                        schema_name=schema_name,
-                        execution_order=ordered_tables,
-                        progress_slot=review_progress_slot.progress(0.0),
-                        status_slot=review_status_slot,
-                    )
-            st.caption("Execute Pipeline: Processes all tables sequentially, applies transformations, and commits data to the target database.")
-        with action_cols[3]:
             current_table_state = st.session_state.get("current_plan_data", {}).get(f"{schema_name}.{table_name}", {})
             current_table_dirty = bool(current_table_state.get("dirty"))
             save_label = "💾 Save and Next" if next_t else "💾 Save Table Configuration"
@@ -1297,9 +1373,20 @@ def render_planner_tab(db):
 
     st.markdown("### Review")
     unsaved_tables = _get_unsaved_tables()
+    ordered_tables_for_execution = st.session_state.get('all_tables_list', []) or st.session_state.get('selected_tables', [])
+    sensitive_keep_violations = _collect_sensitive_keep_violations(
+        db,
+        selected_schema,
+        ordered_tables_for_execution,
+    )
     if unsaved_tables:
         pending_names = [str(t).split(".")[-1] for t in unsaved_tables]
         st.warning(f"Pending: {', '.join(pending_names)}")
+    if sensitive_keep_violations:
+        st.error(
+            "Execution blocked. Sensitive columns still set to `keep`: "
+            + ", ".join(sensitive_keep_violations)
+        )
 
     save_all_label = f"💾 Save Changes for {len(unsaved_tables)} Tables"
     if st.button(
@@ -1334,6 +1421,32 @@ def render_planner_tab(db):
         else:
             st.toast("✅ All table configurations are now synchronized with the plan.")
         st.rerun()
+
+    write_mode_ui = st.selectbox(
+        "Write Mode",
+        options=["Overwrite (Truncate)", "Append"],
+        index=0,
+        key="execution_write_mode",
+        help="Overwrite truncates target tables before insert. Append keeps existing rows and adds new ones.",
+    )
+    execute_disabled = bool(unsaved_tables) or bool(sensitive_keep_violations) or (len(ordered_tables_for_execution) == 0)
+    if st.button(
+        "🚀 Execute Anonymization Pipeline",
+        type="primary",
+        width="stretch",
+        key="global_run_all_tables_bottom",
+        disabled=execute_disabled,
+    ):
+        mode = "overwrite" if write_mode_ui.startswith("Overwrite") else "append"
+        with st.spinner("Running execution-order batch anonymization..."):
+            run_all_anonymization(
+                db=db,
+                schema_name=selected_schema,
+                execution_order=ordered_tables_for_execution,
+                progress_slot=review_progress_slot.progress(0.0),
+                status_slot=review_status_slot,
+                write_mode=mode,
+            )
 
     if unsaved_tables:
         st.warning("⚠️ Cannot finalize. You have unsaved changes in your table configurations.")
