@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 # Importi tvojih modula
 from src.database.db_manager import DBManager
+from src.adapters.legacy.db_manager_adapter import DBManagerAdapter
 from src.agents.privacy_agent import PrivacyAgent
 from src.ui.auth import check_login
 from src.ui.sidebar import render_sidebar
@@ -28,6 +29,16 @@ def get_cached_db_manager(db_url: str, session_scope: str):
     """
     return DBManager(db_url=db_url)
 
+
+@st.cache_resource(show_spinner=False)
+def get_cached_db_adapter(db_url: str, session_scope: str):
+    """
+    Returns one DBManagerAdapter per (session, db_url) scope.
+    Adapter delegates to DBManager so behavior remains unchanged.
+    """
+    manager = get_cached_db_manager(db_url=db_url, session_scope=session_scope)
+    return DBManagerAdapter(manager)
+
 if not check_login():
     st.stop()
 
@@ -46,7 +57,7 @@ if 'db' not in st.session_state or st.session_state.get('last_env') != selected_
     current_url = DB_CONFIGS[selected_env]
     if 'session_scope' not in st.session_state:
         st.session_state['session_scope'] = f"session-{os.urandom(8).hex()}"
-    st.session_state['db'] = get_cached_db_manager(
+    st.session_state['db'] = get_cached_db_adapter(
         db_url=current_url,
         session_scope=st.session_state['session_scope']
     )
