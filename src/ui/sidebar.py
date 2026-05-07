@@ -27,45 +27,66 @@ DB_CONFIGS = get_all_connections()
 
 
 def render_sidebar(agent):
+    """Sidebar intentionally minimal during plan bootstrapping."""
     with st.sidebar:
-        if 'db' not in st.session_state:
-            st.error("Database connection not initialized.")
-            return
+        st.empty()
 
-        db = st.session_state['db']
 
-        # --- DATA SOURCE ---
-        st.subheader("📂 Data Source")
-        source_mode = st.radio("Input Type", ["PostgreSQL Database", "CSV Files"])
+def render_data_source_section(db):
+    """Main-page data source configuration, shown after plan initialization."""
+    with st.expander("🔌 Connection Settings", expanded=False):
+        conn_col1, conn_col2 = st.columns(2)
+        with conn_col1:
+            st.text_input("Host", key="conn_host", placeholder="localhost")
+            st.text_input("Database Name", key="conn_database_name", placeholder="anonify_db")
+            st.text_input("User", key="conn_user", placeholder="postgres")
+        with conn_col2:
+            st.text_input("Port", key="conn_port", placeholder="5432")
+            st.text_input("Password", key="conn_password", type="password", placeholder="••••••••")
+            st.empty()
 
-        if source_mode == "PostgreSQL Database":
-            try:
-                schemas = db.get_all_schemas()
-                # Koristimo key='selected_schema' da bi bio dostupan u celoj aplikaciji
-                selected_schema = st.selectbox("Choose Schema:", schemas, index=0, key='selected_schema')
+    st.markdown("### 🧠 Intelligence Context")
 
-                tables = db.get_tables_in_schema(selected_schema)
-                if tables:
-                    # Multiselect za tabele
-                    selected_tables = st.multiselect(
-                        "Choose Tables (Batch Mode):",
-                        options=tables,
-                        default=st.session_state.get('last_confirmed_tables', []),
-                        key='batch_table_selector'
-                    )
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        db_type = st.selectbox(
+            "Database Type",
+            options=["PostgreSQL", "MySQL", "SQL Server"],
+            key="data_source_database_type",
+        )
+    with col2:
+        domain_type = st.selectbox(
+            "Data Domain/Type",
+            options=["Customer Data", "Financial Records", "E-commerce", "Healthcare", "Custom"],
+            key="data_source_domain_type",
+        )
 
-                    # Reset ako se promeni selekcija tabela
-                    if selected_tables != st.session_state.get('last_confirmed_tables'):
-                        st.session_state['completed_tables'] = set()
-                        st.session_state['last_confirmed_tables'] = selected_tables
-                        st.session_state['all_tables_list'] = db.get_execution_order(selected_tables, selected_schema)
-
-                    if selected_tables:
-                        ordered_tables = st.session_state.get('all_tables_list', [])
-                        ordered_text = " ➔ ".join(ordered_tables) if ordered_tables else "-"
-                        st.info(f"⛓️ **Execution Order:**\n{ordered_text}")
-
-                    else:
-                        st.warning("👈 Please select tables.")
-            except Exception as e:
-                st.error(f"DB Error: {e}")
+    st.session_state["db_config"] = {
+        "database_type": db_type,
+        "data_domain": domain_type,
+        "connection": {
+            "host": st.session_state.get("conn_host", ""),
+            "port": st.session_state.get("conn_port", ""),
+            "database_name": st.session_state.get("conn_database_name", ""),
+            "user": st.session_state.get("conn_user", ""),
+            "password": st.session_state.get("conn_password", ""),
+        },
+    }
+    if "plan_metadata" not in st.session_state or not isinstance(st.session_state["plan_metadata"], dict):
+        st.session_state["plan_metadata"] = {}
+    st.session_state["data_domain"] = domain_type
+    st.session_state["plan_metadata"]["data_domain"] = domain_type
+    st.session_state["plan_metadata"]["database_type"] = db_type
+    if st.button("🔗 Connect to Source", type="primary", use_container_width=True, key="connect_to_source_btn"):
+        try:
+            schemas = db.get_all_schemas()
+            selected_schema = st.session_state.get("selected_schema")
+            if not selected_schema and schemas:
+                selected_schema = schemas[0]
+                st.session_state["selected_schema"] = selected_schema
+            tables = db.get_tables_in_schema(selected_schema) if selected_schema else []
+            st.session_state["last_confirmed_tables"] = tables
+            st.session_state["all_tables_list"] = db.get_execution_order(tables, selected_schema) if selected_schema else []
+            st.success("Source connection context loaded.")
+        except Exception as e:
+            st.error(f"DB Error: {e}")

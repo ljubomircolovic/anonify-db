@@ -69,6 +69,11 @@ class DatabasePort(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def truncate_anon_tables(self, target_schema: str, ordered_tables: list[str]) -> None:
+    def truncate_anon_tables(
+        self,
+        target_schema: str,
+        ordered_tables: list[str],
+        clear_mode: str = "truncate_cascade",
+    ) -> None:
         raise NotImplementedError
 

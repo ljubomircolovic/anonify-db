@@ -228,10 +228,13 @@ def run_all_anonymization(
     progress_slot=None,
     status_slot=None,
     write_mode="overwrite",
+    overwrite_clear_mode="truncate_cascade",
 ):
     if not execution_order:
         st.error("No execution order found. Run AI scan first.")
         return False
+    if hasattr(db, "reset_structural_sync_counters"):
+        db.reset_structural_sync_counters()
 
     progress = progress_slot if progress_slot is not None else st.progress(0)
     status = status_slot if status_slot is not None else st.empty()
@@ -241,7 +244,7 @@ def run_all_anonymization(
     if str(write_mode).lower() == "overwrite":
         status.info("Applying overwrite mode: truncating target tables before insert...")
         try:
-            db.truncate_anon_tables("anon", execution_order)
+            db.truncate_anon_tables("anon", execution_order, clear_mode=overwrite_clear_mode)
         except Exception as e:
             st.error(f"Failed truncating target tables: {e}")
             status.error("Stopped before execution due to truncate failure.")
@@ -1429,24 +1432,31 @@ def render_planner_tab(db):
         key="execution_write_mode",
         help="Overwrite truncates target tables before insert. Append keeps existing rows and adds new ones.",
     )
-    execute_disabled = bool(unsaved_tables) or bool(sensitive_keep_violations) or (len(ordered_tables_for_execution) == 0)
-    if st.button(
-        "🚀 Execute Anonymization Pipeline",
-        type="primary",
-        width="stretch",
-        key="global_run_all_tables_bottom",
-        disabled=execute_disabled,
-    ):
-        mode = "overwrite" if write_mode_ui.startswith("Overwrite") else "append"
-        with st.spinner("Running execution-order batch anonymization..."):
-            run_all_anonymization(
-                db=db,
-                schema_name=selected_schema,
-                execution_order=ordered_tables_for_execution,
-                progress_slot=review_progress_slot.progress(0.0),
-                status_slot=review_status_slot,
-                write_mode=mode,
-            )
+    overwrite_clear_mode = "truncate_cascade"
+    if write_mode_ui.startswith("Overwrite"):
+        overwrite_clear_mode_ui = st.selectbox(
+            "Overwrite Clear Strategy",
+            options=["TRUNCATE ... CASCADE (recommended)", "session_replication_role = replica"],
+            index=0,
+            key="overwrite_clear_mode_ui",
+            help="Use TRUNCATE CASCADE for fast, constraint-safe clearing, or replica mode if your environment requires it.",
+        )
+        overwrite_clear_mode = (
+            "session_replica"
+            if overwrite_clear_mode_ui.startswith("session_replication_role")
+            else "truncate_cascade"
+        )
+    summary_mode = "Overwrite" if write_mode_ui.startswith("Overwrite") else "Append"
+    summary_strategy = (
+        "N/A"
+        if summary_mode == "Append"
+        else ("session_replication_role = replica" if overwrite_clear_mode == "session_replica" else "TRUNCATE ... CASCADE")
+    )
+    db_name = st.session_state.get("active_plan_db_name", "None")
+    data_domain = st.session_state.get("data_domain", "General")
+    st.info(
+        f"Plan: {db_name} | Domain: {data_domain} | Write Mode: {summary_mode} | Clear Strategy: {summary_strategy}"
+    )
 
     if unsaved_tables:
         st.warning("⚠️ Cannot finalize. You have unsaved changes in your table configurations.")
@@ -1463,6 +1473,26 @@ def render_planner_tab(db):
         "🏁 Finalize: Saves the final plan metadata, closes the active database connections, and resets the "
         "application state for a new session. Ensure all tables are executed before finalizing."
     )
+    execute_disabled = bool(unsaved_tables) or bool(sensitive_keep_violations) or (len(ordered_tables_for_execution) == 0)
+    st.markdown("---")
+    if st.button(
+        "🚀 Execute Anonymization Pipeline",
+        type="primary",
+        width="stretch",
+        key="global_run_all_tables_bottom",
+        disabled=execute_disabled,
+    ):
+        mode = "overwrite" if write_mode_ui.startswith("Overwrite") else "append"
+        with st.spinner("Running execution-order batch anonymization..."):
+            run_all_anonymization(
+                db=db,
+                schema_name=selected_schema,
+                execution_order=ordered_tables_for_execution,
+                progress_slot=review_progress_slot.progress(0.0),
+                status_slot=review_status_slot,
+                write_mode=mode,
+                overwrite_clear_mode=overwrite_clear_mode,
+            )
 
 def render_comparison_tab(db):
     st.subheader("🔍 Side-by-Side Comparison")

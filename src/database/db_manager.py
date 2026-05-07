@@ -39,6 +39,7 @@ class DBManager:
         self.db_url = self.target_db_url
         self.metadata_schema = "_anon_metadata"
         self.runtime_salt = os.getenv("ANONIFY_SALT", "default_plan_salt")
+        self._structural_sync_counters = {"indexes_recreated": 0, "fks_recreated": 0}
 
         # Source engine: reads schema/tables from the original database
         self.source_engine = create_engine(
@@ -210,6 +211,16 @@ class DBManager:
         slugified = slugify_name(plan_name)
         return f"anon_{source_db_name}_{slugified}"[:63]
 
+    @staticmethod
+    def _normalize_target_db_name(name_value):
+        raw_value = str(name_value or "").strip()
+        if not raw_value:
+            return ""
+        lowered = raw_value.lower()
+        safe_value = re.sub(r"[^a-z0-9_]+", "_", lowered)
+        safe_value = re.sub(r"_+", "_", safe_value).strip("_")
+        return safe_value[:63]
+
     def _build_database_url(self, database_name):
         parsed = make_url(self.source_db_url)
         drivername = parsed.drivername
@@ -228,6 +239,30 @@ class DBManager:
     def _build_postgres_admin_url(self):
         return self._build_database_url("postgres")
 
+    def _database_exists(self, database_name):
+        admin_engine = create_engine(self._build_postgres_admin_url(), connect_args={'client_encoding': 'utf8'})
+        try:
+            with admin_engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :db_name LIMIT 1"),
+                    {"db_name": str(database_name or "").strip()},
+                ).fetchone()
+                return row is not None
+        finally:
+            admin_engine.dispose()
+
+    def plan_exists(self, plan_name, custom_db_name=None, allow_non_anon_prefix=False):
+        if custom_db_name:
+            normalized_custom_name = self._normalize_target_db_name(custom_db_name)
+            if not normalized_custom_name:
+                return False, ""
+            if (not allow_non_anon_prefix) and (not normalized_custom_name.startswith("anon_")):
+                normalized_custom_name = f"anon_{normalized_custom_name}"
+            candidate_db_name = normalized_custom_name
+        else:
+            candidate_db_name = self._build_target_db_name(plan_name)
+        return self._database_exists(candidate_db_name), candidate_db_name
+
     def _set_target_engine(self, db_url):
         self.target_db_url = db_url
         self.db_url = db_url
@@ -241,8 +276,17 @@ class DBManager:
         )
         self.engine = self.target_engine
 
-    def bootstrap_plan_database(self, plan_name):
-        target_db_name = self._build_target_db_name(plan_name)
+    def bootstrap_plan_database(self, plan_name, custom_db_name=None, allow_non_anon_prefix=False):
+        generated_name = self._build_target_db_name(plan_name)
+        if custom_db_name:
+            normalized_custom_name = self._normalize_target_db_name(custom_db_name)
+            if not normalized_custom_name:
+                raise ValueError("Custom database name cannot be empty.")
+            if not allow_non_anon_prefix and not normalized_custom_name.startswith("anon_"):
+                raise ValueError("Custom database names must start with anon_.")
+            target_db_name = normalized_custom_name
+        else:
+            target_db_name = generated_name
         admin_url = self._build_postgres_admin_url()
         admin_engine = create_engine(admin_url, connect_args={'client_encoding': 'utf8'})
         created_now = False
@@ -397,7 +441,8 @@ class DBManager:
                     logger.info(f"✅ [DB_MANAGER] Aligned type {target_schema}.{table_name}.{column_name} -> {source_type}")
 
         self._sync_pk_unique_constraints(active_conn, source_schema, target_schema, table_name)
-        self._sync_non_constraint_indexes(active_conn, source_schema, target_schema, table_name)
+        created_indexes = self._sync_non_constraint_indexes(active_conn, source_schema, target_schema, table_name)
+        self._structural_sync_counters["indexes_recreated"] += int(created_indexes or 0)
 
     @staticmethod
     def _rewrite_schema_references(sql_def, source_schema, target_schema):
@@ -432,6 +477,9 @@ class DBManager:
         reg_name = f'"{schema_name}"."{index_name}"'
         row = active_conn.execute(exists_sql, {"idx_name": reg_name}).fetchone()
         return bool(row and row[0])
+
+    def reset_structural_sync_counters(self):
+        self._structural_sync_counters = {"indexes_recreated": 0, "fks_recreated": 0}
 
     def _sync_pk_unique_constraints(self, active_conn, source_schema, target_schema, table_name):
         source_constraints_sql = text("""
@@ -480,12 +528,15 @@ class DBManager:
                 {"schema_name": source_schema, "table_name": table_name},
             ).fetchall()
 
+        created_indexes = 0
         for row in source_rows:
             index_name, index_def = row[0], row[1]
             if self._index_exists(active_conn, target_schema, index_name):
                 continue
             rewritten_def = self._rewrite_schema_references(index_def, source_schema, target_schema)
             active_conn.execute(text(rewritten_def))
+            created_indexes += 1
+        return created_indexes
 
     def sync_foreign_keys_for_tables(self, source_schema, target_schema, ordered_tables):
         if not ordered_tables:
@@ -500,6 +551,7 @@ class DBManager:
               AND con.contype = 'f'
             ORDER BY con.conname ASC
         """)
+        recreated_fks = 0
         with self.target_engine.connect() as target_conn:
             with target_conn.begin():
                 target_conn.execute(text(
@@ -521,10 +573,17 @@ class DBManager:
                                 f'ALTER TABLE {self.quote_identifier(target_schema)}.{self.quote_identifier(child_table)} '
                                 f'ADD CONSTRAINT {self.quote_identifier(con_name)} {rewritten_def}'
                             ))
+                            recreated_fks += 1
                         except Exception as e:
                             logger.warning(
                                 f"⚠️ [DB_MANAGER] FK sync warning for {child_table}.{con_name}: {e}"
                             )
+        self._structural_sync_counters["fks_recreated"] += int(recreated_fks or 0)
+        logger.info(
+            "✅ [DB_MANAGER] Structural twin sync finished | Indexes recreated: %s | FKs recreated: %s",
+            self._structural_sync_counters.get("indexes_recreated", 0),
+            self._structural_sync_counters.get("fks_recreated", 0),
+        )
 
     def create_anonymized_table(self, source_schema, table_name, target_db, target_schema="anon"):
         """
@@ -562,6 +621,14 @@ class DBManager:
                         target_conn.execute(create_schema_sql)
                         target_conn.execute(text(f"SET search_path TO {quoted_target_schema}, public;"))
                         target_conn.execute(ctas_sql)
+                        self._sync_pk_unique_constraints(target_conn, source_schema, target_schema, table_name)
+                        created_indexes = self._sync_non_constraint_indexes(
+                            target_conn,
+                            source_schema,
+                            target_schema,
+                            table_name,
+                        )
+                        self._structural_sync_counters["indexes_recreated"] += int(created_indexes or 0)
                         logger.info(
                             f"✅ [DB_MANAGER] Created {target_db_name}.{target_schema}.{table_name} "
                             f"from source schema {source_schema} using CTAS."
@@ -1803,7 +1870,7 @@ class DBManager:
             except Exception as e:
                 logger.warning(f"⚠️ [DB_MANAGER] Re-hook warning: {e}")
 
-    def truncate_anon_tables(self, target_schema, ordered_tables):
+    def truncate_anon_tables(self, target_schema, ordered_tables, clear_mode="truncate_cascade"):
         from sqlalchemy import text
         if not ordered_tables: return
 
@@ -1811,21 +1878,26 @@ class DBManager:
         tables_to_clear = ", ".join([f'"{target_schema}"."{t}"' for t in ordered_tables])
 
         # Dodajemo RESTART IDENTITY da ID-evi krenu od 1
-        sql = text(f"TRUNCATE TABLE {tables_to_clear} RESTART IDENTITY CASCADE;")
+        truncate_sql = text(f"TRUNCATE TABLE {tables_to_clear} RESTART IDENTITY CASCADE;")
+        mode = str(clear_mode or "truncate_cascade").lower()
 
         with self.target_engine.connect() as conn:
-            # 1. Isključujemo trigere i FK provere za ovu sesiju
-            conn.execute(text("SET session_replication_role = 'replica';"))
+            if mode == "session_replica":
+                conn.execute(text("SET session_replication_role = 'replica';"))
+                try:
+                    logger.info(f"✅ [DB_MANAGER] Clearing target tables using session_replication_role replica: {tables_to_clear}")
+                    for table_name in ordered_tables:
+                        conn.execute(text(f'DELETE FROM "{target_schema}"."{table_name}"'))
+                finally:
+                    conn.execute(text("SET session_replication_role = 'origin';"))
+                conn.commit()
+                logger.info("✅ [DB_MANAGER] Replica clear executed and committed successfully")
+                return
 
-            logger.info(f"✅ [DB_MANAGER] Running TRUNCATE on {tables_to_clear}")
-            conn.execute(sql)
-
-            # 2. Vraćamo u normalu
-            conn.execute(text("SET session_replication_role = 'origin';"))
-
-            # 3. FORCE COMMIT
+            logger.info(f"✅ [DB_MANAGER] Running TRUNCATE CASCADE on {tables_to_clear}")
+            conn.execute(truncate_sql)
             conn.commit()
-            logger.info("✅ [DB_MANAGER] TRUNCATE executed and committed successfully")
+            logger.info("✅ [DB_MANAGER] TRUNCATE CASCADE executed and committed successfully")
 
     def prepare_subset_metadata(self, conn):
         """

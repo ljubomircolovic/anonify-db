@@ -1,5 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import os
 import logging
@@ -10,15 +11,80 @@ from src.database.db_manager import DBManager
 from src.adapters.legacy.db_manager_adapter import DBManagerAdapter
 from src.agents.privacy_agent import PrivacyAgent
 from src.ui.auth import check_login
-from src.ui.sidebar import render_sidebar
+from src.ui.sidebar import render_sidebar, render_data_source_section
 from src.ui.tabs_content import render_tabs
 from init_db import initialize_metadata
-import datetime
 logger = logging.getLogger(__name__)
+
+
+def _normalize_name_fragment(raw_value: str) -> str:
+    sanitized = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(raw_value or "").strip().lower())
+    while "__" in sanitized:
+        sanitized = sanitized.replace("__", "_")
+    return sanitized.strip("_")
+
+
+@st.dialog("High Risk Naming Warning")
+def _render_custom_name_warning_dialog():
+    st.markdown("### ⚠️ **High Risk Warning**")
+    st.markdown(
+        "<p style='color:#b91c1c; font-weight:700; margin-top:0.25rem;'>"
+        "Warning: Using a custom name increases the risk of overlapping with production databases. "
+        "Ensure you do not accidentally overwrite real data."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Cancel / Back", width="stretch", key="custom_name_warn_cancel"):
+            st.session_state["custom_name_warning_confirmed"] = False
+            st.session_state["pending_initialize_after_warning"] = False
+            st.rerun()
+    with c2:
+        if st.button("Confirm (Proceed with custom name)", type="primary", width="stretch", key="custom_name_warn_confirm"):
+            st.session_state["custom_name_warning_confirmed"] = True
+            st.session_state["pending_initialize_after_warning"] = True
+            st.rerun()
 
 # --- 1. SETUP & AUTH ---
 load_dotenv()
-st.set_page_config(page_title="AnonifyDB", layout="wide")
+st.set_page_config(page_title="AnonifyDB", layout="wide", initial_sidebar_state="collapsed")
+st.markdown('''
+<style>
+    :root {
+        --primary-color: #0078d4 !important;
+        --background-color: #ffffff !important;
+        --secondary-background-color: #f3f2f1 !important;
+        --text-color: #323130 !important;
+    }
+    /* Clean buttons */
+    button[kind="primary"] {
+        background-color: #0078d4 !important;
+        color: white !important;
+        border-radius: 2px !important; /* Azure style is sharp */
+        border: none !important;
+    }
+    button[kind="primary"]:hover {
+        background-color: #005a9e !important;
+    }
+    a, a:visited {
+        color: #0078d4 !important;
+    }
+    a:hover {
+        color: #005a9e !important;
+    }
+    /* Fix checkboxes globally */
+    [data-testid="stCheckbox"] div[role="checkbox"] {
+        background-color: #0078d4 !important;
+    }
+    /* Remove any shadows, filters, or overlays from previous sessions */
+    .main, .block-container, img, div {
+        filter: none !important;
+        opacity: 1 !important;
+        text-shadow: none !important;
+    }
+</style>
+''', unsafe_allow_html=True)
 
 
 @st.cache_resource(show_spinner=False)
@@ -43,7 +109,7 @@ if not check_login():
     st.stop()
 
 # --- 2. COMPACT TOP BAR ---
-top_col1, top_col2, top_col3 = st.columns([2, 2, 1])
+top_col1, top_col2, top_col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
 top_col1.markdown(f"👤 **{st.session_state.get('user_name', 'Admin')}**")
 
 from src.ui.sidebar import DB_CONFIGS
@@ -66,13 +132,13 @@ if 'db' not in st.session_state or st.session_state.get('last_env') != selected_
 db = st.session_state['db']
 
 if (
-    st.session_state.get("active_plan_db_name")
+    st.session_state.get("active_plan_db_name", "None") != "None"
     and st.session_state.get("last_env") == selected_env
-    and st.session_state.get("connected_plan_db_name") != st.session_state.get("active_plan_db_name")
+    and st.session_state.get("connected_plan_db_name") != st.session_state.get("active_plan_db_name", "None")
 ):
     try:
-        db.connect_to_existing_plan_database(st.session_state["active_plan_db_name"])
-        st.session_state["connected_plan_db_name"] = st.session_state["active_plan_db_name"]
+        db.connect_to_existing_plan_database(st.session_state.get("active_plan_db_name", "None"))
+        st.session_state["connected_plan_db_name"] = st.session_state.get("active_plan_db_name", "None")
     except Exception:
         st.session_state["project_initialized"] = False
 
@@ -111,98 +177,103 @@ render_sidebar(agent)
 # --- 5. UI: GLAVNI SADRŽAJ ---
 st.title("🛡️ AnonifyDB Data Engineering Tool")
 with st.container():
-    # --- Single Dynamic Status Layer (Top) ---
-    hour = datetime.datetime.now().hour
-    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
-    user = st.session_state.get('user_name', 'User')
-    st.markdown(f"👋 **{greeting}, {user}!**")
-
-    selected_tables_hint = st.session_state.get("selected_tables") or st.session_state.get("last_confirmed_tables") or []
-    current_is_initialized = (
-        bool(st.session_state.get("active_plan_db_key"))
-        and st.session_state.get("project_initialized", False)
-        and str(st.session_state.get("active_plan_db_key", "")).startswith(f"{selected_env}:")
-    )
-    if not current_is_initialized:
-        if not selected_tables_hint:
-            st.info("👋 Welcome! Start by selecting tables from the sidebar.")
-        else:
-            st.success(f"✅ {len(selected_tables_hint)} tables selected. Please provide a Plan Name or select an Existing Plan below.")
-
-    # --- Instruction Layer (Middle) ---
     st.markdown("### Plan Selection")
     st.caption(
         "Enter a descriptive name (e.g., 'GDPR Production Prep') or continue with an existing plan database."
     )
-    st.markdown(
-        """
-        <style>
-            div.stButton > button {
-                white-space: nowrap;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True
+    row1_left, row1_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
+
+    if "existing_plan_selection" not in st.session_state:
+        st.session_state["existing_plan_selection"] = st.session_state.get("selected_existing_plan", "None")
+    if "selected_existing_plan" not in st.session_state:
+        st.session_state["selected_existing_plan"] = st.session_state.get("existing_plan_selection", "None")
+    if "allow_custom_naming" not in st.session_state:
+        st.session_state["allow_custom_naming"] = False
+    if "custom_name_warning_confirmed" not in st.session_state:
+        st.session_state["custom_name_warning_confirmed"] = False
+    if "pending_initialize_after_warning" not in st.session_state:
+        st.session_state["pending_initialize_after_warning"] = False
+    if "plan_name" not in st.session_state:
+        st.session_state["plan_name"] = ""
+    if "plan_name_input" not in st.session_state:
+        st.session_state["plan_name_input"] = st.session_state.get("plan_name", "")
+    existing_selected_now = (
+        st.session_state.get("existing_plan_selection") is not None
+        and st.session_state.get("existing_plan_selection") != "None"
+        and str(st.session_state.get("existing_plan_selection", "")).strip() != ""
     )
 
-    row1_left, row1_right = st.columns([5, 2], gap="small", vertical_alignment="bottom")
-    schema_hint = st.session_state.get("selected_schema", "schema")
-    suggested_plan_name = f"plan_{schema_hint}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
-
-    if "selected_existing_plan" not in st.session_state:
-        st.session_state["selected_existing_plan"] = ""
-
-    def _on_plan_name_change():
-        if str(st.session_state.get("plan_name", "")).strip():
-            st.session_state["selected_existing_plan"] = ""
+    def on_plan_name_change():
+        st.session_state["plan_name"] = str(st.session_state.get("plan_name_input", ""))
+        if str(st.session_state.get("plan_name_input", "")).strip():
+            st.session_state["existing_plan_selection"] = "None"
+            st.session_state["selected_existing_plan"] = "None"
 
     def _on_existing_plan_change():
-        if str(st.session_state.get("selected_existing_plan", "")).strip():
+        selected_existing = str(st.session_state.get("existing_plan_selection", "")).strip()
+        if selected_existing and selected_existing != "None":
+            st.session_state["selected_existing_plan"] = selected_existing
             st.session_state["plan_name"] = ""
+            st.session_state["plan_name_input"] = ""
+        else:
+            st.session_state["selected_existing_plan"] = "None"
 
     with row1_left:
-        existing_selected_now = bool(str(st.session_state.get("selected_existing_plan", "")).strip())
         st.text_input(
-            "Plan Name",
-            key="plan_name",
-            placeholder=suggested_plan_name,
-            on_change=_on_plan_name_change,
-            disabled=existing_selected_now
+            "Create New Plan",
+            key="plan_name_input",
+            placeholder="Enter plan name...",
+            on_change=on_plan_name_change,
+            label_visibility="visible",
         )
-        plan_name = str(st.session_state.get("plan_name", "")).strip()
     with row1_right:
-        selected_existing_value = str(st.session_state.get("selected_existing_plan", "")).strip()
         initialize_clicked = st.button(
             "🚀 Initialize Project",
             type="primary",
             use_container_width=True,
-            disabled=(not bool(plan_name)) or bool(selected_existing_value)
         )
+    plan_name = str(st.session_state.get("plan_name_input", "")).strip()
+    if plan_name:
+        st.session_state["existing_plan_selection"] = "None"
+        st.session_state["selected_existing_plan"] = "None"
+    st.session_state["plan_name"] = plan_name
+    allow_custom_naming = st.checkbox(
+        "Allow custom name (skip default anon_ safety prefix)",
+        key="allow_custom_naming",
+    )
+    custom_db_name = st.text_input(
+        "Custom Target Database Name (optional)",
+        key="custom_target_db_name",
+        placeholder="anon_project_clone",
+        disabled=existing_selected_now or (not allow_custom_naming),
+    )
     existing_plan_dbs = db.list_existing_plan_databases()
 
-    row2_left, row2_right = st.columns([5, 2], gap="small", vertical_alignment="bottom")
+    row2_left, row2_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
     with row2_left:
-        plan_name_present_now = bool(str(st.session_state.get("plan_name", "")).strip())
         st.selectbox(
-            "Existing Plan Databases",
-            options=[""] + existing_plan_dbs,
-            key="selected_existing_plan",
+            "Or Select Existing Plan",
+            options=["None"] + existing_plan_dbs,
+            key="existing_plan_selection",
             help="Reuse an existing plan database instead of creating a new one.",
             on_change=_on_existing_plan_change,
-            disabled=plan_name_present_now
+            label_visibility="visible",
         )
-        selected_existing_plan = str(st.session_state.get("selected_existing_plan", "")).strip()
+        selected_existing_plan = str(st.session_state.get("existing_plan_selection", "")).strip()
+        st.session_state["selected_existing_plan"] = selected_existing_plan if selected_existing_plan else "None"
     with row2_right:
         continue_existing_clicked = st.button(
             "🔁 Continue with Existing",
             use_container_width=True,
-            disabled=bool(plan_name) or (not bool(selected_existing_plan))
+            disabled=bool(plan_name) or (not bool(selected_existing_plan)) or selected_existing_plan == "None"
         )
 
-plan_key = f"{selected_env}:{plan_name}" if plan_name else None
+if st.session_state.get("pending_initialize_after_warning") and st.session_state.get("custom_name_warning_confirmed"):
+    initialize_clicked = True
+    st.session_state["pending_initialize_after_warning"] = False
 
 if continue_existing_clicked:
-    if not selected_existing_plan:
+    if not selected_existing_plan or selected_existing_plan == "None":
         st.error("Select an existing plan database first.")
     else:
         try:
@@ -211,13 +282,22 @@ if continue_existing_clicked:
             st.session_state["active_plan_db_key"] = f"{selected_env}:{selected_existing_plan}"
             st.session_state["connected_plan_db_name"] = selected_existing_plan
             st.session_state["project_initialized"] = True
-            st.success(f"Connected to existing plan database: `{selected_existing_plan}`")
+            st.session_state["plan_metadata"] = {
+                "plan_db_name": selected_existing_plan,
+                "data_domain": st.session_state.get("data_source_domain_type", "Not Set"),
+            }
+            st.session_state["scroll_to_data_source"] = True
+            st.success(f"Plan {selected_existing_plan} active. Configure Data Source below.")
         except Exception as exc:
             st.session_state["project_initialized"] = False
             st.error(f"Failed to connect to existing plan database: {exc}")
 
 if initialize_clicked:
     selected_existing_plan = str(st.session_state.get("selected_existing_plan", "")).strip()
+    if selected_existing_plan == "None":
+        selected_existing_plan = ""
+    allow_custom_naming = bool(st.session_state.get("allow_custom_naming", False))
+    custom_db_name = str(st.session_state.get("custom_target_db_name", "")).strip()
     exactly_one_source = bool(plan_name) ^ bool(selected_existing_plan)
     if not exactly_one_source:
         st.error("Provide either Plan Name or Existing Plan Database (exactly one).")
@@ -229,19 +309,60 @@ if initialize_clicked:
                 st.session_state["active_plan_db_name"] = selected_existing_plan
                 st.session_state["connected_plan_db_name"] = selected_existing_plan
                 st.session_state["project_initialized"] = True
-                st.success(f"Connected to existing plan database: `{selected_existing_plan}`")
+                st.session_state["plan_metadata"] = {
+                    "plan_db_name": selected_existing_plan,
+                    "data_domain": st.session_state.get("data_source_domain_type", "Not Set"),
+                }
+                st.session_state["scroll_to_data_source"] = True
+                st.success(f"Plan {selected_existing_plan} active. Configure Data Source below.")
             else:
-                created_db_name, created_now = db.bootstrap_plan_database(plan_name)
+                effective_plan_name = str(plan_name or "").strip()
+                if (not allow_custom_naming) and (not effective_plan_name.lower().startswith("anon_")):
+                    effective_plan_name = f"anon_{_normalize_name_fragment(effective_plan_name)}"
+                    st.session_state["plan_name"] = effective_plan_name
+
+                requires_custom_warning = (
+                    allow_custom_naming
+                    and (
+                        (bool(effective_plan_name) and not effective_plan_name.lower().startswith("anon_"))
+                        or (bool(custom_db_name) and not custom_db_name.lower().startswith("anon_"))
+                    )
+                )
+                if requires_custom_warning and not st.session_state.get("custom_name_warning_confirmed", False):
+                    st.session_state["pending_initialize_after_warning"] = True
+                    _render_custom_name_warning_dialog()
+                    st.stop()
+
+                duplicate_exists, duplicate_candidate_name = db.plan_exists(
+                    effective_plan_name,
+                    custom_db_name=custom_db_name or None,
+                    allow_non_anon_prefix=allow_custom_naming,
+                )
+                if duplicate_exists:
+                    st.session_state["project_initialized"] = False
+                    st.error(
+                        f"Error: A plan with the name {duplicate_candidate_name} already exists. "
+                        "Please choose a different name."
+                    )
+                    st.stop()
+
+                created_db_name, created_now = db.bootstrap_plan_database(
+                    effective_plan_name,
+                    custom_db_name=custom_db_name or None,
+                    allow_non_anon_prefix=allow_custom_naming and st.session_state.get("custom_name_warning_confirmed", False),
+                )
                 st.session_state["active_plan_db_key"] = f"{selected_env}:{created_db_name}"
                 st.session_state["active_plan_db_name"] = created_db_name
                 st.session_state["connected_plan_db_name"] = created_db_name
                 st.session_state["project_initialized"] = True
-                if created_now:
-                    st.success(f"Project initialized. Using plan database: `{created_db_name}`")
-                else:
-                    st.info(
-                        f"Plan database already existed. Connected to existing database: `{created_db_name}`"
-                    )
+                st.session_state["plan_metadata"] = {
+                    "plan_db_name": created_db_name,
+                    "data_domain": st.session_state.get("data_source_domain_type", "Not Set"),
+                }
+                st.session_state["scroll_to_data_source"] = True
+                st.success(f"Plan {created_db_name} active. Configure Data Source below.")
+                st.session_state["custom_name_warning_confirmed"] = False
+                st.session_state["pending_initialize_after_warning"] = False
         except Exception as exc:
             st.session_state["project_initialized"] = False
             error_message = str(exc).lower()
@@ -258,6 +379,23 @@ is_initialized = (
     and st.session_state.get("project_initialized", False)
     and str(st.session_state.get("active_plan_db_key", "")).startswith(f"{selected_env}:")
 )
+
+if st.session_state.get("active_plan_db_name", "None") != "None":
+    st.markdown("---")
+    st.markdown("### 📂 Data Source")
+    components.html('<div id="data-source-section"></div>', height=0)
+    render_data_source_section(db)
+    if st.session_state.get("scroll_to_data_source"):
+        components.html(
+            """
+            <script>
+                const target = window.parent.document.getElementById('data-source-section');
+                if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            </script>
+            """,
+            height=0,
+        )
+        st.session_state["scroll_to_data_source"] = False
 
 selected_existing_plan = str(st.session_state.get("selected_existing_plan", "")).strip()
 

@@ -110,8 +110,17 @@ class DBManagerAdapter(
             preserve_native_columns=preserve_native_columns,
         )
 
-    def truncate_anon_tables(self, target_schema: str, ordered_tables: list[str]) -> None:
-        return self._db_manager.truncate_anon_tables(target_schema=target_schema, ordered_tables=ordered_tables)
+    def truncate_anon_tables(
+        self,
+        target_schema: str,
+        ordered_tables: list[str],
+        clear_mode: str = "truncate_cascade",
+    ) -> None:
+        return self._db_manager.truncate_anon_tables(
+            target_schema=target_schema,
+            ordered_tables=ordered_tables,
+            clear_mode=clear_mode,
+        )
 
     def apply_anonymization_rules(self, df: Any, table_plan: list[dict], salt: str | None = None) -> Any:
         use_strategy_engine = str(
