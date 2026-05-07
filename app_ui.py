@@ -51,6 +51,65 @@ load_dotenv()
 st.set_page_config(page_title="AnonifyDB", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''
 <style>
+    /* 1. Target the Multiselect Tags (Pills) */
+    [data-baseweb="tag"] {
+        background-color: #0078d4 !important;
+        color: white !important;
+        border: none !important;
+    }
+
+    /* 2. Target the text inside the tags specifically */
+    [data-baseweb="tag"] span {
+        color: white !important;
+        -webkit-text-fill-color: white !important;
+    }
+
+    /* 3. Target the 'Delete' (X) icon inside the tags */
+    [data-baseweb="tag"] svg {
+        fill: white !important;
+        color: white !important;
+    }
+
+    /* 4. Fix for the focused/active state of the tags */
+    [data-baseweb="tag"]:focus, [data-baseweb="tag"]:active {
+        background-color: #005a9e !important;
+    }
+    
+    /* 5. Ensure NO red color persists in any span within the main container */
+    .st-emotion-cache-119tkyc, code {
+        color: #0078d4 !important;
+        background-color: #f3f2f1 !important;
+    }
+
+    /* 1. Force white text for table names inside primary buttons */
+    [data-testid="stBaseButton-primary"] p, 
+    [data-testid="stBaseButton-primary"] span,
+    [data-testid="stBaseButton-primary"] div {
+        color: white !important;
+        -webkit-text-fill-color: white !important;
+    }
+
+    /* 2. Force white text for table names inside secondary buttons */
+    [data-testid="stBaseButton-secondary"] p,
+    [data-testid="stBaseButton-secondary"] span {
+        color: #0078d4 !important;
+        -webkit-text-fill-color: #0078d4 !important;
+    }
+
+    /* 3. Target code snippets or table name labels that might be red */
+    code, .stMarkdown p code {
+        color: #0078d4 !important;
+        background-color: #f3f2f1 !important;
+    }
+
+    /* 4. Kill any remaining red on labels or captions */
+    [data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"] p {
+        color: #323130 !important;
+    }
+</style>
+''', unsafe_allow_html=True)
+st.markdown('''
+<style>
     /* 1. Force White Text for ALL Primary Buttons */
     [data-testid="stBaseButton-primary"], 
     [data-testid="stBaseButton-primary"] p,
