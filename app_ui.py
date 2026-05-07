@@ -51,37 +51,42 @@ load_dotenv()
 st.set_page_config(page_title="AnonifyDB", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''
 <style>
-    :root {
-        --primary-color: #0078d4 !important;
-        --background-color: #ffffff !important;
-        --secondary-background-color: #f3f2f1 !important;
-        --text-color: #323130 !important;
-    }
-    /* Clean buttons */
-    button[kind="primary"] {
-        background-color: #0078d4 !important;
+    /* 1. Force White Text for ALL Primary Buttons */
+    [data-testid="stBaseButton-primary"], 
+    [data-testid="stBaseButton-primary"] p,
+    button[kind="primary"] p {
         color: white !important;
-        border-radius: 2px !important; /* Azure style is sharp */
-        border: none !important;
+        -webkit-text-fill-color: white !important; /* Fix for some browser overrides */
     }
-    button[kind="primary"]:hover {
-        background-color: #005a9e !important;
-    }
-    a, a:visited {
-        color: #0078d4 !important;
-    }
-    a:hover {
-        color: #005a9e !important;
-    }
-    /* Fix checkboxes globally */
-    [data-testid="stCheckbox"] div[role="checkbox"] {
-        background-color: #0078d4 !important;
-    }
-    /* Remove any shadows, filters, or overlays from previous sessions */
-    .main, .block-container, img, div {
-        filter: none !important;
+
+    /* 2. Fix Checkbox Label Appearance */
+    /* Target the label container to remove any shading/opacity */
+    [data-testid="stWidgetLabel"], 
+    [data-testid="stWidgetLabel"] p {
+        color: #323130 !important; /* Azure Charcoal */
         opacity: 1 !important;
+        filter: none !important;
         text-shadow: none !important;
+        -webkit-font-smoothing: antialiased !important;
+    }
+
+    /* 3. Ensure the Checkbox Square remains Azure Blue */
+    [data-baseweb="checkbox"] span {
+        background-color: #0078d4 !important;
+        border-color: #0078d4 !important;
+    }
+
+    /* 4. Global Cleanup for Containers */
+    /* Remove any inherited filters that cause the 'blurry/shaded' look */
+    .stMarkdown, .element-container, .stCheckbox {
+        opacity: 1 !important;
+        filter: none !important;
+    }
+
+    /* 5. Azure Blue for Primary Buttons Background */
+    [data-testid="stBaseButton-primary"], button[kind="primary"] {
+        background-color: #0078d4 !important;
+        border: none !important;
     }
 </style>
 ''', unsafe_allow_html=True)
