@@ -478,6 +478,86 @@ class DBManager:
         row = active_conn.execute(exists_sql, {"idx_name": reg_name}).fetchone()
         return bool(row and row[0])
 
+    def get_indexed_columns(self, schema_name, table_name):
+        """
+        Returns set of column names participating in indexes for a table.
+        """
+        idx_sql = text("""
+            SELECT DISTINCT a.attname AS column_name
+            FROM pg_class t
+            JOIN pg_namespace ns ON ns.oid = t.relnamespace
+            JOIN pg_index i ON i.indrelid = t.oid
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+            WHERE ns.nspname = :schema_name
+              AND t.relname = :table_name
+              AND i.indisvalid = true
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+        """)
+        try:
+            with self.source_engine.connect() as conn:
+                rows = conn.execute(
+                    idx_sql,
+                    {"schema_name": schema_name, "table_name": table_name}
+                ).fetchall()
+            return {str(r[0]) for r in rows}
+        except Exception as e:
+            logger.warning(
+                f"⚠️ [DB_MANAGER] Failed to read indexed columns for {schema_name}.{table_name}: {e}"
+            )
+            return set()
+
+    def log_index_distribution_preflight(self, source_schema, ordered_tables):
+        """
+        Logs index-awareness preflight before migration execution.
+        """
+        if not ordered_tables:
+            return
+        idx_sql = text("""
+            SELECT tablename, COUNT(*)::int AS idx_count
+            FROM pg_indexes
+            WHERE schemaname = :schema_name
+              AND tablename = ANY(:tables)
+            GROUP BY tablename
+        """)
+        try:
+            with self.source_engine.connect() as conn:
+                rows = conn.execute(
+                    idx_sql,
+                    {"schema_name": source_schema, "tables": list(ordered_tables)}
+                ).fetchall()
+            idx_map = {str(r[0]): int(r[1]) for r in rows}
+            total = sum(idx_map.values())
+            if total > 0:
+                logger.info(
+                    "Indexing patterns detected. Ensuring data distribution maintains index efficiency."
+                )
+                logger.info(
+                    "✅ [DB_MANAGER] Index preflight: %s indexed structures across %s table(s).",
+                    total,
+                    len(idx_map),
+                )
+                for table_name in ordered_tables:
+                    indexed_cols = self.get_indexed_columns(source_schema, table_name)
+                    if not indexed_cols:
+                        continue
+                    saved_plan = self.get_saved_plan(source_schema, table_name) or {}
+                    plan_rows = saved_plan.get("plan", []) if isinstance(saved_plan, dict) else []
+                    for row in plan_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        col_name = str(row.get("column", "")).strip()
+                        strategy = str(row.get("strategy", "keep")).lower().strip()
+                        if not col_name or col_name not in indexed_cols:
+                            continue
+                        if strategy != "keep":
+                            logger.warning(
+                                "⚠️ Column %s is indexed. Ensuring anonymization preserves data distribution.",
+                                col_name,
+                            )
+        except Exception as e:
+            logger.warning(f"⚠️ [DB_MANAGER] Index preflight check failed: {e}")
+
     def reset_structural_sync_counters(self):
         self._structural_sync_counters = {"indexes_recreated": 0, "fks_recreated": 0}
 
@@ -584,6 +664,63 @@ class DBManager:
             self._structural_sync_counters.get("indexes_recreated", 0),
             self._structural_sync_counters.get("fks_recreated", 0),
         )
+
+    def check_fk_integrity(self, source_schema, target_schema, ordered_tables):
+        """
+        Checks orphan FK rows in target schema based on source FK metadata.
+        Returns a list of violations with orphan row counts.
+        """
+        if not ordered_tables:
+            return []
+        fk_meta_sql = text("""
+            SELECT
+                tc.table_name AS child_table,
+                kcu.column_name AS child_column,
+                ccu.table_name AS parent_table,
+                ccu.column_name AS parent_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+             AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = :schema_name
+              AND tc.table_name = ANY(:tables)
+            ORDER BY tc.table_name, kcu.column_name
+        """)
+        violations = []
+        with self.source_engine.connect() as src_conn:
+            fk_rows = src_conn.execute(
+                fk_meta_sql,
+                {"schema_name": source_schema, "tables": list(ordered_tables)}
+            ).fetchall()
+
+        with self.target_engine.connect() as tgt_conn:
+            for row in fk_rows:
+                child_table, child_column, parent_table, parent_column = row[0], row[1], row[2], row[3]
+                orphan_sql = text(
+                    f"""
+                    SELECT COUNT(*)::bigint
+                    FROM {self.quote_identifier(target_schema)}.{self.quote_identifier(child_table)} c
+                    LEFT JOIN {self.quote_identifier(target_schema)}.{self.quote_identifier(parent_table)} p
+                      ON c.{self.quote_identifier(child_column)} = p.{self.quote_identifier(parent_column)}
+                    -- NULL FK values are valid and intentionally ignored in orphan checks.
+                    WHERE c.{self.quote_identifier(child_column)} IS NOT NULL
+                      AND p.{self.quote_identifier(parent_column)} IS NULL
+                    """
+                )
+                orphan_count = int(tgt_conn.execute(orphan_sql).scalar() or 0)
+                if orphan_count > 0:
+                    violations.append({
+                        "child_table": child_table,
+                        "child_column": child_column,
+                        "parent_table": parent_table,
+                        "parent_column": parent_column,
+                        "orphan_count": orphan_count,
+                    })
+        return violations
 
     def create_anonymized_table(self, source_schema, table_name, target_db, target_schema="anon"):
         """
@@ -798,14 +935,26 @@ class DBManager:
             text(f"CREATE TABLE IF NOT EXISTS {quoted_target_schema}.{quoted_table_name} ({ddl})")
         )
 
-    def save_anonymized_table(self, df, table_name, target_schema='anon', conn=None, source_schema='public', preserve_native_columns=None):
+    def save_anonymized_table(
+        self,
+        df,
+        table_name,
+        target_schema='anon',
+        conn=None,
+        source_schema='public',
+        preserve_native_columns=None,
+        disable_constraints_mode=None,
+    ):
         """
         Snima DataFrame u ciljnu tabelu. Ako je 'conn' prisutan, ostaje u istoj sesiji.
         """
         from sqlalchemy import text
 
         def _run_save(active_conn):
+            use_session_replica = str(disable_constraints_mode or "").lower() == "session_replica"
             try:
+                if use_session_replica:
+                    active_conn.execute(text("SET session_replication_role = 'replica';"))
                 self._ensure_target_table_mirror(active_conn, source_schema, target_schema, table_name)
             except Exception as mirror_err:
                 logger.warning(
@@ -813,30 +962,34 @@ class DBManager:
                     "Falling back to DataFrame-based auto-DDL."
                 )
                 self._ensure_target_table_from_dataframe(active_conn, target_schema, table_name, df)
-            safe_df = self._cast_dataframe_to_table_types(
-                df, active_conn, target_schema, table_name, preserve_native_columns=preserve_native_columns
-            )
+            try:
+                safe_df = self._cast_dataframe_to_table_types(
+                    df, active_conn, target_schema, table_name, preserve_native_columns=preserve_native_columns
+                )
 
-            # Osiguravamo šemu ako ne postoji
-            active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.quote_identifier(target_schema)}"))
+                # Osiguravamo šemu ako ne postoji
+                active_conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.quote_identifier(target_schema)}"))
 
-            # Upisujemo podatke koristeći 'append' (TRUNCATE je već odrađen na nivou Batch-a)
-            # KLJUČNO: Ovde koristimo active_conn umesto self.engine
-            safe_df.to_sql(
-                table_name,
-                active_conn,
-                schema=target_schema,
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=1000
-            )
-            target_db_name = make_url(self.target_db_url).database or "target_db"
-            logger.info(
-                f"✅ [DB_MANAGER] Inserted anonymized rows into {target_db_name}.{target_schema}.{table_name} "
-                f"from source schema {source_schema}"
-            )
-            return True
+                # Upisujemo podatke koristeći 'append' (TRUNCATE je već odrađen na nivou Batch-a)
+                # KLJUČNO: Ovde koristimo active_conn umesto self.engine
+                safe_df.to_sql(
+                    table_name,
+                    active_conn,
+                    schema=target_schema,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=1000
+                )
+                target_db_name = make_url(self.target_db_url).database or "target_db"
+                logger.info(
+                    f"✅ [DB_MANAGER] Inserted anonymized rows into {target_db_name}.{target_schema}.{table_name} "
+                    f"from source schema {source_schema}"
+                )
+                return True
+            finally:
+                if use_session_replica:
+                    active_conn.execute(text("SET session_replication_role = 'origin';"))
 
         try:
             if conn:
@@ -936,7 +1089,7 @@ class DBManager:
 
         return pool[index]
 
-    def apply_anonymization_rules(self, df, table_plan, salt=None):
+    def apply_anonymization_rules(self, df, table_plan, salt=None, consistency_seed_map=None):
         """
         Transformacija podataka prema Type-Safe pravilima.
         SADA SA ZAŠTITOM OD 'TypeError' I PROVEROM TIPOVA.
@@ -961,6 +1114,7 @@ class DBManager:
                 return df_anon
 
         effective_salt = salt or "default_plan_salt"
+        consistency_seed_map = consistency_seed_map or {}
         self._apply_runtime_seed()
 
         for item in table_plan:
@@ -1033,7 +1187,8 @@ class DBManager:
             elif strategy == 'hash':
                 def secure_hash(val):
                     if pd.isnull(val): return val
-                    hash_obj = hashlib.sha256(f"{val}{effective_salt}".encode())
+                    column_seed = consistency_seed_map.get(col, effective_salt)
+                    hash_obj = hashlib.sha256(f"{val}{column_seed}".encode())
                     return hash_obj.hexdigest()[:12]
                 df_anon[col] = df_anon[col].apply(secure_hash)
 
@@ -1898,6 +2053,32 @@ class DBManager:
             conn.execute(truncate_sql)
             conn.commit()
             logger.info("✅ [DB_MANAGER] TRUNCATE CASCADE executed and committed successfully")
+
+    def set_fk_constraints_temporarily_disabled(self, target_schema, ordered_tables, disabled=True):
+        """
+        Temporarily disables/enables FK checks around TRUNCATE/INSERT load windows.
+        """
+        if not ordered_tables:
+            return
+        action = "DISABLE" if disabled else "ENABLE"
+        with self.target_engine.connect() as conn:
+            with conn.begin():
+                for table_name in ordered_tables:
+                    exists_row = conn.execute(
+                        text("SELECT to_regclass(:reg_name)"),
+                        {"reg_name": f'"{target_schema}"."{table_name}"'}
+                    ).fetchone()
+                    if not exists_row or not exists_row[0]:
+                        continue
+                    conn.execute(text(
+                        f'ALTER TABLE "{target_schema}"."{table_name}" {action} TRIGGER ALL'
+                    ))
+        logger.info(
+            "✅ [DB_MANAGER] %sD FK trigger checks for %s table(s) in schema '%s'",
+            "DISABLE" if disabled else "ENABLE",
+            len(ordered_tables),
+            target_schema,
+        )
 
     def prepare_subset_metadata(self, conn):
         """

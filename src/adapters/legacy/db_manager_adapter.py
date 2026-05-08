@@ -122,7 +122,13 @@ class DBManagerAdapter(
             clear_mode=clear_mode,
         )
 
-    def apply_anonymization_rules(self, df: Any, table_plan: list[dict], salt: str | None = None) -> Any:
+    def apply_anonymization_rules(
+        self,
+        df: Any,
+        table_plan: list[dict],
+        salt: str | None = None,
+        consistency_seed_map: dict | None = None,
+    ) -> Any:
         use_strategy_engine = str(
             os.getenv("ANONIFY_USE_STRATEGY_ENGINE", "true")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -132,6 +138,7 @@ class DBManagerAdapter(
                 df=df,
                 table_plan=table_plan,
                 salt=salt,
+                consistency_seed_map=consistency_seed_map,
                 faker_instance=getattr(self._db_manager, "fake", None),
                 fallback_legacy_transform=lambda d, p, s: self._db_manager.apply_anonymization_rules(
                     df=d, table_plan=p, salt=s
@@ -139,7 +146,12 @@ class DBManagerAdapter(
             )
 
         logger.info("[ANON_ENGINE] Using legacy DBManager anonymization engine.")
-        return self._db_manager.apply_anonymization_rules(df=df, table_plan=table_plan, salt=salt)
+        return self._db_manager.apply_anonymization_rules(
+            df=df,
+            table_plan=table_plan,
+            salt=salt,
+            consistency_seed_map=consistency_seed_map,
+        )
 
     def ensure_plan_security_metadata(self, schema_name: str, table_name: str) -> tuple[str, str, bool]:
         return self._db_manager.ensure_plan_security_metadata(schema_name=schema_name, table_name=table_name)

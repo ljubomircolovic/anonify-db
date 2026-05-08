@@ -7,6 +7,9 @@ import logging
 import json
 import html
 import numbers
+import hashlib
+from urllib.parse import urlparse
+from datetime import datetime
 from decimal import Decimal
 from sqlalchemy import text
 from src.core.domain.services.unsaved_changes_guard import UnsavedChangesGuard
@@ -206,6 +209,77 @@ def _finalize_close_project():
     st.rerun()
 
 
+def _resolve_target_connection_from_plan(db):
+    """
+    Enforces plan-bound target database connection before execution starts.
+    """
+    plan_meta = st.session_state.get("plan_metadata", {}) or {}
+    active_plan_db_name = str(st.session_state.get("active_plan_db_name", "")).strip()
+    target_db_connection = str(plan_meta.get("target_db_connection", "")).strip()
+    target_db_name = str(plan_meta.get("plan_db_name", "")).strip() or active_plan_db_name
+
+    if target_db_name:
+        db.connect_to_existing_plan_database(target_db_name)
+        st.session_state["connected_plan_db_name"] = target_db_name
+        target_db_connection = db.target_db_url
+        if "plan_metadata" not in st.session_state or not isinstance(st.session_state["plan_metadata"], dict):
+            st.session_state["plan_metadata"] = {}
+        st.session_state["plan_metadata"]["plan_db_name"] = target_db_name
+        st.session_state["plan_metadata"]["target_db_connection"] = target_db_connection
+    elif target_db_connection:
+        parsed = urlparse(target_db_connection)
+        inferred_db = str(parsed.path or "").lstrip("/")
+        if inferred_db:
+            db.connect_to_existing_plan_database(inferred_db)
+            st.session_state["connected_plan_db_name"] = inferred_db
+            target_db_name = inferred_db
+    return target_db_name, target_db_connection
+
+
+@st.dialog("Confirm Execution")
+def _render_execute_confirmation_dialog(
+    db,
+    schema_name,
+    execution_order,
+    progress_slot,
+    status_slot,
+    write_mode,
+    overwrite_clear_mode,
+    truncate_before_migration,
+    execute_disabled,
+):
+    target_db_name = st.session_state.get("pending_execute_target_db_name", "unknown")
+    target_host = st.session_state.get("pending_execute_target_host", "unknown-host")
+    st.warning(f"You are about to transform data in {target_db_name}. Proceed?")
+    st.caption(f"Targeting: {target_db_name} on {target_host}")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Cancel", width="stretch", key="execute_confirm_cancel_btn"):
+            st.rerun()
+    with c2:
+        if st.button("Proceed", type="primary", width="stretch", key="execute_confirm_ok_btn"):
+            if execute_disabled:
+                st.error("Execution is currently blocked by validation checks.")
+                st.stop()
+            with st.spinner("Running execution-order batch anonymization..."):
+                ok = run_all_anonymization(
+                    db=db,
+                    schema_name=schema_name,
+                    execution_order=execution_order,
+                    progress_slot=progress_slot.progress(0.0),
+                    status_slot=status_slot,
+                    write_mode=write_mode,
+                    overwrite_clear_mode=overwrite_clear_mode,
+                    truncate_before_migration=truncate_before_migration,
+                )
+            st.session_state["execution_completed"] = bool(ok)
+            if ok:
+                st.session_state["execution_last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["execution_last_run_db_name"] = target_db_name
+                st.session_state["execution_last_run_host"] = target_host
+            st.rerun()
+
+
 @st.dialog("Finalize Project")
 def _render_finalize_confirmation_dialog():
     st.warning(
@@ -229,6 +303,7 @@ def run_all_anonymization(
     status_slot=None,
     write_mode="overwrite",
     overwrite_clear_mode="truncate_cascade",
+    truncate_before_migration=True,
 ):
     if not execution_order:
         st.error("No execution order found. Run AI scan first.")
@@ -240,15 +315,33 @@ def run_all_anonymization(
     status = status_slot if status_slot is not None else st.empty()
     progress.progress(0.0)
     total = len(execution_order)
+    plan_id = (
+        str((st.session_state.get("plan_metadata", {}) or {}).get("plan_db_name", "")).strip()
+        or str(st.session_state.get("active_plan_db_name", "")).strip()
+    )
+    global_hash_seed = plan_id or "default_plan_salt"
+    logger.info("[Consistency Check] Using Plan ID %s as global hashing seed.", global_hash_seed)
+    st.session_state["consistency_check_seed"] = global_hash_seed
+    status.markdown(f"🧩 **Consistency Check:** Plan ID `{global_hash_seed}` is active as global hashing seed.")
+    db.log_index_distribution_preflight(schema_name, execution_order)
+    consistency_seed_maps = _build_consistency_seed_maps(
+        db,
+        schema_name,
+        execution_order,
+        global_hash_seed,
+    )
+    constraints_mode = "session_replica" if bool(truncate_before_migration) else None
 
-    if str(write_mode).lower() == "overwrite":
+    if bool(truncate_before_migration) and str(write_mode).lower() == "overwrite":
         status.info("Applying overwrite mode: truncating target tables before insert...")
         try:
-            db.truncate_anon_tables("anon", execution_order, clear_mode=overwrite_clear_mode)
+            db.truncate_anon_tables("anon", execution_order, clear_mode="session_replica")
         except Exception as e:
             st.error(f"Failed truncating target tables: {e}")
             status.error("Stopped before execution due to truncate failure.")
             return False
+    elif str(write_mode).lower() == "overwrite":
+        status.info("Overwrite mode selected with truncate disabled by user.")
 
     for idx, table_name in enumerate(execution_order, start=1):
         pct = int((idx / total) * 100)
@@ -262,7 +355,8 @@ def run_all_anonymization(
 
         where_clause = str(saved_data.get('where', '') or '').strip()
         clean_plan = get_clean_plan(saved_data.get('plan', []))
-        table_plan_salt = _resolve_plan_salt(db, schema_name, table_name)
+        # Execution-level deterministic seed is derived from active plan ID.
+        table_plan_salt = global_hash_seed
 
         table_ready, table_create_msg = db.create_anonymized_table(
             source_schema=schema_name,
@@ -275,7 +369,12 @@ def run_all_anonymization(
             return False
 
         full_data = db.read_table(table_name, schema_name, where=where_clause)
-        final_df = db.apply_anonymization_rules(full_data, clean_plan, salt=table_plan_salt)
+        final_df = db.apply_anonymization_rules(
+            full_data,
+            clean_plan,
+            salt=table_plan_salt,
+            consistency_seed_map=consistency_seed_maps.get(table_name, {}),
+        )
         save_ok = db.save_anonymized_table(
             final_df,
             table_name,
@@ -285,6 +384,7 @@ def run_all_anonymization(
                 i.get("column") for i in clean_plan
                 if isinstance(i, dict) and str(i.get("strategy", "keep")).lower() == "keep"
             ],
+            disable_constraints_mode=constraints_mode,
         )
         if not save_ok:
             st.error(f"Saving anonymized data failed for `{table_name}`.")
@@ -315,6 +415,63 @@ def _resolve_plan_salt(db, schema_name, table_name):
         return saved.get("salt")
     salt_val, _, _ = db.ensure_plan_security_metadata(schema_name, table_name)
     return salt_val
+
+
+def _resolve_active_plan_seed(db, schema_name, table_name):
+    """
+    Uses active plan ID as deterministic global seed; falls back to stored plan salt.
+    """
+    plan_id = (
+        str((st.session_state.get("plan_metadata", {}) or {}).get("plan_db_name", "")).strip()
+        or str(st.session_state.get("active_plan_db_name", "")).strip()
+    )
+    return plan_id or _resolve_plan_salt(db, schema_name, table_name)
+
+
+def _build_consistency_seed_maps(db, schema_name, execution_order, global_seed):
+    """
+    Builds per-table seed maps so FK/PK columns share deterministic hash seeds.
+    Mandatory rule: same value + same plan_id(global_seed) => same output.
+    """
+    relations = db.get_all_foreign_keys(schema_name) or []
+    adjacency = {}
+    for table_name in execution_order or []:
+        for pk_col in db.get_primary_keys(schema_name, table_name) or []:
+            adjacency.setdefault((table_name, pk_col), set())
+    for child_table, child_col, parent_table, parent_col in relations:
+        left = (child_table, child_col)
+        right = (parent_table, parent_col)
+        adjacency.setdefault(left, set()).add(right)
+        adjacency.setdefault(right, set()).add(left)
+
+    seed_by_node = {}
+    visited = set()
+    for node in list(adjacency.keys()):
+        if node in visited:
+            continue
+        component = []
+        stack = [node]
+        visited.add(node)
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neigh in adjacency.get(current, set()):
+                if neigh not in visited:
+                    visited.add(neigh)
+                    stack.append(neigh)
+        key = "|".join(sorted(f"{tbl}.{col}" for tbl, col in component))
+        seed = str(global_seed or "default_plan_salt")
+        for member in component:
+            seed_by_node[member] = seed
+
+    per_table = {}
+    for table_name in execution_order or []:
+        table_map = {}
+        for (tbl, col), seed in seed_by_node.items():
+            if tbl == table_name:
+                table_map[col] = seed
+        per_table[table_name] = table_map
+    return per_table
 
 # Helper function for dynamic quoting based on DDL type
 def _get_quoted_value(column_name, col_details, value):
@@ -351,6 +508,7 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
 
     try:
         col_details = db.get_column_details(table_name, schema_name)
+        indexed_columns = db.get_indexed_columns(schema_name, table_name)
         table_pk_columns = set(db.get_primary_keys(schema_name, table_name))
         actual_db_columns = list(col_details.keys())
         invalid_selections = []
@@ -386,6 +544,12 @@ def save_and_move_to_next(db, table_name, schema_name, plan_data, where_clause="
                         f"❌ Column `{col_name}` ({sql_type}) does not support strategy `{strategy}`."
                     )
                     continue
+                if col_name in indexed_columns and strategy in {"mask", "faker_name", "faker_email", "faker_phone", "mapping"}:
+                    if any(token in sql_type for token in ["bigint", "integer", "smallint", "int", "numeric", "decimal", "double", "real", "boolean", "date", "time", "timestamp"]):
+                        invalid_selections.append(
+                            f"❌ Indexed column `{col_name}` ({sql_type}) cannot use `{strategy}` due to index type compatibility."
+                        )
+                        continue
 
                 # --- VALIDATION 1: NOT NULL guard ---
                 if strategy == 'null' and is_nullable == 'NO':
@@ -857,12 +1021,7 @@ def render_planner_tab(db):
                     with include_cols[i % len(include_cols)]:
                         st.checkbox(t_name, key=include_key, on_change=_on_individual_ai_change)
 
-        if st.button(
-            "🤖 Suggest with AI (Unified Scan)",
-            type="primary",
-            disabled=not st.session_state.get('planning_initialized', False),
-            key="explicit_unified_ai_scan_btn"
-        ):
+        if st.session_state.pop("trigger_unified_scan", False):
             selected_tables_set = set(st.session_state.get('selected_tables', []) or [])
             candidate_tables = st.session_state.get('all_tables_list', []) or st.session_state.get('selected_tables', [])
             tables_to_scan = [
@@ -932,7 +1091,45 @@ def render_planner_tab(db):
                 key="bulk_sample_rows"
             ) if bulk_allow_sampling else 0
 
-        if st.button("🪄 Parallel AI Scan", disabled=not selected_multi_tables, type="secondary"):
+        scan_btn_col1, scan_btn_col2 = st.columns(2)
+        with scan_btn_col1:
+            unified_scan_clicked = st.button(
+                "⭐ 🤖 Suggest with AI (Unified Scan)",
+                type="primary",
+                use_container_width=True,
+                disabled=not st.session_state.get('planning_initialized', False),
+                key="explicit_unified_ai_scan_btn",
+                help=(
+                    "Unified Scan (Recommended for Integrity)\n\n"
+                    "How: Sends all table schemas and samples in a single AI request.\n\n"
+                    "Pros: AI understands Foreign Key relationships between tables; More cost-effective "
+                    "(lower token overhead).\n\n"
+                    "Cons: Limited by AI context window (max ~50-100 tables)."
+                ),
+            )
+            if unified_scan_clicked:
+                st.session_state["trigger_unified_scan"] = True
+                st.rerun()
+        with scan_btn_col2:
+            parallel_scan_clicked = st.button(
+                "⭐ 🪄 Parallel AI Scan",
+                type="secondary",
+                use_container_width=True,
+                disabled=not selected_multi_tables,
+                key="parallel_ai_scan_btn_row",
+                help=(
+                    "Parallel AI Scan (Recommended for Scale)\n\n"
+                    "How: Each table is processed independently in parallel threads.\n\n"
+                    "Pros: Extremely fast for large schemas; No context window limits.\n\n"
+                    "Cons: AI doesn't see cross-table relationships; Slightly higher token usage due to "
+                    "repeated prompts."
+                ),
+            )
+            if parallel_scan_clicked:
+                st.session_state["trigger_parallel_scan"] = True
+                st.rerun()
+
+        if st.session_state.pop("trigger_parallel_scan", False):
             with st.status("Running parallel scan...", expanded=True) as scan_status:
                 tables_to_scan = st.session_state.get('planner_multiselect', selected_multi_tables)
                 scan_status.write(f"Queued tables: {', '.join(tables_to_scan)}")
@@ -1433,6 +1630,22 @@ def render_planner_tab(db):
         help="Overwrite truncates target tables before insert. Append keeps existing rows and adds new ones.",
     )
     overwrite_clear_mode = "truncate_cascade"
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stCheckbox"] input[type="checkbox"] {
+            accent-color: #0078d4 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    truncate_before_migration = st.checkbox(
+        "⚠️ Truncate target tables before migration",
+        value=True,
+        key="truncate_before_migration",
+        help="Ensures the target database is clean before re-establishing Foreign Key constraints.",
+    )
     if write_mode_ui.startswith("Overwrite"):
         overwrite_clear_mode_ui = st.selectbox(
             "Overwrite Clear Strategy",
@@ -1458,22 +1671,10 @@ def render_planner_tab(db):
         f"Plan: {db_name} | Domain: {data_domain} | Write Mode: {summary_mode} | Clear Strategy: {summary_strategy}"
     )
 
-    if unsaved_tables:
-        st.warning("⚠️ Cannot finalize. You have unsaved changes in your table configurations.")
-
-    if st.button(
-        "🏁 Finalize & Close Project",
-        type="primary",
-        width="stretch",
-        key="finalize_close_project_btn",
-        disabled=bool(unsaved_tables)
-    ):
-        _render_finalize_confirmation_dialog()
-    st.caption(
-        "🏁 Finalize: Saves the final plan metadata, closes the active database connections, and resets the "
-        "application state for a new session. Ensure all tables are executed before finalizing."
-    )
     execute_disabled = bool(unsaved_tables) or bool(sensitive_keep_violations) or (len(ordered_tables_for_execution) == 0)
+    consistency_seed_badge = str(st.session_state.get("consistency_check_seed", "")).strip()
+    if consistency_seed_badge:
+        st.caption(f"🧩 Consistency Check active | Plan seed: `{consistency_seed_badge}`")
     st.markdown("---")
     if st.button(
         "🚀 Execute Anonymization Pipeline",
@@ -1482,17 +1683,86 @@ def render_planner_tab(db):
         key="global_run_all_tables_bottom",
         disabled=execute_disabled,
     ):
+        plan_db_name, target_conn_url = _resolve_target_connection_from_plan(db)
+        conn_url = str(target_conn_url or getattr(db, "target_db_url", "") or "")
+        parsed = urlparse(conn_url)
+        target_host = parsed.hostname or "unknown-host"
+        target_db_name = plan_db_name or (parsed.path.lstrip("/") if parsed.path else "unknown-db")
+        st.session_state["pending_execute_target_db_name"] = target_db_name
+        st.session_state["pending_execute_target_host"] = target_host
+        st.info(f"Targeting: {target_db_name} on {target_host}")
+        logger.info("Targeting: %s on %s", target_db_name, target_host)
         mode = "overwrite" if write_mode_ui.startswith("Overwrite") else "append"
-        with st.spinner("Running execution-order batch anonymization..."):
-            run_all_anonymization(
-                db=db,
-                schema_name=selected_schema,
-                execution_order=ordered_tables_for_execution,
-                progress_slot=review_progress_slot.progress(0.0),
-                status_slot=review_status_slot,
-                write_mode=mode,
-                overwrite_clear_mode=overwrite_clear_mode,
-            )
+        _render_execute_confirmation_dialog(
+            db=db,
+            schema_name=selected_schema,
+            execution_order=ordered_tables_for_execution,
+            progress_slot=review_progress_slot,
+            status_slot=review_status_slot,
+            write_mode=mode,
+            overwrite_clear_mode=overwrite_clear_mode,
+            truncate_before_migration=truncate_before_migration,
+            execute_disabled=execute_disabled,
+        )
+
+    run_completed = bool(st.session_state.get("execution_completed", False))
+    st.markdown("---")
+    if not run_completed:
+        st.caption("Complete anonymization run before closing the project.")
+    else:
+        run_at = st.session_state.get("execution_last_run_at", "unknown-time")
+        run_db = st.session_state.get("execution_last_run_db_name", "unknown-db")
+        run_host = st.session_state.get("execution_last_run_host", "unknown-host")
+        st.markdown(
+            f"""
+            <div style="border:1px solid #0078d4; border-radius:8px; padding:0.55rem 0.75rem; background:#f0f7ff; color:#0b3d6e; margin-bottom:0.65rem;">
+              <strong>Last Run</strong> | {run_at} | DB: <code>{run_db}</code> | Host: <code>{run_host}</code>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("🔍 Verify Integrity", expanded=False):
+        if st.button(
+            "Run FK Integrity Check",
+            key="run_fk_integrity_check_btn",
+            width="stretch",
+            disabled=not run_completed,
+        ):
+            try:
+                violations = db.check_fk_integrity(
+                    source_schema=selected_schema,
+                    target_schema="anon",
+                    ordered_tables=ordered_tables_for_execution,
+                )
+                if not violations:
+                    st.success("✅ Referential Integrity Verified")
+                else:
+                    st.error("Foreign key integrity violations detected:")
+                    for item in violations:
+                        st.write(
+                            f"- `{item['child_table']}.{item['child_column']}` -> "
+                            f"`{item['parent_table']}.{item['parent_column']}` | "
+                            f"orphan rows: {item['orphan_count']}"
+                        )
+            except Exception as e:
+                st.error(f"FK integrity check failed: {e}")
+
+    if unsaved_tables:
+        st.warning("⚠️ Cannot finalize. You have unsaved changes in your table configurations.")
+
+    if st.button(
+        "🏁 Finalize & Close Project",
+        type="primary" if run_completed else "secondary",
+        width="stretch",
+        key="finalize_close_project_btn",
+        disabled=bool(unsaved_tables) or (not run_completed)
+    ):
+        _render_finalize_confirmation_dialog()
+    st.caption(
+        "🏁 Finalize: Saves the final plan metadata, closes the active database connections, and resets the "
+        "application state for a new session. Ensure all tables are executed before finalizing."
+    )
 
 def render_comparison_tab(db):
     st.subheader("🔍 Side-by-Side Comparison")
@@ -1500,7 +1770,7 @@ def render_comparison_tab(db):
     if 'current_plan' in st.session_state and 'selected_table_info' in st.session_state:
         table_name, schema_name = st.session_state['selected_table_info']
         current_plan = st.session_state['current_plan']
-        current_salt = _resolve_plan_salt(db, schema_name, table_name)
+        current_salt = _resolve_active_plan_seed(db, schema_name, table_name)
         current_locale = st.session_state.get('selected_locale', 'de')  # New
 
         # Fetch sample for comparison

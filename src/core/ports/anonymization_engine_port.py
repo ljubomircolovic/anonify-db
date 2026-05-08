@@ -4,7 +4,13 @@ from typing import Any
 
 class AnonymizationEnginePort(ABC):
     @abstractmethod
-    def apply_anonymization_rules(self, df: Any, table_plan: list[dict], salt: str | None = None) -> Any:
+    def apply_anonymization_rules(
+        self,
+        df: Any,
+        table_plan: list[dict],
+        salt: str | None = None,
+        consistency_seed_map: dict | None = None,
+    ) -> Any:
         raise NotImplementedError
 
     @abstractmethod

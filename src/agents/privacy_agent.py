@@ -69,6 +69,12 @@ class PrivacyAgent:
         - 'mask': Use for sensitive strings like addresses or descriptions.
         - 'keep': Use for safe, non-identifiable data (counts, timestamps, amounts, statuses).
 
+        CONSISTENCY MAPPING (MANDATORY):
+        - If a column is a Foreign Key, it must use the same anonymization function/seed logic as the corresponding Primary Key.
+        - Example: if customers.id is transformed to X-123, then orders.customer_id referencing that key must transform to X-123 as well.
+        - Never propose FK strategies that would break join compatibility with referenced PK values.
+        - Keep anonymized outputs type-compatible with indexed columns.
+
         IMPORTANT: Return ONLY valid JSON.
         """
 
@@ -149,6 +155,10 @@ class PrivacyAgent:
         prompt = (
             "Analyze all provided database tables and identify PII per column.\n"
             "Preserve relational boundaries and infer potential FK links from names/samples.\n\n"
+            "CONSISTENCY MAPPING (MANDATORY):\n"
+            "- Foreign Keys must use the same anonymization function/seed behavior as their referenced Primary Keys.\n"
+            "- If customers.id maps to X-123, orders.customer_id must map to X-123 for matching source values.\n"
+            "- Ensure anonymized values remain type-compatible with likely indexed columns.\n\n"
             "Return ONLY a raw JSON object. Do not include markdown, prose, or any wrapper text.\n"
             "Use exactly this JSON schema:\n"
             "{\n"

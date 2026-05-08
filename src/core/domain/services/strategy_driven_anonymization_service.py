@@ -40,6 +40,7 @@ class StrategyDrivenAnonymizationService:
         df: pd.DataFrame,
         table_plan: list[dict],
         salt: str | None = None,
+        consistency_seed_map: dict | None = None,
         faker_instance: Any = None,
         fallback_legacy_transform: Callable[[pd.DataFrame, list[dict], str | None], pd.DataFrame] | None = None,
     ) -> pd.DataFrame:
@@ -48,6 +49,7 @@ class StrategyDrivenAnonymizationService:
 
         df_anon = df.copy()
         effective_salt = salt or "default_plan_salt"
+        consistency_seed_map = consistency_seed_map or {}
         seeded_faker = self._build_seeded_faker(faker_instance)
 
         for item in table_plan or []:
@@ -70,10 +72,11 @@ class StrategyDrivenAnonymizationService:
                 continue
 
             if strategy in {"mask", "hash", "faker_name", "faker_email", "faker_phone"}:
+                strategy_salt = consistency_seed_map.get(col, effective_salt)
                 df_anon[col] = self._registry.apply(
                     strategy,
                     df_anon[col],
-                    salt=effective_salt,
+                    salt=strategy_salt,
                     original_series=original_series,
                     column_name=col,
                     faker_instance=seeded_faker,
