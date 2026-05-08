@@ -38,11 +38,17 @@ class DBManagerAdapter(
         # Preserves broad compatibility for untouched callsites.
         return getattr(self._db_manager, item)
 
+    def test_metadata_connection(self) -> tuple[bool, str]:
+        return self._db_manager.test_connection()
+
     def get_all_schemas(self) -> list[str]:
         return self._db_manager.get_all_schemas()
 
     def get_tables(self, schema_name: str = "public") -> list[str]:
         return self._db_manager.get_tables(schema_name=schema_name)
+
+    def get_source_schema_catalog(self, schema_name: str = "public") -> list[dict]:
+        return self._db_manager.get_source_schema_catalog(schema_name=schema_name)
 
     def get_tables_in_schema(self, schema: str = "public") -> list[str]:
         return self._db_manager.get_tables_in_schema(schema=schema)

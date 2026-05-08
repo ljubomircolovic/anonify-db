@@ -4,6 +4,10 @@ from typing import Any
 
 class MetadataRepositoryPort(ABC):
     @abstractmethod
+    def test_metadata_connection(self) -> tuple[bool, str]:
+        raise NotImplementedError
+
+    @abstractmethod
     def log_action(
         self,
         user: str,

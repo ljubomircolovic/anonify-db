@@ -2283,3 +2283,34 @@ class DBManager:
         except Exception as e:
             logger.error(f"❌ Error listing tables: {e}")
             return []
+
+    def get_source_schema_catalog(self, schema_name='public'):
+        """
+        Returns source schema tables with PostgreSQL table comments.
+        """
+        query = text("""
+            SELECT
+                relname AS table_name,
+                obj_description(oid) AS description
+            FROM pg_class
+            WHERE relkind = 'r'
+              AND relnamespace = (
+                  SELECT oid
+                  FROM pg_namespace
+                  WHERE nspname = :schema_name
+              )
+            ORDER BY relname;
+        """)
+        try:
+            with self.source_engine.connect() as conn:
+                result = conn.execute(query, {"schema_name": schema_name})
+                rows = []
+                for row in result:
+                    rows.append({
+                        "table_name": row[0],
+                        "description": row[1] if row[1] is not None else "No description available",
+                    })
+                return rows
+        except Exception as e:
+            logger.error(f"❌ Error loading source schema catalog: {e}")
+            return []

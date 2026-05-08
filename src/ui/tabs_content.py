@@ -209,6 +209,58 @@ def _finalize_close_project():
     st.rerun()
 
 
+def _render_target_context_banner(db, context="default"):
+    """Render metadata vs target context with target connectivity check."""
+    plan_meta = st.session_state.get("plan_metadata", {}) or {}
+    metadata_conn_url = str(
+        plan_meta.get("source_db_connection")
+        or plan_meta.get("db_connection")
+        or getattr(db, "source_db_url", "")
+        or ""
+    ).strip()
+    target_conn_url = str(
+        plan_meta.get("target_db_connection")
+        or getattr(db, "target_db_url", "")
+        or ""
+    ).strip()
+    target_db = str(
+        plan_meta.get("plan_db_name")
+        or (urlparse(target_conn_url).path.lstrip("/") if target_conn_url else "")
+        or st.session_state.get("active_plan_db_name", "None")
+    ).strip() or "None"
+    active_schema = str(plan_meta.get("schema_name") or "public").strip() or "public"
+    metadata_host = urlparse(metadata_conn_url).hostname or "unknown-host"
+    metadata_db = (
+        urlparse(metadata_conn_url).path.lstrip("/")
+        if metadata_conn_url and urlparse(metadata_conn_url).path
+        else str(plan_meta.get("db_name") or "unknown-db")
+    ) or "unknown-db"
+    target_host = urlparse(target_conn_url).hostname or "unknown-host"
+
+    cols = st.columns([2, 2, 2, 0.8], gap="small")
+    with cols[0]:
+        st.caption(f"**📂 Metadata:** `{metadata_db}` @ `{metadata_host}`")
+    with cols[1]:
+        st.caption(f"**🎯 Target:** `{target_db}` (`{active_schema}`)")
+    with cols[2]:
+        st.caption(f"**🖥️ Host:** `{target_host}`")
+    with cols[3]:
+        if st.button("⚡ Test", key=f"{context}_target_conn_test_btn", use_container_width=True):
+            try:
+                if db is None:
+                    raise RuntimeError("No active DB manager found")
+                with db.target_engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                st.session_state[f"{context}_target_conn_test_result"] = ("ok", f"{target_host}")
+            except Exception:
+                st.session_state[f"{context}_target_conn_test_result"] = ("fail", f"{target_host}")
+        test_result = st.session_state.get(f"{context}_target_conn_test_result")
+        if isinstance(test_result, tuple):
+            icon = "✅" if test_result[0] == "ok" else "❌"
+            st.caption(f"{icon}")
+    st.caption("Metadata and anonymized target databases can run on different physical servers by design.")
+
+
 def _resolve_target_connection_from_plan(db):
     """
     Enforces plan-bound target database connection before execution starts.
@@ -839,6 +891,7 @@ def _pick_first_table_by_execution_order(result_keys, execution_order):
 def render_planner_tab(db):
     st.subheader("Parallel AI Strategy Planner")
     st.caption("Scan selected tables first, then review and refine anonymization plans in dependency order.")
+    _render_target_context_banner(db, context="planner")
     review_progress_slot = st.empty()
     review_status_slot = st.empty()
     # Always initialize early so downstream button disabled state is safe.
@@ -1675,38 +1728,10 @@ def render_planner_tab(db):
     consistency_seed_badge = str(st.session_state.get("consistency_check_seed", "")).strip()
     if consistency_seed_badge:
         st.caption(f"🧩 Consistency Check active | Plan seed: `{consistency_seed_badge}`")
-    st.markdown("---")
-    if st.button(
-        "🚀 Execute Anonymization Pipeline",
-        type="primary",
-        width="stretch",
-        key="global_run_all_tables_bottom",
-        disabled=execute_disabled,
-    ):
-        plan_db_name, target_conn_url = _resolve_target_connection_from_plan(db)
-        conn_url = str(target_conn_url or getattr(db, "target_db_url", "") or "")
-        parsed = urlparse(conn_url)
-        target_host = parsed.hostname or "unknown-host"
-        target_db_name = plan_db_name or (parsed.path.lstrip("/") if parsed.path else "unknown-db")
-        st.session_state["pending_execute_target_db_name"] = target_db_name
-        st.session_state["pending_execute_target_host"] = target_host
-        st.info(f"Targeting: {target_db_name} on {target_host}")
-        logger.info("Targeting: %s on %s", target_db_name, target_host)
-        mode = "overwrite" if write_mode_ui.startswith("Overwrite") else "append"
-        _render_execute_confirmation_dialog(
-            db=db,
-            schema_name=selected_schema,
-            execution_order=ordered_tables_for_execution,
-            progress_slot=review_progress_slot,
-            status_slot=review_status_slot,
-            write_mode=mode,
-            overwrite_clear_mode=overwrite_clear_mode,
-            truncate_before_migration=truncate_before_migration,
-            execute_disabled=execute_disabled,
-        )
 
     run_completed = bool(st.session_state.get("execution_completed", False))
     st.markdown("---")
+    _render_target_context_banner(db, context="exec")
     if not run_completed:
         st.caption("Complete anonymization run before closing the project.")
     else:
@@ -1751,14 +1776,46 @@ def render_planner_tab(db):
     if unsaved_tables:
         st.warning("⚠️ Cannot finalize. You have unsaved changes in your table configurations.")
 
-    if st.button(
-        "🏁 Finalize & Close Project",
-        type="primary" if run_completed else "secondary",
-        width="stretch",
-        key="finalize_close_project_btn",
-        disabled=bool(unsaved_tables) or (not run_completed)
-    ):
-        _render_finalize_confirmation_dialog()
+    st.markdown("---")
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button(
+            "🚀 Execute Anonymization Pipeline",
+            type="primary",
+            use_container_width=True,
+            key="global_run_all_tables_bottom",
+            disabled=execute_disabled,
+        ):
+            plan_db_name, target_conn_url = _resolve_target_connection_from_plan(db)
+            conn_url = str(target_conn_url or getattr(db, "target_db_url", "") or "")
+            parsed = urlparse(conn_url)
+            target_host = parsed.hostname or "unknown-host"
+            target_db_name = plan_db_name or (parsed.path.lstrip("/") if parsed.path else "unknown-db")
+            st.session_state["pending_execute_target_db_name"] = target_db_name
+            st.session_state["pending_execute_target_host"] = target_host
+            st.info(f"Targeting: {target_db_name} on {target_host}")
+            logger.info("Targeting: %s on %s", target_db_name, target_host)
+            mode = "overwrite" if write_mode_ui.startswith("Overwrite") else "append"
+            _render_execute_confirmation_dialog(
+                db=db,
+                schema_name=selected_schema,
+                execution_order=ordered_tables_for_execution,
+                progress_slot=review_progress_slot,
+                status_slot=review_status_slot,
+                write_mode=mode,
+                overwrite_clear_mode=overwrite_clear_mode,
+                truncate_before_migration=truncate_before_migration,
+                execute_disabled=execute_disabled,
+            )
+    with cols[1]:
+        if st.button(
+            "🏁 Finalize & Close Project",
+            type="primary" if run_completed else "secondary",
+            use_container_width=True,
+            key="finalize_close_project_btn",
+            disabled=bool(unsaved_tables) or (not run_completed)
+        ):
+            _render_finalize_confirmation_dialog()
     st.caption(
         "🏁 Finalize: Saves the final plan metadata, closes the active database connections, and resets the "
         "application state for a new session. Ensure all tables are executed before finalizing."
