@@ -1,6 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import os
 import logging
@@ -11,7 +10,7 @@ from src.database.db_manager import DBManager
 from src.adapters.legacy.db_manager_adapter import DBManagerAdapter
 from src.agents.privacy_agent import PrivacyAgent
 from src.ui.auth import check_login
-from src.ui.sidebar import render_sidebar, render_data_source_section
+from src.ui.sidebar import render_sidebar, render_data_source_section, render_metadata_storage_section
 from src.ui.tabs_content import render_tabs
 from init_db import initialize_metadata
 logger = logging.getLogger(__name__)
@@ -172,16 +171,18 @@ def get_cached_db_adapter(db_url: str, session_scope: str):
 if not check_login():
     st.stop()
 
-# --- 2. COMPACT TOP BAR ---
-top_col1, top_col2, top_col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
-top_col1.markdown(f"👤 **{st.session_state.get('user_name', 'Admin')}**")
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = bool(st.session_state.get("authenticated", True))
 
 from src.ui.sidebar import DB_CONFIGS
-selected_env = top_col2.selectbox(
-    "🔌 Target Environment",
-    options=list(DB_CONFIGS.keys()),
-    label_visibility="collapsed"
-)
+available_envs = list(DB_CONFIGS.keys())
+if not available_envs:
+    st.error("No metadata database connection found. Set DATABASE_URL or DB_URL_* environment variables.")
+    st.stop()
+selected_env = st.session_state.get("selected_env_label", available_envs[0])
+if selected_env not in DB_CONFIGS:
+    selected_env = available_envs[0]
+st.session_state["selected_env_label"] = selected_env
 
 if 'db' not in st.session_state or st.session_state.get('last_env') != selected_env:
     current_url = DB_CONFIGS[selected_env]
@@ -194,6 +195,8 @@ if 'db' not in st.session_state or st.session_state.get('last_env') != selected_
     st.session_state['last_env'] = selected_env
 
 db = st.session_state['db']
+metadata_ok, metadata_message = db.test_metadata_connection()
+st.session_state["metadata_live_status"] = bool(metadata_ok)
 
 if (
     st.session_state.get("active_plan_db_name", "None") != "None"
@@ -203,19 +206,36 @@ if (
     try:
         db.connect_to_existing_plan_database(st.session_state.get("active_plan_db_name", "None"))
         st.session_state["connected_plan_db_name"] = st.session_state.get("active_plan_db_name", "None")
+        if "plan_metadata" not in st.session_state or not isinstance(st.session_state["plan_metadata"], dict):
+            st.session_state["plan_metadata"] = {}
+        st.session_state["plan_metadata"]["plan_db_name"] = st.session_state.get("active_plan_db_name", "None")
+        st.session_state["plan_metadata"]["target_db_connection"] = db.target_db_url
     except Exception:
         st.session_state["project_initialized"] = False
 
-if top_col3.button("Logout", width="stretch"):
-    st.session_state['authenticated'] = False
-    st.rerun()
-
-if top_col3.button("⚡ Test", width="stretch"):
-    success, message = db.test_connection()
-    if success:
-        st.success(message)
-    else:
-        st.error(message)
+if "logged_in" in st.session_state and st.session_state.get("logged_in"):
+    username = str(st.session_state.get("user_name", "admin"))
+    user_role = str(st.session_state.get("user_role", "Administrator"))
+    metadata_connected = bool(st.session_state.get("metadata_live_status", False))
+    metadata_status_text = "● Metadata: Connected" if metadata_connected else "● Metadata: Disconnected"
+    with st.container():
+        cols = st.columns([3, 1.5, 1.5, 1])
+        with cols[0]:
+            st.title("AnonifyDB")
+        with cols[1]:
+            st.write("")
+            st.write(f"👤 **{username}**")
+        with cols[2]:
+            st.write("")
+            st.write(f"ID: {user_role} | {'🟢' if metadata_connected else '🔴'} {metadata_status_text}")
+            if not metadata_connected:
+                st.caption(metadata_message)
+        with cols[3]:
+            st.write("")
+            if st.button("Logout", key="logout_btn"):
+                st.session_state['authenticated'] = False
+                st.session_state['logged_in'] = False
+                st.rerun()
 
 # --- 3. INICIJALIZACIJA (State Management) ---
 if 'agent' not in st.session_state:
@@ -236,16 +256,17 @@ db = st.session_state['db']
 agent = st.session_state['agent']
 
 # --- 4. UI: SIDEBAR ---
-render_sidebar(agent)
+render_sidebar(agent, db)
 
 # --- 5. UI: GLAVNI SADRŽAJ ---
-st.title("🛡️ AnonifyDB Data Engineering Tool")
+render_metadata_storage_section(db)
 with st.container():
     st.markdown("### Plan Selection")
     st.caption(
         "Enter a descriptive name (e.g., 'GDPR Production Prep') or continue with an existing plan database."
     )
-    row1_left, row1_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
+    initialize_clicked = bool(st.session_state.pop("trigger_session_initialize", False))
+    row1_left = st.container()
 
     if "existing_plan_selection" not in st.session_state:
         st.session_state["existing_plan_selection"] = st.session_state.get("selected_existing_plan", "None")
@@ -289,12 +310,6 @@ with st.container():
             placeholder="Enter plan name...",
             on_change=on_plan_name_change,
             label_visibility="visible",
-        )
-    with row1_right:
-        initialize_clicked = st.button(
-            "🚀 Initialize Project",
-            type="primary",
-            use_container_width=True,
         )
     plan_name = str(st.session_state.get("plan_name_input", "")).strip()
     if plan_name:
@@ -349,6 +364,7 @@ if continue_existing_clicked:
             st.session_state["plan_metadata"] = {
                 "plan_db_name": selected_existing_plan,
                 "data_domain": st.session_state.get("data_source_domain_type", "Not Set"),
+                "target_db_connection": db.target_db_url,
             }
             st.session_state["scroll_to_data_source"] = True
             st.success(f"Plan {selected_existing_plan} active. Configure Data Source below.")
@@ -376,6 +392,7 @@ if initialize_clicked:
                 st.session_state["plan_metadata"] = {
                     "plan_db_name": selected_existing_plan,
                     "data_domain": st.session_state.get("data_source_domain_type", "Not Set"),
+                    "target_db_connection": db.target_db_url,
                 }
                 st.session_state["scroll_to_data_source"] = True
                 st.success(f"Plan {selected_existing_plan} active. Configure Data Source below.")
@@ -422,6 +439,7 @@ if initialize_clicked:
                 st.session_state["plan_metadata"] = {
                     "plan_db_name": created_db_name,
                     "data_domain": st.session_state.get("data_source_domain_type", "Not Set"),
+                    "target_db_connection": db.target_db_url,
                 }
                 st.session_state["scroll_to_data_source"] = True
                 st.success(f"Plan {created_db_name} active. Configure Data Source below.")
@@ -447,44 +465,66 @@ is_initialized = (
 if st.session_state.get("active_plan_db_name", "None") != "None":
     st.markdown("---")
     st.markdown("### 📂 Data Source")
-    components.html('<div id="data-source-section"></div>', height=0)
+    st.markdown('<div id="data-source-section"></div>', unsafe_allow_html=True)
     render_data_source_section(db)
     if st.session_state.get("scroll_to_data_source"):
-        components.html(
+        st.markdown(
             """
             <script>
                 const target = window.parent.document.getElementById('data-source-section');
                 if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
             </script>
             """,
-            height=0,
+            unsafe_allow_html=True,
         )
         st.session_state["scroll_to_data_source"] = False
 
 selected_existing_plan = str(st.session_state.get("selected_existing_plan", "")).strip()
 
 ordered_tables = st.session_state.get("all_tables_list", []) or st.session_state.get("selected_tables", [])
-start_enabled = bool(is_initialized and ordered_tables)
+start_enabled = bool(is_initialized)
 if is_initialized:
     st.markdown("---")
-    if st.button("🚀 Start Planning / Load", type="primary", use_container_width=True, disabled=not start_enabled):
-        selected_schema = st.session_state.get("selected_schema", "public")
-        if not ordered_tables:
-            st.error("Please select tables in the sidebar before starting planning.")
-            st.stop()
-        logger.info("[DB_MANAGER] Initializing planning session...")
-        for t_name in ordered_tables:
-            db.ensure_plan_security_metadata(selected_schema, t_name)
-        st.session_state.pop('multi_ai_analysis', None)
-        st.session_state['all_tables_list'] = ordered_tables
-        st.session_state['selected_tables'] = ordered_tables
-        st.session_state['selected_table_info'] = (ordered_tables[0], selected_schema)
-        st.session_state['plan_active'] = False
-        st.session_state['planning_initialized'] = True
-        for key in ['ai_analysis', 'current_plan', 'plan_snapshot', 'last_rendered_table']:
-            if key in st.session_state:
-                del st.session_state[key]
-        logger.info("[DB_MANAGER] Planning session initialized. Awaiting explicit AI scan trigger.")
+    if bool(st.session_state.pop("trigger_session_initialize", False)) and start_enabled:
+        with st.spinner("Establishing secure connection and indexing metadata..."):
+            success, message = db.test_connection()
+            if not success:
+                st.error(message)
+                st.stop()
+
+            selected_schema = st.session_state.get("selected_schema")
+            schemas = db.get_all_schemas()
+            if not selected_schema:
+                selected_schema = schemas[0] if schemas else "public"
+                st.session_state["selected_schema"] = selected_schema
+
+            tables = db.get_tables_in_schema(selected_schema) if selected_schema else []
+            ordered_tables = db.get_execution_order(tables, selected_schema) if selected_schema else []
+            st.session_state["last_confirmed_tables"] = tables
+            st.session_state["all_tables_list"] = ordered_tables
+
+            if "plan_metadata" not in st.session_state or not isinstance(st.session_state["plan_metadata"], dict):
+                st.session_state["plan_metadata"] = {}
+            st.session_state["plan_metadata"]["schema_name"] = selected_schema or "public"
+            st.session_state["plan_metadata"]["db_name"] = str(st.session_state.get("last_env", "None"))
+            st.session_state["plan_metadata"]["plan_db_name"] = st.session_state.get("active_plan_db_name", "None")
+            st.session_state["plan_metadata"]["target_db_connection"] = getattr(db, "target_db_url", "")
+
+            logger.info("[DB_MANAGER] Initializing planning session...")
+            for t_name in ordered_tables:
+                db.ensure_plan_security_metadata(selected_schema, t_name)
+
+            st.session_state.pop('multi_ai_analysis', None)
+            st.session_state['selected_tables'] = ordered_tables
+            st.session_state['project_initialized'] = True
+            st.session_state['plan_active'] = False
+            st.session_state['planning_initialized'] = True
+            if ordered_tables:
+                st.session_state['selected_table_info'] = (ordered_tables[0], selected_schema)
+            for key in ['ai_analysis', 'current_plan', 'plan_snapshot', 'last_rendered_table']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            logger.info("[DB_MANAGER] Planning session initialized. Awaiting explicit AI scan trigger.")
         st.rerun()
 
 if 'selected_table_info' in st.session_state:
