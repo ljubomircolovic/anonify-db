@@ -12,6 +12,7 @@ from src.agents.privacy_agent import PrivacyAgent
 from src.ui.auth import check_login
 from src.ui.sidebar import render_sidebar, render_data_source_section, render_metadata_storage_section
 from src.ui.tabs_content import render_tabs
+from src.ui.main_menu import render_main_menu
 from init_db import initialize_metadata
 logger = logging.getLogger(__name__)
 
@@ -219,23 +220,17 @@ if "logged_in" in st.session_state and st.session_state.get("logged_in"):
     metadata_connected = bool(st.session_state.get("metadata_live_status", False))
     metadata_status_text = "● Metadata: Connected" if metadata_connected else "● Metadata: Disconnected"
     with st.container():
-        cols = st.columns([3, 1.5, 1.5, 1])
+        cols = st.columns([3, 1.5, 1.5, 0.5], vertical_alignment="center")
         with cols[0]:
             st.title("AnonifyDB")
         with cols[1]:
-            st.write("")
             st.write(f"👤 **{username}**")
         with cols[2]:
-            st.write("")
             st.write(f"ID: {user_role} | {'🟢' if metadata_connected else '🔴'} {metadata_status_text}")
             if not metadata_connected:
                 st.caption(metadata_message)
         with cols[3]:
-            st.write("")
-            if st.button("Logout", key="logout_btn"):
-                st.session_state['authenticated'] = False
-                st.session_state['logged_in'] = False
-                st.rerun()
+            render_main_menu()
 
 # --- 3. INICIJALIZACIJA (State Management) ---
 if 'agent' not in st.session_state:
