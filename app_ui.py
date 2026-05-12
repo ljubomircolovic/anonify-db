@@ -10,8 +10,14 @@ from src.database.db_manager import DBManager
 from src.adapters.legacy.db_manager_adapter import DBManagerAdapter
 from src.agents.privacy_agent import PrivacyAgent
 from src.ui.auth import check_login
-from src.ui.sidebar import render_sidebar, render_data_source_section, render_metadata_storage_section
-from src.ui.tabs_content import render_tabs
+from src.ui.sidebar import (
+    render_sidebar,
+    render_data_source_section,  # legacy; kept for callsite parity, no longer rendered
+    render_metadata_storage_section,
+    render_connection_dashboard,
+)
+from src.ui.source_tab import render_source_tab
+from src.ui.tabs_content import render_planner_tab, render_comparison_tab
 from src.ui.main_menu import render_main_menu
 from init_db import initialize_metadata
 logger = logging.getLogger(__name__)
@@ -22,6 +28,109 @@ def _normalize_name_fragment(raw_value: str) -> str:
     while "__" in sanitized:
         sanitized = sanitized.replace("__", "_")
     return sanitized.strip("_")
+
+
+# ---------------------------------------------------------------------------
+# Decoupled workflow helpers
+# ---------------------------------------------------------------------------
+# "Source" (Tab 1) and "Mappings" (Tab 2) are independent: each can be set up
+# in any order. The helpers below split what used to be the monolithic
+# "🚀 Initialize Session" action into two reusable pieces so that:
+#   - scanning the source DB never requires a plan, and
+#   - the plan↔source binding (writing plan_metadata + ensuring
+#     plan_security rows) can be performed retroactively when the user
+#     completes the other half later.
+
+def _bind_plan_metadata_to_source(db, selected_schema, ordered_tables):
+    """Plan-coupled portion of the legacy 'Initialize Session' work.
+
+    Writes plan_metadata for the currently-scanned source and ensures a
+    plan_security row exists for every discovered table. Safe to call
+    multiple times; the function is idempotent at the storage layer.
+    """
+    if "plan_metadata" not in st.session_state or not isinstance(
+        st.session_state["plan_metadata"], dict
+    ):
+        st.session_state["plan_metadata"] = {}
+    st.session_state["plan_metadata"]["schema_name"] = selected_schema or "public"
+    st.session_state["plan_metadata"]["db_name"] = str(
+        st.session_state.get("last_env", "None")
+    )
+    st.session_state["plan_metadata"]["plan_db_name"] = st.session_state.get(
+        "active_plan_db_name", "None"
+    )
+    st.session_state["plan_metadata"]["target_db_connection"] = getattr(
+        db, "target_db_url", ""
+    )
+
+    logger.info("[DB_MANAGER] Binding plan to source: %s tables", len(ordered_tables or []))
+    for t_name in (ordered_tables or []):
+        try:
+            db.ensure_plan_security_metadata(selected_schema, t_name)
+        except Exception as exc:
+            logger.warning("ensure_plan_security_metadata failed for %s: %s", t_name, exc)
+
+    st.session_state.pop("multi_ai_analysis", None)
+    st.session_state["project_initialized"] = True
+    st.session_state["plan_active"] = False
+    st.session_state["planning_initialized"] = True
+    st.session_state["plan_source_binding_key"] = st.session_state.get("active_plan_db_key")
+    for key in ["ai_analysis", "current_plan", "plan_snapshot", "last_rendered_table"]:
+        st.session_state.pop(key, None)
+
+
+def _maybe_auto_bind_plan_to_source(db):
+    """Auto-run the plan↔source binding when both halves are ready.
+
+    Called once per script run after the plan-selection handlers. If the user
+    scanned the source first and then chose a plan (or vice-versa), this is
+    what wires the two together without requiring a second button click.
+    """
+    if not st.session_state.get("source_connected"):
+        return
+    plan_db_key = st.session_state.get("active_plan_db_key")
+    if not plan_db_key:
+        return
+    if not st.session_state.get("project_initialized", False):
+        return
+    if st.session_state.get("plan_source_binding_key") == plan_db_key:
+        return  # already bound to this plan
+
+    _bind_plan_metadata_to_source(
+        db,
+        selected_schema=st.session_state.get("selected_schema") or "public",
+        ordered_tables=st.session_state.get("all_tables_list", []) or [],
+    )
+
+
+def _render_workflow_readiness_warning():
+    """Friendly gate for tabs that need BOTH a source and a plan.
+
+    Returns True when both halves are ready; otherwise renders an inline
+    warning naming the missing piece(s) and returns False so the caller can
+    short-circuit its own rendering.
+    """
+    missing_source = not bool(st.session_state.get("source_connected"))
+    missing_plan = not (
+        bool(st.session_state.get("active_plan_db_key"))
+        and st.session_state.get("project_initialized", False)
+    )
+    if not (missing_source or missing_plan):
+        return True
+
+    if missing_source and missing_plan:
+        st.warning(
+            "Please complete **Source connection in Tab 1** and **Plan selection in Tab 2** to proceed."
+        )
+    elif missing_source:
+        st.warning(
+            "Please complete **Source connection in Tab 1 (Source)** to proceed."
+        )
+    else:
+        st.warning(
+            "Please complete **Plan selection in Tab 2 (Mappings)** to proceed."
+        )
+    return False
 
 
 @st.dialog("High Risk Naming Warning")
@@ -147,6 +256,114 @@ st.markdown('''
         background-color: #0078d4 !important;
         border: none !important;
     }
+
+    /* --- Brand Header (🛡️ AnonifyDB: Data Engineering Tool) ----------- */
+    .adb-app-header {
+        display: flex;
+        align-items: baseline;
+        gap: 0.55rem;
+        margin: 0.25rem 0 0.5rem 0;
+        line-height: 1.15;
+    }
+    .adb-app-header-icon {
+        font-size: 1.75rem;
+        line-height: 1;
+        flex: 0 0 auto;
+        transform: translateY(0.2rem);
+    }
+    .adb-app-header-title {
+        font-size: 1.95rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0;
+        letter-spacing: -0.01em;
+        white-space: nowrap;
+    }
+    .adb-app-header-sub {
+        font-weight: 500;
+        color: #475569;
+        letter-spacing: 0;
+        margin-left: 0.15rem;
+    }
+    @media (max-width: 1200px) {
+        .adb-app-header-title { font-size: 1.7rem; white-space: normal; }
+    }
+    @media (prefers-color-scheme: dark) {
+        .adb-app-header-title { color: #e2e8f0; }
+        .adb-app-header-sub { color: #94a3b8; }
+    }
+
+    /* --- Connection Dashboard (Source · Mappings · Export Target) ------ */
+    .adb-conn-dashboard {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.65rem;
+        margin: 0.4rem 0 1rem 0;
+    }
+    .adb-conn-card {
+        background: rgba(15, 23, 42, 0.03);
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        border-radius: 10px;
+        padding: 0.6rem 0.9rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        min-width: 0;
+    }
+    .adb-conn-head {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-weight: 600;
+        color: #0f172a;
+        font-size: 0.95rem;
+        line-height: 1.2;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .adb-conn-icon { font-size: 1.05rem; line-height: 1; }
+    .adb-conn-label { overflow: hidden; text-overflow: ellipsis; }
+    .adb-conn-body {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        color: #475569;
+        font-size: 0.84rem;
+        flex-wrap: wrap;
+    }
+    .adb-conn-dot { font-size: 0.85rem; line-height: 1; }
+    .adb-conn-state { font-weight: 600; color: #0f172a; }
+    .adb-conn-meta { opacity: 0.85; }
+    .adb-conn-hint {
+        font-size: 0.78rem;
+        color: #64748b;
+        margin-top: 0.15rem;
+    }
+    .adb-conn-card code {
+        background: rgba(0, 120, 212, 0.10) !important;
+        color: #0078d4 !important;
+        padding: 0.05rem 0.35rem;
+        border-radius: 4px;
+        font-size: 0.82rem;
+    }
+    @media (max-width: 1100px) {
+        .adb-conn-dashboard { grid-template-columns: 1fr; }
+    }
+    @media (prefers-color-scheme: dark) {
+        .adb-conn-card {
+            background: rgba(148, 163, 184, 0.06);
+            border-color: rgba(148, 163, 184, 0.18);
+        }
+        .adb-conn-head { color: #e2e8f0; }
+        .adb-conn-body { color: #94a3b8; }
+        .adb-conn-state { color: #e2e8f0; }
+        .adb-conn-hint { color: #94a3b8; }
+        .adb-conn-card code {
+            background: rgba(56, 189, 248, 0.14) !important;
+            color: #38bdf8 !important;
+        }
+    }
 </style>
 ''', unsafe_allow_html=True)
 
@@ -217,20 +434,35 @@ if (
 if "logged_in" in st.session_state and st.session_state.get("logged_in"):
     username = str(st.session_state.get("user_name", "admin"))
     user_role = str(st.session_state.get("user_role", "Administrator"))
-    metadata_connected = bool(st.session_state.get("metadata_live_status", False))
-    metadata_status_text = "● Metadata: Connected" if metadata_connected else "● Metadata: Disconnected"
     with st.container():
-        cols = st.columns([3, 1.5, 1.5, 0.5], vertical_alignment="center")
+        cols = st.columns([3.6, 1.3, 1.0, 0.5], vertical_alignment="center")
         with cols[0]:
-            st.title("AnonifyDB")
+            st.markdown(
+                """
+<div class="adb-app-header">
+  <span class="adb-app-header-icon" aria-hidden="true">🛡️</span>
+  <h1 class="adb-app-header-title">
+    AnonifyDB<span class="adb-app-header-sub">: Data Engineering Tool</span>
+  </h1>
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
         with cols[1]:
             st.write(f"👤 **{username}**")
         with cols[2]:
-            st.write(f"ID: {user_role} | {'🟢' if metadata_connected else '🔴'} {metadata_status_text}")
-            if not metadata_connected:
-                st.caption(metadata_message)
+            st.write(f"ID: {user_role}")
         with cols[3]:
             render_main_menu()
+
+    # Live status of the three data sources the app interacts with. Replaces
+    # the single inline "Metadata: Connected/Disconnected" pill that used to
+    # live next to the user/role cluster.
+    render_connection_dashboard(
+        db,
+        metadata_env_url=DB_CONFIGS.get(selected_env, ""),
+        metadata_message=metadata_message,
+    )
 
 # --- 3. INICIJALIZACIJA (State Management) ---
 if 'agent' not in st.session_state:
@@ -255,13 +487,86 @@ render_sidebar(agent, db)
 
 # --- 5. UI: GLAVNI SADRŽAJ ---
 render_metadata_storage_section(db)
-with st.container():
-    st.markdown("### Plan Selection")
+
+# --- 5a. ENTERPRISE TAB-STRIP THEMING --------------------------------------
+# Subtle Azure-blue active indicator + slate inactive text, matching the rest
+# of the Command Center's enterprise palette.
+st.markdown(
+    """
+<style>
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.25rem;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.10);
+    padding: 0 0 0.15rem 0;
+}
+.stTabs [data-baseweb="tab"] {
+    color: #475569;
+    font-weight: 600;
+    padding: 0.6rem 1.1rem;
+    border-radius: 8px 8px 0 0;
+    transition: background-color 140ms ease-out, color 140ms ease-out;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    background: rgba(0, 120, 212, 0.06);
+    color: #0078d4;
+}
+.stTabs [aria-selected="true"] {
+    color: #0078d4 !important;
+    background: rgba(0, 120, 212, 0.06) !important;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+    background-color: #0078d4 !important;
+}
+.stTabs [data-baseweb="tab-panel"] {
+    padding-top: 1.25rem;
+}
+@media (prefers-color-scheme: dark) {
+    .stTabs [data-baseweb="tab-list"] { border-bottom-color: rgba(148, 163, 184, 0.18); }
+    .stTabs [data-baseweb="tab"] { color: #94a3b8; }
+    .stTabs [data-baseweb="tab"]:hover { color: #38bdf8; background: rgba(56, 189, 248, 0.08); }
+    .stTabs [aria-selected="true"] { color: #38bdf8 !important; background: rgba(56, 189, 248, 0.08) !important; }
+    .stTabs [data-baseweb="tab-highlight"] { background-color: #38bdf8 !important; }
+}
+</style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- 5b. SIX-TAB NAVIGATION ------------------------------------------------
+# Tabs are created up-front so the strip's visual order is stable. Each tab's
+# content is populated below in script order; tabs are populated out of order
+# so the workflow-critical Mappings block runs first (it sets the variables
+# the init handlers need).
+_TAB_LABELS = [
+    "📂 Source",
+    "🛠️ Mappings",
+    "🔍 Comparison",
+    "📤 Export",
+    "📜 Audit",
+    "🆚 Data Selection",
+]
+tab_source, tab_mappings, tab_comparison, tab_export, tab_audit, tab_data_sel = st.tabs(
+    _TAB_LABELS
+)
+
+# ===========================================================================
+# TAB 2 — MAPPINGS  (Plan Selection + Rule Definition / Planner)
+# ===========================================================================
+# This block populates the Mappings tab AND defines the variables consumed by
+# the initialization handlers below. Streamlit's tab context only redirects
+# *element rendering*; Python variable assignments stay in the enclosing
+# script scope, so `plan_name`, `initialize_clicked`, etc. remain accessible
+# to the top-level handlers that follow.
+with tab_mappings:
+    st.markdown("### 🛠️ Plan Selection & Rule Definition")
     st.caption(
-        "Enter a descriptive name (e.g., 'GDPR Production Prep') or continue with an existing plan database."
+        "Enter a descriptive name (e.g., 'GDPR Production Prep') or continue with an existing plan database. "
+        "Plan selection is independent from the source connection — configure them in any order."
     )
-    initialize_clicked = bool(st.session_state.pop("trigger_session_initialize", False))
-    row1_left = st.container()
+    # Plan activation is now driven exclusively by an explicit button inside
+    # this tab. The Source tab's "🚀 Initialize Session" button no longer
+    # implicitly creates a plan; the two flows are fully decoupled.
+    initialize_clicked = False
 
     if "existing_plan_selection" not in st.session_state:
         st.session_state["existing_plan_selection"] = st.session_state.get("selected_existing_plan", "None")
@@ -298,6 +603,7 @@ with st.container():
         else:
             st.session_state["selected_existing_plan"] = "None"
 
+    row1_left, row1_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
     with row1_left:
         st.text_input(
             "Create New Plan",
@@ -311,6 +617,19 @@ with st.container():
         st.session_state["existing_plan_selection"] = "None"
         st.session_state["selected_existing_plan"] = "None"
     st.session_state["plan_name"] = plan_name
+    with row1_right:
+        # Dedicated, in-tab plan activation. The Source tab's Initialize
+        # Session button no longer triggers this — the workflows are
+        # decoupled and either can be completed first.
+        activate_plan_clicked = st.button(
+            "✨ Activate Plan",
+            use_container_width=True,
+            disabled=(not plan_name) or existing_selected_now,
+            help="Create the plan database and activate it for rule definition.",
+            key="mappings_activate_plan_btn",
+        )
+        if activate_plan_clicked:
+            initialize_clicked = True
     allow_custom_naming = st.checkbox(
         "Allow custom name (skip default anon_ safety prefix)",
         key="allow_custom_naming",
@@ -341,6 +660,16 @@ with st.container():
             use_container_width=True,
             disabled=bool(plan_name) or (not bool(selected_existing_plan)) or selected_existing_plan == "None"
         )
+
+    # Inline status hint so users know the plan half is configured (or not)
+    # without needing to leave this tab.
+    if st.session_state.get("active_plan_db_name", "None") not in (None, "None"):
+        st.success(
+            f"Plan active: `{st.session_state.get('active_plan_db_name')}` — "
+            "you can now configure the Source tab (or refine rules below)."
+        )
+    else:
+        st.info("No plan activated yet. Activate or continue a plan above to start defining rules.")
 
 if st.session_state.get("pending_initialize_after_warning") and st.session_state.get("custom_name_warning_confirmed"):
     initialize_clicked = True
@@ -457,73 +786,178 @@ is_initialized = (
     and str(st.session_state.get("active_plan_db_key", "")).startswith(f"{selected_env}:")
 )
 
-if st.session_state.get("active_plan_db_name", "None") != "None":
-    st.markdown("---")
-    st.markdown("### 📂 Data Source")
-    st.markdown('<div id="data-source-section"></div>', unsafe_allow_html=True)
-    render_data_source_section(db)
-    if st.session_state.get("scroll_to_data_source"):
-        st.markdown(
-            """
-            <script>
-                const target = window.parent.document.getElementById('data-source-section');
-                if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            </script>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.session_state["scroll_to_data_source"] = False
-
 selected_existing_plan = str(st.session_state.get("selected_existing_plan", "")).strip()
 
 ordered_tables = st.session_state.get("all_tables_list", []) or st.session_state.get("selected_tables", [])
-start_enabled = bool(is_initialized)
-if is_initialized:
+
+# --- Source scan (spinner) — DECOUPLED FROM PLAN -------------------------
+# The Source tab's "🚀 Initialize Session" button sets
+# `trigger_session_initialize`. We now consume it here regardless of plan
+# state: the source-only work (connection test + schema/table discovery)
+# always runs, and the plan-coupled binding only piggy-backs if a plan
+# happens to already be active in this session.
+if bool(st.session_state.pop("trigger_session_initialize", False)):
+    with st.spinner("Establishing secure connection and indexing source metadata..."):
+        success, message = db.test_connection()
+        if not success:
+            st.error(message)
+            st.stop()
+
+        # ---- Source-only state (works even with no plan) ----
+        st.session_state["source_connected"] = True
+        st.session_state["source_db_connection"] = dict(
+            st.session_state.get("db_config", {}).get("connection", {})
+        )
+
+        selected_schema = st.session_state.get("selected_schema")
+        schemas = db.get_all_schemas()
+        if not selected_schema:
+            selected_schema = schemas[0] if schemas else "public"
+            st.session_state["selected_schema"] = selected_schema
+
+        tables = db.get_tables_in_schema(selected_schema) if selected_schema else []
+        ordered_tables = db.get_execution_order(tables, selected_schema) if selected_schema else []
+        st.session_state["last_confirmed_tables"] = tables
+        st.session_state["all_tables_list"] = ordered_tables
+        st.session_state["selected_tables"] = ordered_tables
+        if ordered_tables:
+            st.session_state["selected_table_info"] = (ordered_tables[0], selected_schema)
+
+        # ---- Plan-coupled binding (only if a plan is also active) ----
+        if is_initialized:
+            _bind_plan_metadata_to_source(db, selected_schema, ordered_tables)
+        else:
+            logger.info(
+                "[DB_MANAGER] Source scanned without an active plan; binding deferred."
+            )
+    st.rerun()
+
+# After plan activation OR after a source-only scan, if both halves are now
+# ready but binding hasn't happened yet (e.g. source-first → plan-second),
+# wire them together here so dependent tabs work on the next render.
+_maybe_auto_bind_plan_to_source(db)
+
+# `scroll_to_data_source` was used by the legacy single-page layout to scroll
+# the viewport to the data-source section after plan initialization. With the
+# tabbed layout the user simply switches to the Source tab, so the flag has
+# no UI effect — we just clear it here to keep session state tidy.
+st.session_state.pop("scroll_to_data_source", None)
+
+
+# ===========================================================================
+# TAB 1 — SOURCE  (Domain · File · Database · API · Source Log)
+# ===========================================================================
+# Fully independent from the Mappings tab — the user can configure and scan
+# the source database without selecting (or even creating) a plan first. The
+# tab is now organized into five collapsible sections rendered by
+# `render_source_tab`. Only the Database section is currently wired into the
+# rest of the workflow; File/API are functional scaffolds with their own
+# session-state slices.
+with tab_source:
+    st.markdown("### 📂 Data Source · Intelligence Context")
+    st.markdown('<div id="data-source-section"></div>', unsafe_allow_html=True)
+    render_source_tab(db)
+
+    if st.session_state.get("source_connected"):
+        plan_name_disp = st.session_state.get("active_plan_db_name", "None")
+        if plan_name_disp not in (None, "None"):
+            st.success(
+                f"Source connected and bound to plan `{plan_name_disp}`. "
+                "Open the **Mappings** tab to define rules, or move on to **Comparison / Export**."
+            )
+        else:
+            st.info(
+                "Source connected. Activate a plan in the **Mappings** tab to start defining anonymization rules."
+            )
+
+
+# ===========================================================================
+# TAB 2 (continued) — MAPPINGS  (Rule Definition / Planner)
+# ===========================================================================
+# Plan Selection above is always available. Rule definition (the planner)
+# additionally needs the Source half: it operates on real columns from the
+# scanned schema, so we gate it on workflow_ready and surface a precise
+# warning if either half is missing.
+with tab_mappings:
     st.markdown("---")
-    if bool(st.session_state.pop("trigger_session_initialize", False)) and start_enabled:
-        with st.spinner("Establishing secure connection and indexing metadata..."):
-            success, message = db.test_connection()
-            if not success:
-                st.error(message)
-                st.stop()
+    if _render_workflow_readiness_warning():
+        render_planner_tab(db)
 
-            selected_schema = st.session_state.get("selected_schema")
-            schemas = db.get_all_schemas()
-            if not selected_schema:
-                selected_schema = schemas[0] if schemas else "public"
-                st.session_state["selected_schema"] = selected_schema
 
-            tables = db.get_tables_in_schema(selected_schema) if selected_schema else []
-            ordered_tables = db.get_execution_order(tables, selected_schema) if selected_schema else []
-            st.session_state["last_confirmed_tables"] = tables
-            st.session_state["all_tables_list"] = ordered_tables
+# ===========================================================================
+# TAB 3 — COMPARISON
+# ===========================================================================
+with tab_comparison:
+    if _render_workflow_readiness_warning():
+        render_comparison_tab(db)
 
-            if "plan_metadata" not in st.session_state or not isinstance(st.session_state["plan_metadata"], dict):
-                st.session_state["plan_metadata"] = {}
-            st.session_state["plan_metadata"]["schema_name"] = selected_schema or "public"
-            st.session_state["plan_metadata"]["db_name"] = str(st.session_state.get("last_env", "None"))
-            st.session_state["plan_metadata"]["plan_db_name"] = st.session_state.get("active_plan_db_name", "None")
-            st.session_state["plan_metadata"]["target_db_connection"] = getattr(db, "target_db_url", "")
 
-            logger.info("[DB_MANAGER] Initializing planning session...")
-            for t_name in ordered_tables:
-                db.ensure_plan_security_metadata(selected_schema, t_name)
-
-            st.session_state.pop('multi_ai_analysis', None)
-            st.session_state['selected_tables'] = ordered_tables
-            st.session_state['project_initialized'] = True
-            st.session_state['plan_active'] = False
-            st.session_state['planning_initialized'] = True
-            if ordered_tables:
-                st.session_state['selected_table_info'] = (ordered_tables[0], selected_schema)
-            for key in ['ai_analysis', 'current_plan', 'plan_snapshot', 'last_rendered_table']:
-                if key in st.session_state:
-                    del st.session_state[key]
-            logger.info("[DB_MANAGER] Planning session initialized. Awaiting explicit AI scan trigger.")
-        st.rerun()
-
-if 'selected_table_info' in st.session_state:
-    if is_initialized:
-        render_tabs(db)
+# ===========================================================================
+# TAB 4 — EXPORT
+# ===========================================================================
+with tab_export:
+    st.markdown("### 📤 Export Anonymized Data")
+    st.caption(
+        "Generate a full anonymized export of the active table using the current plan, "
+        "deterministic salt, and locale."
+    )
+    if not _render_workflow_readiness_warning():
+        pass  # warning already rendered by helper
+    elif 'current_plan' not in st.session_state:
+        st.info(
+            "Define and save anonymization rules in the **Mappings** tab to enable export."
+        )
     else:
-        st.info("Plan workflow is locked until the project is initialized.")
+        from src.ui.tabs_content import _resolve_active_plan_seed
+        export_table_name, export_schema_name = st.session_state['selected_table_info']
+        export_plan = st.session_state['current_plan']
+        export_salt = _resolve_active_plan_seed(db, export_schema_name, export_table_name)
+        export_locale = st.session_state.get('selected_locale', 'de')
+
+        st.markdown(
+            f"**Active table:** `{export_schema_name}.{export_table_name}` &nbsp;·&nbsp; "
+            f"**Locale:** `{export_locale.upper()}`"
+        )
+
+        if st.button("Prepare Full Download (CSV)", key="export_tab_prepare_csv"):
+            with st.spinner("Generating CSV..."):
+                full_df = db.read_table(export_table_name, export_schema_name)
+                full_anon = db.apply_anonymization_rules(
+                    full_df,
+                    export_plan,
+                    salt=export_salt,
+                )
+                csv_bytes = full_anon.to_csv(
+                    index=False, encoding='utf-8-sig'
+                ).encode('utf-8-sig')
+                st.download_button(
+                    label="Click to Download CSV",
+                    data=csv_bytes,
+                    file_name=f"anon_{export_table_name}.csv",
+                    mime="text/csv",
+                    key="export_tab_download_csv",
+                )
+
+
+# ===========================================================================
+# TAB 5 — AUDIT
+# ===========================================================================
+with tab_audit:
+    st.markdown("### 📜 Audit Log")
+    st.caption("Most recent 50 audit events recorded by the metadata database.")
+    try:
+        log_df = db.get_audit_logs(limit=50)
+        if log_df.empty:
+            st.info("No audit logs found yet.")
+        else:
+            st.dataframe(log_df, width="stretch")
+    except Exception as exc:
+        st.error(f"Could not load audit logs: {exc}")
+
+
+# ===========================================================================
+# TAB 6 — DATA SELECTION  (placeholder)
+# ===========================================================================
+with tab_data_sel:
+    st.markdown("### 🆚 Raw vs. Anonymized Selection")
+    st.info("**Feature in development:** Real-time selection comparison.")

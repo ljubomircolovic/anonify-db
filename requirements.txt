@@ -1,4 +1,4 @@
-# --- Core Application ---
+﻿# --- Core Application ---
 streamlit
 pandas
 openpyxl
@@ -16,6 +16,9 @@ langchain-core
 langchain-openai
 langchain-ollama
 pydantic
+
+# --- HTTP / API Source ---
+requests
 
 # --- Data Generation & Processing ---
 Unidecode

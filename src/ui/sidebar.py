@@ -33,6 +33,121 @@ def render_sidebar(agent, db=None):
         st.caption("Global navigation and app-wide controls.")
 
 
+def render_connection_dashboard(db, metadata_env_url: str = "", metadata_message: str = ""):
+    """Three-column horizontal banner showing live status of the three
+    data sources the app interacts with:
+
+      1. 📂 Source       — the raw database to anonymize (from DATABASE_URL)
+      2. 🧠 Mappings     — the metadata "Brain" schema (formerly Metadata)
+      3. 🚀 Export Target — the plan's anonymized target database
+
+    Status is dynamic: 🟢 reflects the most recently confirmed live state
+    (source_connected flag, metadata_live_status, plan binding), 🔴 means
+    not-yet-connected / unreachable / not-configured.
+    """
+    # ---- Source ----------------------------------------------------------
+    source_url = str(getattr(db, "source_db_url", "") or "").strip() or str(
+        os.getenv("DATABASE_URL", "")
+    ).strip()
+    source_parsed = urlparse(source_url) if source_url else None
+    source_host = (source_parsed.hostname if source_parsed else None) or "—"
+    source_db = (
+        source_parsed.path.lstrip("/") if source_parsed and source_parsed.path else None
+    ) or "—"
+    source_ready = bool(st.session_state.get("source_connected"))
+    source_dot = "🟢" if source_ready else "🔴"
+    source_state = "Connected" if source_ready else "Idle"
+    source_hint = "" if source_ready else "Run Initialize Session in the Source tab"
+
+    # ---- Mappings (Brain) -----------------------------------------------
+    metadata_ok_flag = bool(st.session_state.get("metadata_live_status", False))
+    metadata_dot = "🟢" if metadata_ok_flag else "🔴"
+    metadata_state = "Connected" if metadata_ok_flag else "Unreachable"
+    metadata_schema = "metadata"  # fixed by DBManager / init_db
+    meta_url = str(metadata_env_url or getattr(db, "source_db_url", "") or "").strip()
+    meta_parsed = urlparse(meta_url) if meta_url else None
+    meta_host = (meta_parsed.hostname if meta_parsed else None) or "—"
+    meta_db = (
+        meta_parsed.path.lstrip("/") if meta_parsed and meta_parsed.path else None
+    ) or "—"
+    metadata_hint = "" if metadata_ok_flag else (metadata_message or "Check .env credentials")
+
+    # ---- Export Target ---------------------------------------------------
+    plan_name = str(st.session_state.get("active_plan_db_name", "None") or "None")
+    connected_plan = str(st.session_state.get("connected_plan_db_name", "None") or "None")
+    target_url = str(getattr(db, "target_db_url", "") or "").strip()
+    target_parsed = urlparse(target_url) if target_url else None
+    target_host = (target_parsed.hostname if target_parsed else None) or "—"
+    target_db_display = (
+        target_parsed.path.lstrip("/")
+        if target_parsed and target_parsed.path
+        else plan_name if plan_name not in ("", "None") else "—"
+    )
+    target_bound = (
+        plan_name not in ("", "None")
+        and connected_plan == plan_name
+        and target_url
+        and target_url != (getattr(db, "source_db_url", "") or "")
+    )
+    target_dot = "🟢" if target_bound else "🔴"
+    if plan_name in ("", "None"):
+        target_state = "Not configured"
+        target_hint = "Activate a plan in Mappings"
+    elif not target_bound:
+        target_state = "Pending"
+        target_hint = "Reconnecting to plan database"
+    else:
+        target_state = "Bound"
+        target_hint = ""
+
+    def _hint_html(text):
+        return (
+            f'<div class="adb-conn-hint">{text}</div>' if text else ""
+        )
+
+    html = f"""
+<div class="adb-conn-dashboard">
+  <div class="adb-conn-card">
+    <div class="adb-conn-head">
+      <span class="adb-conn-icon">📂</span>
+      <span class="adb-conn-label">Source: <code>{source_db}</code></span>
+    </div>
+    <div class="adb-conn-body">
+      <span class="adb-conn-dot">{source_dot}</span>
+      <span class="adb-conn-state">{source_state}</span>
+      <span class="adb-conn-meta">host <code>{source_host}</code></span>
+    </div>
+    {_hint_html(source_hint)}
+  </div>
+  <div class="adb-conn-card">
+    <div class="adb-conn-head">
+      <span class="adb-conn-icon">🧠</span>
+      <span class="adb-conn-label">Mappings (Brain)</span>
+    </div>
+    <div class="adb-conn-body">
+      <span class="adb-conn-dot">{metadata_dot}</span>
+      <span class="adb-conn-state">{metadata_state}</span>
+      <span class="adb-conn-meta">schema <code>{metadata_schema}</code> on <code>{meta_db}</code></span>
+    </div>
+    {_hint_html(metadata_hint)}
+  </div>
+  <div class="adb-conn-card">
+    <div class="adb-conn-head">
+      <span class="adb-conn-icon">🚀</span>
+      <span class="adb-conn-label">Export Target: <code>{target_db_display}</code></span>
+    </div>
+    <div class="adb-conn-body">
+      <span class="adb-conn-dot">{target_dot}</span>
+      <span class="adb-conn-state">{target_state}</span>
+      <span class="adb-conn-meta">host <code>{target_host}</code></span>
+    </div>
+    {_hint_html(target_hint)}
+  </div>
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def render_metadata_storage_section(db):
     """Central workflow metadata storage configuration."""
     if "plan_metadata" not in st.session_state or not isinstance(st.session_state["plan_metadata"], dict):
@@ -100,7 +215,13 @@ def render_metadata_storage_section(db):
 
 
 def render_data_source_section(db):
-    """Main-page data source configuration, shown after plan initialization."""
+    """Main-page data source configuration.
+
+    Independent of plan selection: the user can configure connection details
+    and trigger an "Initialize Session" (source scan) with or without an
+    active plan. When a plan is also active, the spinner in `app_ui.py`
+    will additionally bind the plan to the freshly-scanned source.
+    """
     with st.expander("🔌 Connection Settings", expanded=False):
         conn_col1, conn_col2 = st.columns(2)
         with conn_col1:
@@ -134,9 +255,18 @@ def render_data_source_section(db):
             type="primary",
             use_container_width=True,
             key="sidebar_initialize_session_btn",
-            help="Click to connect and load metadata",
+            help="Test the source connection and index its schema. No plan required.",
         ):
             st.session_state["trigger_session_initialize"] = True
+            # Snapshot the entered source connection into a dedicated key so
+            # downstream tabs (Comparison, Export, Audit) can read the source
+            # config without depending on plan_metadata.
+            st.session_state["source_db_connection"] = {
+                "host": st.session_state.get("conn_host", ""),
+                "port": st.session_state.get("conn_port", ""),
+                "database_name": st.session_state.get("conn_database_name", ""),
+                "user": st.session_state.get("conn_user", ""),
+            }
 
     st.session_state["db_config"] = {
         "database_type": db_type,
