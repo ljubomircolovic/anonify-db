@@ -7,9 +7,9 @@ to the existing Mappings -> Comparison -> Export pipeline; File and API
 sections are functional scaffolds that store config + provide a 20-row
 preview in their own session-state slices.
 
-Connection details are read-only with respect to `.env`: values from
-`os.getenv("DATABASE_URL")` seed the defaults; user edits live in
-`st.session_state` only and never write back.
+Connection defaults are read from `.env` (`SOURCE_DB_URL`, then `DATABASE_URL`).
+**Confirm Source** persists the active Source configuration to `.env` and locks inputs
+until **Cancel / Change Source** is used.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import streamlit as st
@@ -50,7 +50,25 @@ _QUOTING_OPTIONS: dict[str, int] = {
     "QUOTE_NONNUMERIC": csv.QUOTE_NONNUMERIC,
     "QUOTE_NONE": csv.QUOTE_NONE,
 }
-_DB_TYPES = ["PostgreSQL", "MySQL", "SQL Server", "Oracle"]
+_DB_ENGINES = [
+    "PostgreSQL",
+    "MySQL",
+    "SQL Server",
+    "Oracle",
+    "DB2",
+    "Informix",
+    "Sybase",
+]
+
+_DEFAULT_PORT_BY_ENGINE: dict[str, str] = {
+    "PostgreSQL": "5432",
+    "MySQL": "3306",
+    "SQL Server": "1433",
+    "Oracle": "1521",
+    "DB2": "50000",
+    "Informix": "9088",
+    "Sybase": "5000",
+}
 _HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"]
 _SYSTEM_SCHEMAS = {"pg_catalog", "information_schema", "pg_toast"}
 _LOG_MAX_ENTRIES = 200
@@ -72,6 +90,90 @@ def _normalize_source_type(raw: str | None) -> str:
     return _SOURCE_TYPES[0]
 
 
+_SOURCE_CONFIRM_ENV = "SOURCE_CONFIRMED"
+_SOURCE_DB_URL_ENV = "SOURCE_DB_URL"
+
+
+def _compose_source_database_url() -> str:
+    """Build a PostgreSQL URL from the connection string or discrete fields."""
+    cs = str(st.session_state.get("db_source_conn_string", "")).strip()
+    if cs:
+        return cs
+    host = str(st.session_state.get("conn_host", "") or "").strip()
+    dbn = str(st.session_state.get("conn_database_name", "") or "").strip()
+    port = str(st.session_state.get("conn_port", "") or "5432").strip()
+    user = str(st.session_state.get("conn_user", "") or "").strip()
+    password = str(st.session_state.get("conn_password", "") or "")
+    if not (host and dbn):
+        return ""
+    user_q = quote_plus(user)
+    if password:
+        auth = f"{user_q}:{quote_plus(password)}"
+    else:
+        auth = user_q
+    return f"postgresql://{auth}@{host}:{port}/{dbn}"
+
+
+def _persist_source_confirmation_to_env() -> tuple[bool, str]:
+    """Write confirmed Source settings to `.env` and mirror critical keys into `os.environ`."""
+    try:
+        from dotenv import find_dotenv, set_key
+
+        env_path = find_dotenv(usecwd=True)
+        if not env_path:
+            return False, "No .env file found (use python-dotenv search path)."
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+    active = _normalize_source_type(st.session_state.get("source_type"))
+    try:
+        set_key(env_path, "SOURCE_TYPE", active.upper(), quote_mode="never")
+        os.environ["SOURCE_TYPE"] = active.upper()
+        if active == "Database":
+            url = _compose_source_database_url().strip()
+            if not url:
+                return False, "Provide a connection string or host + database name before confirming."
+            set_key(env_path, _SOURCE_DB_URL_ENV, url, quote_mode="never")
+            os.environ[_SOURCE_DB_URL_ENV] = url
+            schema = str(
+                st.session_state.get("selected_schema")
+                or st.session_state.get("source_schema")
+                or "public"
+            ).strip() or "public"
+            set_key(env_path, "SOURCE_SCHEMA", schema, quote_mode="never")
+            os.environ["SOURCE_SCHEMA"] = schema
+            plan_md = st.session_state.setdefault("plan_metadata", {})
+            if isinstance(plan_md, dict):
+                plan_md["source_db_connection"] = url
+        elif active == "File":
+            path = str(st.session_state.get("file_source_path", "")).strip()
+            set_key(env_path, "SOURCE_FILE_PATH", path, quote_mode="never")
+            os.environ["SOURCE_FILE_PATH"] = path
+        else:
+            api_url = str(st.session_state.get("api_source_url", "")).strip()
+            set_key(env_path, "SOURCE_API_URL", api_url, quote_mode="never")
+            os.environ["SOURCE_API_URL"] = api_url
+
+        set_key(env_path, _SOURCE_CONFIRM_ENV, "1", quote_mode="never")
+        os.environ[_SOURCE_CONFIRM_ENV] = "1"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return True, ""
+
+
+def _clear_source_confirmation_env() -> None:
+    """Best-effort: mark Source as editable again in `.env` for the next cold start."""
+    try:
+        from dotenv import find_dotenv, set_key
+
+        env_path = find_dotenv(usecwd=True)
+        if env_path:
+            set_key(env_path, _SOURCE_CONFIRM_ENV, "0", quote_mode="never")
+        os.environ[_SOURCE_CONFIRM_ENV] = "0"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not clear %s in .env: %s", _SOURCE_CONFIRM_ENV, exc)
+
+
 def _persist_source_type_env(source_type: str) -> None:
     """Best-effort persist `SOURCE_TYPE=<value>` back to `.env`.
 
@@ -88,6 +190,46 @@ def _persist_source_type_env(source_type: str) -> None:
         set_key(env_path, "SOURCE_TYPE", source_type.upper(), quote_mode="never")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not persist SOURCE_TYPE to .env: %s", exc)
+
+
+def _default_port_for_engine(engine: str | None) -> str:
+    if not engine:
+        return "5432"
+    return _DEFAULT_PORT_BY_ENGINE.get(str(engine).strip(), "5432")
+
+
+def _on_db_engine_change() -> None:
+    """When the engine pick changes, align the Port field to that engine's usual default."""
+    eng = str(st.session_state.get("db_source_type") or "PostgreSQL")
+    st.session_state["conn_port"] = _default_port_for_engine(eng)
+
+
+def _sync_domain_from_session() -> None:
+    """Mirror `source_domain` into keys the rest of the app reads."""
+    domain = str(st.session_state.get("source_domain", _DOMAIN_OPTIONS[0]))
+    st.session_state["data_source_domain_type"] = domain
+    st.session_state["data_domain"] = domain
+    plan_md = st.session_state.setdefault("plan_metadata", {})
+    if isinstance(plan_md, dict):
+        plan_md["data_domain"] = domain
+
+
+def _handle_confirm_source_click() -> None:
+    ok, err = _persist_source_confirmation_to_env()
+    if not ok:
+        st.error(err)
+        return
+    st.session_state["source_confirmed"] = True
+    _log_source_event("system", "source_confirmed", source_type=st.session_state.get("source_type"))
+    st.rerun()
+
+
+def _unlock_confirmed_source() -> None:
+    """Leave confirmed state and allow editing again."""
+    st.session_state["source_confirmed"] = False
+    _clear_source_confirmation_env()
+    _log_source_event("system", "source_confirmation_cleared")
+    st.rerun()
 
 
 def _clear_inactive_source_state(active_type: str) -> None:
@@ -125,29 +267,29 @@ def _clear_inactive_source_state(active_type: str) -> None:
 def render_source_tab(db: Any) -> None:
     """Render the Source tab with exclusive source-type selection.
 
-    Layout (top -> bottom):
-        1. Domain Selection           — applies to whichever source is active
-        2. Master Source Selector     — Database / File / API (radio, horizontal)
-        3. Active source section      — exactly one of [DB, File, API]
-        4. Source Log                 — chronological audit of source events
-
-    Switching the master selector clears the inactive sources' previews and
-    metadata (configuration fields are preserved) and persists the new choice
-    to `.env` via `SOURCE_TYPE`.
+    Layout (top → bottom):
+        1. Source control bar (label + status + Change / Cancel / Confirm) + domain row
+        2. Master source (Database / File / API)
+        3. Format or engine sub-selector when File / Database is active
+        4. Active source expander (connection / file / API details)
+        5. Source Log
     """
     _init_source_state()
-    _render_domain_section()
-    _render_master_source_selector()
+    locked = bool(st.session_state.get("source_confirmed"))
+    _render_source_control_bar_and_domain(locked)
+    _render_master_source_selector(locked)
 
     active = _normalize_source_type(st.session_state.get("source_type"))
     if active == "Database":
-        _render_db_source_section(db)
+        _render_db_engine_subselector(locked)
+        _render_db_source_section(db, locked)
     elif active == "File":
-        _render_file_source_section()
+        _render_file_format_subselector(locked)
+        _render_file_source_section(locked)
     elif active == "API":
-        _render_api_source_section()
+        _render_api_source_section(locked)
 
-    _render_source_log_section()
+    _render_source_log_section(locked)
 
 
 def _on_source_type_change() -> None:
@@ -159,10 +301,9 @@ def _on_source_type_change() -> None:
     _log_source_event("system", "source_type_changed", to=new_type)
 
 
-def _render_master_source_selector() -> None:
+def _render_master_source_selector(locked: bool = False) -> None:
     """Top-level radio that determines which source section is rendered."""
-    current = _normalize_source_type(st.session_state.get("source_type"))
-    st.session_state["source_type"] = current  # normalize before widget reads it
+    st.session_state["source_type"] = _normalize_source_type(st.session_state.get("source_type"))
 
     st.markdown("#### Active Data Source")
     st.radio(
@@ -172,13 +313,13 @@ def _render_master_source_selector() -> None:
         key="source_type",
         label_visibility="collapsed",
         on_change=_on_source_type_change,
+        disabled=locked,
         help=(
             "Only the selected source's configuration is rendered. Switching clears "
             "the previous preview/metadata. The choice is persisted to .env as "
             "`SOURCE_TYPE` so the next session opens on the same source."
         ),
     )
-    st.caption(f"Editing **{current}** source configuration.")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +362,14 @@ def _init_source_state() -> None:
     ss.setdefault("api_source_body", "")
     ss.setdefault("api_source_last_response", None)
 
+    ss.setdefault("db_source_type", "PostgreSQL")
+    eng = str(ss.get("db_source_type", "PostgreSQL"))
+    if eng not in _DB_ENGINES:
+        ss["db_source_type"] = "PostgreSQL"
+        eng = "PostgreSQL"
+    if not str(ss.get("conn_port", "")).strip():
+        ss["conn_port"] = _default_port_for_engine(eng)
+
 
 def _log_source_event(kind: str, event: str, **details: Any) -> None:
     """Append a bounded entry to the in-memory Source event log."""
@@ -250,28 +399,165 @@ def _format_size(num_bytes: int | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Section 1 — Domain Selection
+# Source control bar + domain (single-line actions, engineering theme)
 # ---------------------------------------------------------------------------
-def _render_domain_section() -> None:
-    st.markdown("#### Data Domain")
-    current = st.session_state.get("source_domain", _DOMAIN_OPTIONS[0])
-    try:
-        default_idx = _DOMAIN_OPTIONS.index(current)
-    except ValueError:
-        default_idx = 0
-    domain = st.selectbox(
-        "Data Domain",
-        options=_DOMAIN_OPTIONS,
-        index=default_idx,
-        key="source_domain",
-        help="Classify the source so downstream AI rules can apply domain-specific heuristics.",
+def _inject_source_control_bar_styles() -> None:
+    st.markdown(
+        """
+<style>
+.adb-src-control-left {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-width: 0;
+    flex-wrap: nowrap;
+}
+.adb-src-heading {
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: #e2e8f0;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+}
+@media (prefers-color-scheme: light) {
+    .adb-src-heading { color: #0f172a; }
+}
+.adb-src-pill {
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.14rem 0.5rem;
+    border-radius: 999px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+.adb-src-pill--ok {
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.45);
+    background: rgba(34, 197, 94, 0.14);
+}
+.adb-src-pill--draft {
+    color: #fde68a;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    background: rgba(245, 158, 11, 0.14);
+}
+.adb-src-type {
+    font-size: 0.78rem;
+    color: #94a3b8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 11rem;
+}
+@media (prefers-color-scheme: light) {
+    .adb-src-type { color: #64748b; }
+}
+</style>
+        """,
+        unsafe_allow_html=True,
     )
-    # Mirror to keys consumed by the rest of the app.
-    st.session_state["data_source_domain_type"] = domain
-    st.session_state["data_domain"] = domain
-    plan_md = st.session_state.setdefault("plan_metadata", {})
-    if isinstance(plan_md, dict):
-        plan_md["data_domain"] = domain
+
+
+def _render_source_control_bar_and_domain(locked: bool) -> None:
+    """Single-line Source actions (Change / Cancel / Confirm) + status pill; domain row below."""
+    _inject_source_control_bar_styles()
+    src_type = _normalize_source_type(st.session_state.get("source_type"))
+    pill_label = "Confirmed" if locked else "Draft"
+    pill_cls = "adb-src-pill adb-src-pill--ok" if locked else "adb-src-pill adb-src-pill--draft"
+
+    try:
+        bar = st.container(border=True)
+    except TypeError:
+        bar = st.container()
+    with bar:
+        row_left, row_right = st.columns([2.35, 2.65], vertical_alignment="center")
+        with row_left:
+            st.markdown(
+                f'<div class="adb-src-control-left">'
+                f'<span class="adb-src-heading">Source</span>'
+                f'<span class="{pill_cls}">{pill_label}</span>'
+                f'<span class="adb-src-type">{src_type}</span>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with row_right:
+            b1, b2, b3 = st.columns([1, 1, 1], gap="small")
+            with b1:
+                if st.button(
+                    "Change",
+                    key="source_control_change_btn",
+                    disabled=not locked,
+                    use_container_width=True,
+                    help="Unlock source fields to edit configuration.",
+                ):
+                    _unlock_confirmed_source()
+            with b2:
+                if st.button(
+                    "Cancel",
+                    key="source_control_cancel_btn",
+                    disabled=not locked,
+                    use_container_width=True,
+                    help="Exit confirmed state and edit again (same as Change).",
+                ):
+                    _unlock_confirmed_source()
+            with b3:
+                if st.button(
+                    "Confirm",
+                    type="primary",
+                    key="source_confirm_btn",
+                    disabled=locked,
+                    use_container_width=True,
+                    help="Save settings to session and `.env`, then lock inputs.",
+                ):
+                    _handle_confirm_source_click()
+
+    try:
+        di = _DOMAIN_OPTIONS.index(st.session_state.get("source_domain", _DOMAIN_OPTIONS[0]))
+    except ValueError:
+        di = 0
+    st.selectbox(
+        "Domain",
+        options=_DOMAIN_OPTIONS,
+        index=di,
+        key="source_domain",
+        disabled=locked,
+        label_visibility="collapsed",
+        help="Data domain for downstream AI heuristics.",
+    )
+    _sync_domain_from_session()
+
+
+def _render_file_format_subselector(locked: bool) -> None:
+    """Horizontal format pick when File is the active master source."""
+    st.radio(
+        "File format",
+        options=_FILE_TYPES,
+        horizontal=True,
+        key="file_source_type",
+        disabled=locked,
+        label_visibility="collapsed",
+        help="File format used for parsing and preview.",
+    )
+
+
+def _render_db_engine_subselector(locked: bool) -> None:
+    """Engine pick when Database is the active master source; drives default port on change."""
+    cur = st.session_state.get("db_source_type", "PostgreSQL")
+    try:
+        idx = _DB_ENGINES.index(cur)
+    except ValueError:
+        idx = 0
+    st.selectbox(
+        " ",
+        options=_DB_ENGINES,
+        index=idx,
+        key="db_source_type",
+        disabled=locked,
+        label_visibility="collapsed",
+        on_change=_on_db_engine_change,
+        help="Database engine. Changing this sets Port to the usual default for that engine.",
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -310,53 +596,54 @@ def _load_file_dataframe(
     raise ValueError(f"Unsupported file type: {file_type}")
 
 
-def _render_file_source_section() -> None:
+def _render_file_source_section(locked: bool = False) -> None:
     with st.expander("File Source (CSV / JSON / XML / TXT)", expanded=True):
         st.caption(
             "Define a file source. The file is parsed into a Pandas DataFrame for preview only — "
             "it is not yet routed through Mappings / Export."
         )
 
-        c1, c2, c3 = st.columns([1.5, 1, 1])
+        c1, c2 = st.columns([2, 2])
         with c1:
-            st.text_input("Name", key="file_source_name", placeholder="customers_csv")
+            st.text_input("Name", key="file_source_name", placeholder="customers_csv", disabled=locked)
         with c2:
-            st.selectbox("Type", options=_FILE_TYPES, key="file_source_type")
-        with c3:
-            st.selectbox("Encoding", options=_ENCODINGS, key="file_source_encoding")
+            st.selectbox("Encoding", options=_ENCODINGS, key="file_source_encoding", disabled=locked)
 
         st.text_input(
             "Path",
             key="file_source_path",
             placeholder="/absolute/path/to/file.csv (or use the upload below)",
+            disabled=locked,
         )
         uploaded = st.file_uploader(
             "Upload file",
             type=["csv", "json", "xml", "txt"],
             key="file_source_uploader",
+            disabled=locked,
         )
 
         c4, c5, c6, c7 = st.columns(4)
         with c4:
-            st.text_input("Delimiter", key="file_source_delimiter", max_chars=4)
+            st.text_input("Delimiter", key="file_source_delimiter", max_chars=4, disabled=locked)
         with c5:
-            st.text_input("Quotechar", key="file_source_quotechar", max_chars=4)
+            st.text_input("Quotechar", key="file_source_quotechar", max_chars=4, disabled=locked)
         with c6:
             st.selectbox(
                 "Quoting",
                 options=list(_QUOTING_OPTIONS.keys()),
                 key="file_source_quoting",
+                disabled=locked,
             )
         with c7:
-            st.text_input("Escapechar", key="file_source_escapechar", max_chars=4)
+            st.text_input("Escapechar", key="file_source_escapechar", max_chars=4, disabled=locked)
 
         c8, c9 = st.columns(2)
         with c8:
-            st.checkbox("Doublequote", key="file_source_doublequote")
+            st.checkbox("Doublequote", key="file_source_doublequote", disabled=locked)
         with c9:
-            st.checkbox("First row is header", key="file_source_has_header")
+            st.checkbox("First row is header", key="file_source_has_header", disabled=locked)
 
-        if st.button("Load File", key="file_source_load_btn"):
+        if st.button("Load File", key="file_source_load_btn", disabled=locked):
             raw_bytes: bytes | None = None
             size_bytes: int | None = None
             origin: str = ""
@@ -429,6 +716,7 @@ def _render_file_source_section() -> None:
                 options=list(df.columns),
                 default=list(df.columns),
                 key="file_source_selected_columns",
+                disabled=locked,
             )
 
             st.markdown("**Row filter** (pandas `query` syntax) + Limit")
@@ -438,6 +726,7 @@ def _render_file_source_section() -> None:
                     "WHERE (pandas query)",
                     key="file_source_where",
                     placeholder="age > 30 and country == 'DE'",
+                    disabled=locked,
                 )
             with lcol:
                 row_limit = st.number_input(
@@ -447,6 +736,7 @@ def _render_file_source_section() -> None:
                     value=int(st.session_state.get("file_source_row_limit", 100)),
                     step=10,
                     key="file_source_row_limit",
+                    disabled=locked,
                 )
 
             st.markdown("**Column Mapping** (Source → Target)")
@@ -458,7 +748,7 @@ def _render_file_source_section() -> None:
                 mapping_df,
                 num_rows="fixed",
                 use_container_width=True,
-                disabled=["source"],
+                disabled=True if locked else ["source"],
                 key="file_source_column_map_editor",
             )
             st.session_state["file_source_column_map"] = edited_map
@@ -481,6 +771,7 @@ def _render_file_source_section() -> None:
                 if rename_map:
                     preview = preview.rename(columns=rename_map)
 
+                st.divider()
                 st.markdown("**Preview** (first 20 records after filter/mapping)")
                 st.dataframe(preview, use_container_width=True)
             except Exception as exc:  # noqa: BLE001
@@ -491,8 +782,8 @@ def _render_file_source_section() -> None:
 # Section 3 — Database Source
 # ---------------------------------------------------------------------------
 def _parse_env_database_url() -> dict[str, str]:
-    """Parse DATABASE_URL into connection components for read-only defaults."""
-    raw = str(os.getenv("DATABASE_URL", "")).strip()
+    """Parse SOURCE_DB_URL or DATABASE_URL into connection components for defaults."""
+    raw = str(os.getenv("SOURCE_DB_URL") or os.getenv("DATABASE_URL", "")).strip()
     if not raw:
         return {}
     try:
@@ -614,11 +905,11 @@ def _render_technical_metadata(db: Any, schema: str, table: str) -> None:
         st.caption("None")
 
 
-def _render_db_source_section(db: Any) -> None:
+def _render_db_source_section(db: Any, locked: bool = False) -> None:
     with st.expander("Database Source", expanded=True):
         st.caption(
-            ".env values are shown as defaults; edits live in this session only. "
-            "The actual DB connection used for scans is the one loaded from `.env` at app startup."
+            ".env values seed defaults (`SOURCE_DB_URL` or `DATABASE_URL`); edits live in session until "
+            "you click **Confirm Source**, which persists them to `.env`."
         )
 
         env_defaults = _parse_env_database_url()
@@ -635,33 +926,30 @@ def _render_db_source_section(db: Any) -> None:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.text_input("Name", key="db_source_name", placeholder="primary_postgres")
+            st.text_input("Name", key="db_source_name", placeholder="primary_postgres", disabled=locked)
         with c2:
-            st.text_input("Alias", key="db_source_alias", placeholder="prod-pg")
+            st.text_input("Alias", key="db_source_alias", placeholder="prod-pg", disabled=locked)
 
         st.text_input(
             "Connection String",
             key="db_source_conn_string",
             placeholder="postgresql://user:pass@host:5432/dbname",
+            disabled=locked,
         )
 
-        c3, c4 = st.columns([1, 1])
-        with c3:
-            st.selectbox("Type", options=_DB_TYPES, key="db_source_type")
-        with c4:
-            st.text_input("User", key="conn_user")
+        cu, cpw = st.columns(2)
+        with cu:
+            st.text_input("User", key="conn_user", disabled=locked)
+        with cpw:
+            st.text_input("Password", type="password", key="conn_password", disabled=locked)
 
-        c5, c6 = st.columns(2)
-        with c5:
-            st.text_input("Password", type="password", key="conn_password")
-        with c6:
-            st.text_input("Host", key="conn_host")
+        ch, cport = st.columns(2)
+        with ch:
+            st.text_input("Host", key="conn_host", disabled=locked)
+        with cport:
+            st.text_input("Port", key="conn_port", disabled=locked)
 
-        c7, c8 = st.columns([1, 1.5])
-        with c7:
-            st.text_input("Port", key="conn_port")
-        with c8:
-            st.text_input("Database Name", key="conn_database_name")
+        st.text_input("Database Name", key="conn_database_name", disabled=locked)
 
         # ---- Schema selector ----
         try:
@@ -680,6 +968,7 @@ def _render_db_source_section(db: Any) -> None:
                 options=schemas,
                 index=schemas.index(current_schema),
                 key="db_source_schema_select",
+                disabled=locked,
             )
             st.session_state["selected_schema"] = schema_choice
             st.session_state["source_schema"] = schema_choice
@@ -688,6 +977,7 @@ def _render_db_source_section(db: Any) -> None:
                 "Schema",
                 key="db_source_schema_text",
                 placeholder="public",
+                disabled=locked,
             )
             if schema_choice:
                 st.session_state["selected_schema"] = schema_choice
@@ -718,7 +1008,9 @@ def _render_db_source_section(db: Any) -> None:
         # ---- Test connection ----
         tc1, tc2 = st.columns([1, 4])
         with tc1:
-            if st.button("Test Connection", key="db_source_test_btn"):
+            test_clicked = st.button("Test Connection", key="db_source_test_btn", disabled=locked)
+        with tc2:
+            if test_clicked:
                 try:
                     ok, msg = db.test_connection()
                 except Exception as exc:  # noqa: BLE001
@@ -728,14 +1020,9 @@ def _render_db_source_section(db: Any) -> None:
                     "database", "test_connection", ok=bool(ok), msg=str(msg)
                 )
                 if ok:
-                    st.success(msg or "Connection successful.")
+                    st.markdown("**Connection successful! ✅**")
                 else:
                     st.error(msg or "Connection failed.")
-        with tc2:
-            connected = bool(st.session_state.get("source_connected"))
-            st.markdown(
-                f"**Status:** {'🟢 Connected' if connected else '🔴 Not yet tested'}"
-            )
 
         # ---- Table discovery ----
         active_schema = str(st.session_state.get("selected_schema", "") or "")
@@ -759,6 +1046,7 @@ def _render_db_source_section(db: Any) -> None:
             options=available_tables,
             default=default_tables,
             key="db_source_selected_tables",
+            disabled=locked,
         )
 
         if selected_tables:
@@ -771,6 +1059,7 @@ def _render_db_source_section(db: Any) -> None:
                 options=selected_tables,
                 index=active_idx,
                 key="db_source_active_table",
+                disabled=locked,
             )
 
             try:
@@ -783,17 +1072,20 @@ def _render_db_source_section(db: Any) -> None:
                 options=cols_avail,
                 default=cols_avail,
                 key=f"db_source_cols__{active_schema}__{active_table}",
+                disabled=locked,
             )
             st.text_input(
                 "WHERE clause (preview only)",
                 key=f"db_source_where__{active_schema}__{active_table}",
                 placeholder="email IS NOT NULL AND created_at > '2024-01-01'",
+                disabled=locked,
             )
 
             with st.expander("Technical Metadata", expanded=False):
                 _render_technical_metadata(db, active_schema, active_table)
 
-            if st.button("Preview 20 rows", key="db_source_preview_btn"):
+            st.divider()
+            if st.button("Preview 20 rows", key="db_source_preview_btn", disabled=locked):
                 where_clause = str(
                     st.session_state.get(
                         f"db_source_where__{active_schema}__{active_table}", ""
@@ -842,6 +1134,7 @@ def _render_db_source_section(db: Any) -> None:
                 "🚀 Initialize Session",
                 type="primary",
                 key="db_source_initialize_btn",
+                disabled=locked,
                 help="Test the source connection, index schema/tables, and wire them into the rest of the workflow.",
             ):
                 st.session_state["trigger_session_initialize"] = True
@@ -877,7 +1170,7 @@ def _detect_response_language(content_type: str) -> str:
     return "text"
 
 
-def _render_api_source_section() -> None:
+def _render_api_source_section(locked: bool = False) -> None:
     with st.expander("API Source", expanded=True):
         st.caption(
             "Define an HTTP API as a data source. Provides response monitoring and a "
@@ -890,15 +1183,16 @@ def _render_api_source_section() -> None:
                 "URL",
                 key="api_source_url",
                 placeholder="https://api.example.com/customers",
+                disabled=locked,
             )
         with c2:
-            st.selectbox("Method", options=_HTTP_METHODS, key="api_source_method")
+            st.selectbox("Method", options=_HTTP_METHODS, key="api_source_method", disabled=locked)
 
         c3, c4 = st.columns(2)
         with c3:
-            st.text_input("API Key", type="password", key="api_source_api_key")
+            st.text_input("API Key", type="password", key="api_source_api_key", disabled=locked)
         with c4:
-            st.text_input("Secret", type="password", key="api_source_secret")
+            st.text_input("Secret", type="password", key="api_source_secret", disabled=locked)
 
         st.markdown("**Headers**")
         headers_state = st.session_state.setdefault(
@@ -910,6 +1204,7 @@ def _render_api_source_section() -> None:
             num_rows="dynamic",
             use_container_width=True,
             key="api_source_headers_editor",
+            disabled=locked,
         )
         st.session_state["api_source_headers"] = headers_df
 
@@ -918,9 +1213,10 @@ def _render_api_source_section() -> None:
             key="api_source_body",
             height=120,
             placeholder='{"q": "select customers"}',
+            disabled=locked,
         )
 
-        if st.button("Send Request", key="api_source_send_btn"):
+        if st.button("Send Request", key="api_source_send_btn", disabled=locked):
             try:
                 import requests  # type: ignore  # noqa: WPS433 — local import is intentional
             except ImportError:
@@ -1002,6 +1298,7 @@ def _render_api_source_section() -> None:
 
         last = st.session_state.get("api_source_last_response")
         if last:
+            st.divider()
             st.markdown("**Response Monitor**")
             m1, m2, m3 = st.columns(3)
             m1.metric("Status", last["status"])
@@ -1033,7 +1330,7 @@ def _render_api_source_section() -> None:
 # ---------------------------------------------------------------------------
 # Section 5 — Source Log
 # ---------------------------------------------------------------------------
-def _render_source_log_section() -> None:
+def _render_source_log_section(locked: bool = False) -> None:
     with st.expander("Source Log", expanded=False):
         log: list = list(st.session_state.get("source_event_log", []))
         st.caption(
@@ -1042,7 +1339,7 @@ def _render_source_log_section() -> None:
 
         ctl1, ctl2 = st.columns([1, 1])
         with ctl1:
-            if st.button("Clear log", key="source_log_clear_btn"):
+            if st.button("Clear log", key="source_log_clear_btn", disabled=locked):
                 st.session_state["source_event_log"] = []
                 st.rerun()
         with ctl2:
@@ -1053,6 +1350,7 @@ def _render_source_log_section() -> None:
                     file_name="anonifydb_source_log.json",
                     mime="application/json",
                     key="source_log_download_btn",
+                    disabled=locked,
                 )
 
         if not log:
