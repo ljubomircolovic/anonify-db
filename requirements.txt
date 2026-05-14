@@ -1,25 +1,37 @@
-﻿# --- Core Application ---
-streamlit
-pandas
-openpyxl
-python-dotenv
-PyYAML
+﻿# AnonifyDB — third-party dependencies (from import scan + Docker entrypoints).
+#
+# PEP 668 (externally managed Python): use a virtual environment, not system pip:
+#   cd /path/to/anonify-db
+#   python3 -m venv .venv
+#   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+#   pip install -U pip
+#   pip install -r requirements.txt
+
+# --- Core application (Streamlit UI) ---
+streamlit>=1.28.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+PyYAML>=6.0.0
 
 # --- Database ---
-sqlalchemy
-psycopg2-binary
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
 
-# --- AI & Agents ---
-langchain
-langchain-community
-langchain-core
-langchain-openai
-langchain-ollama
-pydantic
+# --- Data generation / anonymization ---
+Faker>=24.0.0
+Unidecode>=1.3.0
 
-# --- HTTP / API Source ---
-requests
+# --- File I/O (Excel via pandas) ---
+openpyxl>=3.1.0
 
-# --- Data Generation & Processing ---
-Unidecode
-faker==24.0.0
+# --- HTTP (optional API source paths) ---
+requests>=2.28.0
+
+# --- AI / planner (privacy_agent) ---
+pydantic>=2.0.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+
+# --- Optional scripts ---
+# vibe_engine.py — Google Gen AI SDK
+google-genai>=1.0.0

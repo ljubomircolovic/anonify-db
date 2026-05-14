@@ -6,7 +6,7 @@ import logging
 from dotenv import load_dotenv
 
 # Importi tvojih modula
-from src.database.db_manager import DBManager
+from src.db import DBManager
 from src.adapters.legacy.db_manager_adapter import DBManagerAdapter
 from src.agents.privacy_agent import PrivacyAgent
 from src.ui.auth import check_login
@@ -15,122 +15,23 @@ from src.ui.sidebar import (
     render_data_source_section,  # legacy; kept for callsite parity, no longer rendered
     render_metadata_storage_section,
     render_connection_dashboard,
+    DB_CONFIGS,
+    DB_ENV_KEY_BY_LABEL,
 )
-from src.ui.source_tab import render_source_tab
-from src.ui.tabs_content import render_planner_tab, render_comparison_tab
+from src.ui.source.source_tab import render_source_tab
+from src.ui.tabs.planner.planner_table_config import render_planner_tab
+from src.ui.tabs_content import render_comparison_tab
+from src.ui.selection_tab import render_selection_tab
 from src.ui.main_menu import render_main_menu
 from init_db import initialize_metadata
+from src.logic.naming import normalize_name_fragment
+from src.logic.workflow import (
+    bind_plan_metadata_to_source,
+    maybe_auto_bind_plan_to_source,
+    render_workflow_readiness_warning,
+)
+
 logger = logging.getLogger(__name__)
-
-
-def _normalize_name_fragment(raw_value: str) -> str:
-    sanitized = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(raw_value or "").strip().lower())
-    while "__" in sanitized:
-        sanitized = sanitized.replace("__", "_")
-    return sanitized.strip("_")
-
-
-# ---------------------------------------------------------------------------
-# Decoupled workflow helpers
-# ---------------------------------------------------------------------------
-# "Source" (Tab 1) and "Mappings" (Tab 2) are independent: each can be set up
-# in any order. The helpers below split what used to be the monolithic
-# "🚀 Initialize Session" action into two reusable pieces so that:
-#   - scanning the source DB never requires a plan, and
-#   - the plan↔source binding (writing plan_metadata + ensuring
-#     plan_security rows) can be performed retroactively when the user
-#     completes the other half later.
-
-def _bind_plan_metadata_to_source(db, selected_schema, ordered_tables):
-    """Plan-coupled portion of the legacy 'Initialize Session' work.
-
-    Writes plan_metadata for the currently-scanned source and ensures a
-    plan_security row exists for every discovered table. Safe to call
-    multiple times; the function is idempotent at the storage layer.
-    """
-    if "plan_metadata" not in st.session_state or not isinstance(
-        st.session_state["plan_metadata"], dict
-    ):
-        st.session_state["plan_metadata"] = {}
-    st.session_state["plan_metadata"]["schema_name"] = selected_schema or "public"
-    st.session_state["plan_metadata"]["db_name"] = str(
-        st.session_state.get("last_env", "None")
-    )
-    st.session_state["plan_metadata"]["plan_db_name"] = st.session_state.get(
-        "active_plan_db_name", "None"
-    )
-    st.session_state["plan_metadata"]["target_db_connection"] = getattr(
-        db, "target_db_url", ""
-    )
-
-    logger.info("[DB_MANAGER] Binding plan to source: %s tables", len(ordered_tables or []))
-    for t_name in (ordered_tables or []):
-        try:
-            db.ensure_plan_security_metadata(selected_schema, t_name)
-        except Exception as exc:
-            logger.warning("ensure_plan_security_metadata failed for %s: %s", t_name, exc)
-
-    st.session_state.pop("multi_ai_analysis", None)
-    st.session_state["project_initialized"] = True
-    st.session_state["plan_active"] = False
-    st.session_state["planning_initialized"] = True
-    st.session_state["plan_source_binding_key"] = st.session_state.get("active_plan_db_key")
-    for key in ["ai_analysis", "current_plan", "plan_snapshot", "last_rendered_table"]:
-        st.session_state.pop(key, None)
-
-
-def _maybe_auto_bind_plan_to_source(db):
-    """Auto-run the plan↔source binding when both halves are ready.
-
-    Called once per script run after the plan-selection handlers. If the user
-    scanned the source first and then chose a plan (or vice-versa), this is
-    what wires the two together without requiring a second button click.
-    """
-    if not st.session_state.get("source_connected"):
-        return
-    plan_db_key = st.session_state.get("active_plan_db_key")
-    if not plan_db_key:
-        return
-    if not st.session_state.get("project_initialized", False):
-        return
-    if st.session_state.get("plan_source_binding_key") == plan_db_key:
-        return  # already bound to this plan
-
-    _bind_plan_metadata_to_source(
-        db,
-        selected_schema=st.session_state.get("selected_schema") or "public",
-        ordered_tables=st.session_state.get("all_tables_list", []) or [],
-    )
-
-
-def _render_workflow_readiness_warning():
-    """Friendly gate for tabs that need BOTH a source and a plan.
-
-    Returns True when both halves are ready; otherwise renders an inline
-    warning naming the missing piece(s) and returns False so the caller can
-    short-circuit its own rendering.
-    """
-    missing_source = not bool(st.session_state.get("source_connected"))
-    missing_plan = not (
-        bool(st.session_state.get("active_plan_db_key"))
-        and st.session_state.get("project_initialized", False)
-    )
-    if not (missing_source or missing_plan):
-        return True
-
-    if missing_source and missing_plan:
-        st.warning(
-            "Please complete **Source connection in Tab 1** and **Plan selection in Tab 2** to proceed."
-        )
-    elif missing_source:
-        st.warning(
-            "Please complete **Source connection in Tab 1 (Source)** to proceed."
-        )
-    else:
-        st.warning(
-            "Please complete **Plan selection in Tab 2 (Mappings)** to proceed."
-        )
-    return False
 
 
 @st.dialog("High Risk Naming Warning")
@@ -158,6 +59,10 @@ def _render_custom_name_warning_dialog():
 # --- 1. SETUP & AUTH ---
 load_dotenv()
 st.set_page_config(page_title="AnonifyDB", layout="wide", initial_sidebar_state="collapsed")
+st.session_state.setdefault(
+    "source_confirmed",
+    str(os.getenv("SOURCE_CONFIRMED", "")).strip().lower() in ("1", "true", "yes"),
+)
 st.markdown('''
 <style>
     /* 1. Target the Multiselect Tags (Pills) */
@@ -462,6 +367,18 @@ if "logged_in" in st.session_state and st.session_state.get("logged_in"):
         db,
         metadata_env_url=DB_CONFIGS.get(selected_env, ""),
         metadata_message=metadata_message,
+        source_tooltip=(
+            "Source: Reading from SOURCE_DB_URL in .env"
+            if st.session_state.get("source_confirmed")
+            else "Source: Defaults read from DATABASE_URL in .env until you confirm Source (saved to SOURCE_DB_URL in .env)"
+        ),
+        mappings_tooltip=(
+            f"Mappings: Reading from {DB_ENV_KEY_BY_LABEL.get(selected_env, 'DATABASE_URL')} in .env"
+        ),
+        export_tooltip=(
+            f"Export: Reading from {DB_ENV_KEY_BY_LABEL.get(selected_env, 'DATABASE_URL')} in .env "
+            "(plan target database name comes from the active plan in Mappings)"
+        ),
     )
 
 # --- 3. INICIJALIZACIJA (State Management) ---
@@ -723,7 +640,7 @@ if initialize_clicked:
             else:
                 effective_plan_name = str(plan_name or "").strip()
                 if (not allow_custom_naming) and (not effective_plan_name.lower().startswith("anon_")):
-                    effective_plan_name = f"anon_{_normalize_name_fragment(effective_plan_name)}"
+                    effective_plan_name = f"anon_{normalize_name_fragment(effective_plan_name)}"
                     st.session_state["plan_name"] = effective_plan_name
 
                 requires_custom_warning = (
@@ -797,45 +714,48 @@ ordered_tables = st.session_state.get("all_tables_list", []) or st.session_state
 # always runs, and the plan-coupled binding only piggy-backs if a plan
 # happens to already be active in this session.
 if bool(st.session_state.pop("trigger_session_initialize", False)):
-    with st.spinner("Establishing secure connection and indexing source metadata..."):
-        success, message = db.test_connection()
-        if not success:
-            st.error(message)
-            st.stop()
+    if not st.session_state.get("source_confirmed"):
+        st.warning("Confirm Source in the **Source** tab before running Initialize Session.")
+    else:
+        with st.spinner("Establishing secure connection and indexing source metadata..."):
+            success, message = db.test_connection()
+            if not success:
+                st.error(message)
+                st.stop()
 
-        # ---- Source-only state (works even with no plan) ----
-        st.session_state["source_connected"] = True
-        st.session_state["source_db_connection"] = dict(
-            st.session_state.get("db_config", {}).get("connection", {})
-        )
-
-        selected_schema = st.session_state.get("selected_schema")
-        schemas = db.get_all_schemas()
-        if not selected_schema:
-            selected_schema = schemas[0] if schemas else "public"
-            st.session_state["selected_schema"] = selected_schema
-
-        tables = db.get_tables_in_schema(selected_schema) if selected_schema else []
-        ordered_tables = db.get_execution_order(tables, selected_schema) if selected_schema else []
-        st.session_state["last_confirmed_tables"] = tables
-        st.session_state["all_tables_list"] = ordered_tables
-        st.session_state["selected_tables"] = ordered_tables
-        if ordered_tables:
-            st.session_state["selected_table_info"] = (ordered_tables[0], selected_schema)
-
-        # ---- Plan-coupled binding (only if a plan is also active) ----
-        if is_initialized:
-            _bind_plan_metadata_to_source(db, selected_schema, ordered_tables)
-        else:
-            logger.info(
-                "[DB_MANAGER] Source scanned without an active plan; binding deferred."
+            # ---- Source-only state (works even with no plan) ----
+            st.session_state["source_connected"] = True
+            st.session_state["source_db_connection"] = dict(
+                st.session_state.get("db_config", {}).get("connection", {})
             )
-    st.rerun()
+
+            selected_schema = st.session_state.get("selected_schema")
+            schemas = db.get_all_schemas()
+            if not selected_schema:
+                selected_schema = schemas[0] if schemas else "public"
+                st.session_state["selected_schema"] = selected_schema
+
+            tables = db.get_tables_in_schema(selected_schema) if selected_schema else []
+            ordered_tables = db.get_execution_order(tables, selected_schema) if selected_schema else []
+            st.session_state["last_confirmed_tables"] = tables
+            st.session_state["all_tables_list"] = ordered_tables
+            st.session_state["selected_tables"] = ordered_tables
+            if ordered_tables:
+                st.session_state["selected_table_info"] = (ordered_tables[0], selected_schema)
+
+            # ---- Plan-coupled binding (only if a plan is also active) ----
+            if is_initialized:
+                bind_plan_metadata_to_source(db, selected_schema, ordered_tables, st.session_state)
+            else:
+                logger.info(
+                    "[DB_MANAGER] Source scanned without an active plan; binding deferred."
+                )
+        st.rerun()
 
 # After plan activation OR after a source-only scan, if both halves are now
 # ready but binding hasn't happened yet (e.g. source-first → plan-second),
 # wire them together here so dependent tabs work on the next render.
-_maybe_auto_bind_plan_to_source(db)
+maybe_auto_bind_plan_to_source(db, st.session_state)
 
 # `scroll_to_data_source` was used by the legacy single-page layout to scroll
 # the viewport to the data-source section after plan initialization. With the
@@ -880,7 +800,7 @@ with tab_source:
 # warning if either half is missing.
 with tab_mappings:
     st.markdown("---")
-    if _render_workflow_readiness_warning():
+    if render_workflow_readiness_warning(st.session_state):
         render_planner_tab(db)
 
 
@@ -888,7 +808,7 @@ with tab_mappings:
 # TAB 3 — COMPARISON
 # ===========================================================================
 with tab_comparison:
-    if _render_workflow_readiness_warning():
+    if render_workflow_readiness_warning(st.session_state):
         render_comparison_tab(db)
 
 
@@ -901,17 +821,18 @@ with tab_export:
         "Generate a full anonymized export of the active table using the current plan, "
         "deterministic salt, and locale."
     )
-    if not _render_workflow_readiness_warning():
+    if not render_workflow_readiness_warning(st.session_state):
         pass  # warning already rendered by helper
     elif 'current_plan' not in st.session_state:
         st.info(
             "Define and save anonymization rules in the **Mappings** tab to enable export."
         )
     else:
-        from src.ui.tabs_content import _resolve_active_plan_seed
+        from src.ui.tabs.planner.planner_secrets import resolve_active_plan_seed
+
         export_table_name, export_schema_name = st.session_state['selected_table_info']
         export_plan = st.session_state['current_plan']
-        export_salt = _resolve_active_plan_seed(db, export_schema_name, export_table_name)
+        export_salt = resolve_active_plan_seed(db, export_schema_name, export_table_name)
         export_locale = st.session_state.get('selected_locale', 'de')
 
         st.markdown(
@@ -959,5 +880,4 @@ with tab_audit:
 # TAB 6 — DATA SELECTION  (placeholder)
 # ===========================================================================
 with tab_data_sel:
-    st.markdown("### 🆚 Raw vs. Anonymized Selection")
-    st.info("**Feature in development:** Real-time selection comparison.")
+    render_selection_tab(db)

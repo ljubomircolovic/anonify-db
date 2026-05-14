@@ -3,7 +3,7 @@ import pandas as pd
 import logging
 import os
 from sqlalchemy import text
-from src.database.db_manager import DBManager
+from src.db import DBManager
 import hashlib
 
 
