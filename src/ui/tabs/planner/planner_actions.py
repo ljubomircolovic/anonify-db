@@ -112,7 +112,7 @@ def render_planner_actions_block(
                 else:
                     st.success("✅ Table configuration saved.")
                 m["current_plan_data"][f"{schema_name}.{table_name}"]["dirty"] = False
-                st.rerun()
+
             st.caption(
                 "Finalize: Saves the final state, clears the active session, and prepares the app for a new project."
             )
@@ -168,7 +168,6 @@ def render_planner_actions_block(
             st.error(f"Failed saving: {', '.join(failed_tables)}")
         else:
             st.toast("✅ All table configurations are now synchronized with the plan.")
-        st.rerun()
 
     write_mode_ui = st.selectbox(
         "Write Mode",

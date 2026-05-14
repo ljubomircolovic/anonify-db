@@ -159,19 +159,21 @@ def seed_db_connection_fields_from_env(state: MutableMapping[str, Any]) -> None:
             state[ss_key] = env_defaults.get(env_key, "")
 
 
-def connection_test_and_init_disabled(locked: bool, state: Mapping[str, Any]) -> bool:
+def connection_test_and_init_disabled(_locked: bool, state: Mapping[str, Any]) -> bool:
     """Return whether Test Connection / Initialize Session should be disabled.
 
-    When the source is not confirmed, actions stay enabled whenever the user
-    can supply parameters. When confirmed (locked), actions remain enabled as
-    long as a URL can be resolved from session **or** from ``SOURCE_DB_URL`` /
-    ``DATABASE_URL`` in the environment, so **Change** is not required merely to
-    unlock Initialize Session.
+    Both actions are disabled when no PostgreSQL URL can be resolved from the
+    connection string or discrete fields, including fallbacks from
+    ``SOURCE_DB_URL`` / ``DATABASE_URL``. A successful **Test Connection** is
+    never required to enable **Initialize Session** — only resolvable settings.
+
+    The ``_locked`` parameter is kept for backward compatibility with callers;
+    only whether a URL can be resolved matters.
 
     Parameters
     ----------
-    locked:
-        ``True`` when the Source tab is in confirmed (read-only) mode.
+    _locked:
+        Ignored; retained for call-site compatibility.
     state:
         Current session mapping.
 
@@ -180,9 +182,4 @@ def connection_test_and_init_disabled(locked: bool, state: Mapping[str, Any]) ->
     bool
         ``True`` if the buttons should be disabled.
     """
-    if not locked:
-        return False
-    if bool(resolve_postgresql_source_url(state).strip()):
-        return False
-    # Extra guard: env URL present even if session keys are momentarily stale.
-    return not bool(str(parse_env_database_url().get("conn_string") or "").strip())
+    return not bool(resolve_postgresql_source_url(state).strip())

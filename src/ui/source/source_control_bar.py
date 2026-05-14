@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, MutableMapping
 
 import streamlit as st
 
 from src.logic.app_state import AppState
 from src.logic.source_constants import DOMAIN_OPTIONS, SOURCE_TYPES
+from src.ui.source import source_session_init as ssi
 from src.ui.source import source_utils as su
 
 __all__ = [
@@ -20,6 +21,30 @@ __all__ = [
 ]
 
 
+def _database_host_database_schema_snapshot(mapping: MutableMapping[str, Any]) -> tuple[str, str, str]:
+    """Host, database name, and schema for **Confirm** dirty-detection (Database source)."""
+    sch = str(mapping.get("selected_schema") or mapping.get("source_schema") or "").strip()
+    return (
+        str(mapping.get("conn_host", "") or "").strip(),
+        str(mapping.get("conn_database_name", "") or "").strip(),
+        sch,
+    )
+
+
+def _database_confirm_button_disabled(m: MutableMapping[str, Any], locked: bool) -> bool:
+    """Whether **Confirm** should be disabled (Database): locked, or Change-gated with no edits."""
+    if locked:
+        return True
+    if not m.get("_db_source_confirm_edit_gate"):
+        return False
+    base = m.get("_db_source_confirm_field_baseline")
+    if not isinstance(base, (tuple, list)) or len(base) != 3:
+        return True
+    cur = _database_host_database_schema_snapshot(m)
+    baseline = tuple(str(x) for x in base)
+    return cur == baseline
+
+
 def handle_confirm_source_click(app: AppState) -> None:
     """Persist confirmation to ``.env`` and lock the Source tab."""
     m = app.mapping
@@ -29,8 +54,9 @@ def handle_confirm_source_click(app: AppState) -> None:
         return
     app.set_source_confirmed(True)
     m["source_locked"] = True
+    m["_db_source_confirm_edit_gate"] = False
+    m.pop("_db_source_confirm_field_baseline", None)
     su.log_source_event(m, "system", "source_confirmed", source_type=m.get("source_type"))
-    st.rerun()
 
 
 def unlock_confirmed_source(app: AppState) -> None:
@@ -38,9 +64,10 @@ def unlock_confirmed_source(app: AppState) -> None:
     m = app.mapping
     app.set_source_confirmed(False)
     m["source_locked"] = False
+    m["_db_source_confirm_edit_gate"] = True
+    m["_db_source_confirm_field_baseline"] = _database_host_database_schema_snapshot(m)
     su.clear_source_confirmation_env()
     su.log_source_event(m, "system", "source_confirmation_cleared")
-    st.rerun()
 
 
 def _on_source_type_change(app: AppState) -> None:
@@ -52,6 +79,8 @@ def _on_source_type_change(app: AppState) -> None:
     su.persist_source_type_env(new_type)
     m.pop("trigger_session_initialize", None)
     m.pop("_db_source_test_feedback", None)
+    m.pop("_db_source_confirm_edit_gate", None)
+    m.pop("_db_source_confirm_field_baseline", None)
     if new_type == "Database" and bool(m.get("source_confirmed")):
         m["source_locked"] = True
     else:
@@ -127,6 +156,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
     with toolbar:
         if src_type == "Database":
             conn_btn_disabled = su.connection_test_and_init_disabled_for_store(locked, m)
+            confirm_disabled = _database_confirm_button_disabled(m, locked)
             try:
                 b0, b1, b2, b3 = st.columns(
                     [1, 1.2, 0.8, 0.8], gap="small", vertical_alignment="center"
@@ -135,69 +165,43 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                 b0, b1, b2, b3 = st.columns([1, 1.2, 0.8, 0.8], gap="small")
 
             with b0:
-                test_clicked = st.button(
+                st.button(
                     "Test Connection",
                     key="db_source_test_btn",
-                    disabled=conn_btn_disabled,
+                    disabled=conn_btn_disabled or db is None,
                     use_container_width=True,
                     help="Verify reachability with the current source settings.",
+                    on_click=lambda: ssi.handle_test_connection(db),
                 )
             with b1:
-                init_clicked = st.button(
+                st.button(
                     "Initialize Session",
-                    type="primary",
                     key="db_source_initialize_btn",
-                    disabled=conn_btn_disabled,
+                    disabled=conn_btn_disabled or db is None,
                     use_container_width=True,
                     help=(
-                        "Test the source connection, index schema/tables, and wire them "
-                        "into the rest of the workflow."
+                        "Connect using the current settings, index schema/tables, and wire them "
+                        "into the rest of the workflow. A separate **Test Connection** is optional."
                     ),
+                    on_click=lambda: ssi.handle_initialization(db),
                 )
             with b2:
-                if st.button(
+                st.button(
                     "Change",
                     key="source_control_change_btn",
                     disabled=not locked,
                     use_container_width=True,
                     help="Unlock source fields to edit configuration.",
-                ):
-                    unlock_confirmed_source(app)
+                    on_click=lambda: unlock_confirmed_source(app),
+                )
             with b3:
-                if st.button(
+                st.button(
                     "Confirm",
-                    type="primary",
                     key="source_confirm_btn",
-                    disabled=locked,
+                    disabled=confirm_disabled,
                     use_container_width=True,
                     help="Save settings to session and `.env`, then lock inputs.",
-                ):
-                    handle_confirm_source_click(app)
-
-            if test_clicked and db is not None:
-                try:
-                    ok, msg = db.test_connection()
-                except Exception as exc:  # noqa: BLE001
-                    ok, msg = False, str(exc)
-                m["source_connected"] = bool(ok)
-                su.log_source_event(m, "database", "test_connection", ok=bool(ok), msg=str(msg))
-                if ok:
-                    m["_db_source_test_feedback"] = ("ok", msg or "Connection successful! ✅")
-                else:
-                    m["_db_source_test_feedback"] = ("err", msg or "Connection failed.")
-
-            if init_clicked:
-                m["trigger_session_initialize"] = True
-                su.sync_db_config_dict_from_session(m)
-                m["source_db_connection"] = dict(m["db_config"]["connection"])
-                active_schema = str(m.get("selected_schema", "") or "")
-                selected_tables = list(m.get("db_source_selected_tables") or [])
-                su.log_source_event(
-                    m,
-                    "database",
-                    "init_triggered",
-                    schema=active_schema,
-                    tables=selected_tables,
+                    on_click=lambda: handle_confirm_source_click(app),
                 )
 
             fb = m.get("_db_source_test_feedback")
@@ -219,21 +223,22 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
             with z1:
                 st.empty()
             with b_ch:
-                if st.button(
+                st.button(
                     "Change",
                     key="source_control_change_btn",
                     disabled=not locked,
                     use_container_width=True,
                     help="Unlock source fields to edit configuration.",
-                ):
-                    unlock_confirmed_source(app)
+                    on_click=unlock_confirmed_source,
+                    args=(app,),
+                )
             with b_cf:
-                if st.button(
+                st.button(
                     "Confirm",
-                    type="primary",
                     key="source_confirm_btn",
                     disabled=locked,
                     use_container_width=True,
                     help="Save settings to session and `.env`, then lock inputs.",
-                ):
-                    handle_confirm_source_click(app)
+                    on_click=handle_confirm_source_click,
+                    args=(app,),
+                )

@@ -1,6 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 import streamlit as st
 from src.db import DBManager
+from src.ui.source.source_session_init import handle_initialization
 import os
 from urllib.parse import urlparse
 
@@ -146,6 +147,11 @@ def render_connection_dashboard(
         st.caption(f"`{target_db_display}` @ `{target_host}` · {target_state}")
         if target_hint:
             st.caption(target_hint)
+        # Source of truth for SQL mirroring / twin schema label (same string as this caption).
+        if target_bound and isinstance(target_db_display, str) and target_db_display.strip() not in ("", "—"):
+            st.session_state["export_target"] = target_db_display.strip()
+        else:
+            st.session_state.pop("export_target", None)
 
 
 def render_metadata_storage_section(db):
@@ -220,8 +226,8 @@ def render_data_source_section(db):
 
     Independent of plan selection: the user can configure connection details
     and trigger an "Initialize Session" (source scan) with or without an
-    active plan. When a plan is also active, the spinner in `app_ui.py`
-    will additionally bind the plan to the freshly-scanned source.
+    active plan. When a plan is also active, ``handle_initialization`` in
+    ``source_session_init`` additionally binds the plan to the freshly-scanned source.
     """
     with st.expander("🔌 Connection Settings", expanded=False):
         conn_col1, conn_col2 = st.columns(2)
@@ -251,23 +257,14 @@ def render_data_source_section(db):
         )
     with col3:
         st.markdown('<div style="padding-top: 28px;"></div>', unsafe_allow_html=True)
-        if st.button(
+        st.button(
             "🚀 Initialize Session",
             type="primary",
             use_container_width=True,
             key="sidebar_initialize_session_btn",
             help="Test the source connection and index its schema. No plan required.",
-        ):
-            st.session_state["trigger_session_initialize"] = True
-            # Snapshot the entered source connection into a dedicated key so
-            # downstream tabs (Comparison, Export, Audit) can read the source
-            # config without depending on plan_metadata.
-            st.session_state["source_db_connection"] = {
-                "host": st.session_state.get("conn_host", ""),
-                "port": st.session_state.get("conn_port", ""),
-                "database_name": st.session_state.get("conn_database_name", ""),
-                "user": st.session_state.get("conn_user", ""),
-            }
+            on_click=lambda: handle_initialization(db),
+        )
 
     st.session_state["db_config"] = {
         "database_type": db_type,

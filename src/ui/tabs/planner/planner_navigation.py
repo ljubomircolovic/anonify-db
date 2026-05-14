@@ -21,12 +21,10 @@ def render_nav_buttons():
         if st.button("⬅️ Back", disabled=(pointer <= 0), width="stretch"):
             st.session_state['history_pointer'] -= 1
             st.session_state['selected_table_info'] = history[st.session_state['history_pointer']]
-            st.rerun()
     with n_col2:
         if st.button("Next ➡️", disabled=(pointer >= len(history) - 1), width="stretch"):
             st.session_state['history_pointer'] += 1
             st.session_state['selected_table_info'] = history[st.session_state['history_pointer']]
-            st.rerun()
 
 def get_next_table_in_chain(current_table, all_tables, completed_tables):
     """

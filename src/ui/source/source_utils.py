@@ -79,7 +79,7 @@ def sync_db_config_dict_from_session(m: MutableMapping[str, Any]) -> None:
 
 
 def connection_test_and_init_disabled_for_store(locked: bool, m: MutableMapping[str, Any]) -> bool:
-    """Whether Test Connection / Initialize Session should be disabled."""
+    """Whether Test Connection / Initialize Session should be disabled (no URL resolved)."""
     return connection_test_and_init_disabled(locked, m)
 
 
@@ -215,6 +215,7 @@ def init_source_state(app: AppState) -> None:
         m["conn_port"] = default_port_for_engine(eng)
 
     seed_db_connection_fields_from_env(m)
+    m.setdefault("_db_source_confirm_edit_gate", False)
     env_schema = str(os.getenv("SOURCE_SCHEMA", "")).strip()
     if env_schema:
         m.setdefault("selected_schema", env_schema)

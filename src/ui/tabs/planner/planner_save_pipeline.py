@@ -264,10 +264,8 @@ def save_and_move_to_next(
 
         st.success(f"✅ Saved! Moving to {next_table}...")
         time.sleep(0.5)
-        st.rerun()
     else:
         st.success("🎯 All tables finalized! Ready for Batch execution.")
         st.session_state["plan_active"] = False
         time.sleep(1)
-        st.rerun()
     return True

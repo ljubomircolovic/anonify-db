@@ -104,7 +104,6 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
             prev_schema = current_table_info[1] if isinstance(current_table_info, tuple) else schema_name
             _persist_current_plan_for_table(prev_schema, prev_table)
         _set_active_table_by_index(target_index, ordered_tables, schema_name)
-        st.rerun()
 
     def _render_execution_roadmap(ordered_tables, completed_tables, schema_name):
         if not ordered_tables:
@@ -136,18 +135,19 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
     if 'plan_active' not in m:
         m['plan_active'] = False
 
-    # 2. Global integrity settings (sidebar)
-    with st.sidebar:
+    # Global integrity settings (main tab body — avoids sidebar scope issues with tabs/fragments).
+    with st.expander("⛓️ Integrity Lock Settings", expanded=False):
         lock_title_col, lock_help_col = st.columns([12, 1], gap="small")
         with lock_title_col:
-            st.markdown("### ⛓️ Integrity Lock Settings")
+            st.markdown("**⛓️ Referential integrity**")
         with lock_help_col:
             st.markdown(
-                '<div style="padding-top: 0.6rem; font-size: 1.1rem;" title="Controls foreign key enforcement. Strict ensures all relations are valid.">⭐</div>',
-                unsafe_allow_html=True
+                '<div style="padding-top: 0.35rem; font-size: 1.1rem;" title="Controls foreign key enforcement. '
+                'Strict ensures all relations are valid.">⭐</div>',
+                unsafe_allow_html=True,
             )
-        global_lock = st.checkbox("Force Referential Integrity", value=True, key="global_lock_check")
-        global_integrity_val = st.text_input("Global ID Sync:", value="1", key="global_integrity_val")
+        st.checkbox("Force Referential Integrity", value=True, key="global_lock_check")
+        st.text_input("Global ID Sync:", value="1", key="global_integrity_val")
 
     multi_scan_errors = {
         table_key: table_result.get('error')
@@ -223,6 +223,64 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
                     with include_cols[i % len(include_cols)]:
                         st.checkbox(t_name, key=include_key, on_change=_on_individual_ai_change)
 
+        selected_multi_tables = st.multiselect(
+            "Tables for parallel scan",
+            options=available_tables,
+            default=initial_multiselect_default,
+            key="planner_multiselect"
+        )
+        m['selected_tables'] = selected_multi_tables
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            bulk_allow_sampling = st.checkbox("Enable sampling", value=True, key="bulk_allow_sample")
+        with c2:
+            bulk_sample_rows = st.number_input(
+                "Sample rows",
+                min_value=1,
+                max_value=5000,
+                value=int(m.get("bulk_sample_rows", 5)),
+                step=1,
+                help="Tip: focus this field, then use keyboard Up/Down arrows for precise adjustments.",
+                key="bulk_sample_rows"
+            ) if bulk_allow_sampling else 0
+
+        scan_btn_col1, scan_btn_col2 = st.columns(2)
+        with scan_btn_col1:
+            unified_scan_clicked = st.button(
+                "⭐ 🤖 Suggest with AI (Unified Scan)",
+                type="primary",
+                use_container_width=True,
+                disabled=not m.get('planning_initialized', False),
+                key="explicit_unified_ai_scan_btn",
+                help=(
+                    "Unified Scan (Recommended for Integrity)\n\n"
+                    "How: Sends all table schemas and samples in a single AI request.\n\n"
+                    "Pros: AI understands Foreign Key relationships between tables; More cost-effective "
+                    "(lower token overhead).\n\n"
+                    "Cons: Limited by AI context window (max ~50-100 tables)."
+                ),
+            )
+            if unified_scan_clicked:
+                m["trigger_unified_scan"] = True
+        with scan_btn_col2:
+            parallel_scan_clicked = st.button(
+                "⭐ 🪄 Parallel AI Scan",
+                type="secondary",
+                use_container_width=True,
+                disabled=not selected_multi_tables,
+                key="parallel_ai_scan_btn_row",
+                help=(
+                    "Parallel AI Scan (Recommended for Scale)\n\n"
+                    "How: Each table is processed independently in parallel threads.\n\n"
+                    "Pros: Extremely fast for large schemas; No context window limits.\n\n"
+                    "Cons: AI doesn't see cross-table relationships; Slightly higher token usage due to "
+                    "repeated prompts."
+                ),
+            )
+            if parallel_scan_clicked:
+                m["trigger_parallel_scan"] = True
+
         if m.pop("trigger_unified_scan", False):
             selected_tables_set = set(m.get('selected_tables', []) or [])
             candidate_tables = m.get('all_tables_list', []) or m.get('selected_tables', [])
@@ -269,67 +327,6 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
                     m['multi_ai_analysis'] = merged_results
                     m['plan_active'] = True
                     scan_status.update(label="Unified AI scan completed", state="complete")
-                    st.rerun()
-
-        selected_multi_tables = st.multiselect(
-            "Tables for parallel scan",
-            options=available_tables,
-            default=initial_multiselect_default,
-            key="planner_multiselect"
-        )
-        m['selected_tables'] = selected_multi_tables
-
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            bulk_allow_sampling = st.checkbox("Enable sampling", value=True, key="bulk_allow_sample")
-        with c2:
-            bulk_sample_rows = st.number_input(
-                "Sample rows",
-                min_value=1,
-                max_value=5000,
-                value=int(m.get("bulk_sample_rows", 5)),
-                step=1,
-                help="Tip: focus this field, then use keyboard Up/Down arrows for precise adjustments.",
-                key="bulk_sample_rows"
-            ) if bulk_allow_sampling else 0
-
-        scan_btn_col1, scan_btn_col2 = st.columns(2)
-        with scan_btn_col1:
-            unified_scan_clicked = st.button(
-                "⭐ 🤖 Suggest with AI (Unified Scan)",
-                type="primary",
-                use_container_width=True,
-                disabled=not m.get('planning_initialized', False),
-                key="explicit_unified_ai_scan_btn",
-                help=(
-                    "Unified Scan (Recommended for Integrity)\n\n"
-                    "How: Sends all table schemas and samples in a single AI request.\n\n"
-                    "Pros: AI understands Foreign Key relationships between tables; More cost-effective "
-                    "(lower token overhead).\n\n"
-                    "Cons: Limited by AI context window (max ~50-100 tables)."
-                ),
-            )
-            if unified_scan_clicked:
-                m["trigger_unified_scan"] = True
-                st.rerun()
-        with scan_btn_col2:
-            parallel_scan_clicked = st.button(
-                "⭐ 🪄 Parallel AI Scan",
-                type="secondary",
-                use_container_width=True,
-                disabled=not selected_multi_tables,
-                key="parallel_ai_scan_btn_row",
-                help=(
-                    "Parallel AI Scan (Recommended for Scale)\n\n"
-                    "How: Each table is processed independently in parallel threads.\n\n"
-                    "Pros: Extremely fast for large schemas; No context window limits.\n\n"
-                    "Cons: AI doesn't see cross-table relationships; Slightly higher token usage due to "
-                    "repeated prompts."
-                ),
-            )
-            if parallel_scan_clicked:
-                m["trigger_parallel_scan"] = True
-                st.rerun()
 
         if m.pop("trigger_parallel_scan", False):
             with st.status("Running parallel scan...", expanded=True) as scan_status:
@@ -377,7 +374,6 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
                 st.success("Scan completed successfully.")
                 m['plan_active'] = True
                 scan_status.update(label="Parallel scan completed", state="complete")
-                st.rerun()
 
         if 'selected_table_info' not in m and m.get('multi_ai_analysis'):
             multi_results = m['multi_ai_analysis']

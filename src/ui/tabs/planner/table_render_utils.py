@@ -130,7 +130,6 @@ def render_planner_table_plan_editor(
             m["active_plan"][table_name] = {"mappings": cleared_plan}
             if "manual_overrides_by_table" in m:
                 m["manual_overrides_by_table"][table_name] = set()
-            st.rerun()
     with right_col:
         if "ai_analysis" in m and m["ai_analysis"]:
             plan_df = pd.DataFrame(m["ai_analysis"])

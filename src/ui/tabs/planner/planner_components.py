@@ -36,7 +36,6 @@ def render_planner_action_buttons(db: Any, table_name: str, schema_name: str) ->
             st.session_state[f"where_clause_{table_name}"] = saved_data['where']
             st.session_state['plan_origin'] = 'saved'
             st.session_state['plan_active'] = True
-            st.rerun()
 
     if st.button("✍️ Manual", width="stretch", key=f"man_btn_{table_name}"):
         columns = db.get_columns(table_name, schema_name)
@@ -45,6 +44,5 @@ def render_planner_action_buttons(db: Any, table_name: str, schema_name: str) ->
         ]
         st.session_state['plan_origin'] = 'new'
         st.session_state['plan_active'] = True
-        st.rerun()
 
     render_ai_audit_log()
