@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 import streamlit as st
-from src.database.db_manager import DBManager
+from src.db import DBManager
 import os
 from urllib.parse import urlparse
 
