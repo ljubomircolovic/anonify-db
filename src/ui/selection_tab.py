@@ -13,6 +13,8 @@ import streamlit as st
 from streamlit.errors import StreamlitAPIException
 from sqlalchemy import text as sql_text
 
+from src.ui.source import source_utils as su
+
 
 def _quote_ident(ident: str) -> str:
     safe = str(ident).replace('"', '""')
@@ -91,6 +93,59 @@ def _mirror_effective_salt(db, schema_name: str, table_names: List[str]) -> str:
     return str(getattr(db, "runtime_salt", None) or "default_plan_salt")
 
 
+def _sync_destination_mode_session() -> str:
+    """Set ``st.session_state.destination_mode`` to ``memory`` or ``database`` for this tab."""
+    raw = su.get_plan_destination_mode(st.session_state)
+    mode = "database" if raw == "database" else "memory"
+    st.session_state["destination_mode"] = mode
+    return mode
+
+
+def _on_mirror_table_pick() -> None:
+    """When the comparison table pick changes, refresh the default SQL template."""
+    t = str(st.session_state.get("mirror_comparison_table_pick") or "").strip()
+    if not t:
+        return
+    sch = str(st.session_state.get("selected_schema") or "public")
+    try:
+        st.session_state["mirror_sql_text_widget"] = (
+            f"SELECT * FROM {_quote_ident(sch)}.{_quote_ident(t)} LIMIT 50"
+        )
+    except StreamlitAPIException:
+        pass
+
+
+def _dedupe_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure unique column names so Arrow / ``st.dataframe`` accepts the frame (e.g. JOINs).
+
+    Original SQL is unchanged; only display-side column labels are adjusted.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            "_".join(str(p) for p in tup if str(p) != "") or f"col_{i}"
+            for i, tup in enumerate(out.columns)
+        ]
+    names = list(out.columns)
+    if len(names) == len(set(names)):
+        return out
+    used: Set[str] = set()
+    new_names: List[str] = []
+    for c in names:
+        base = str(c)
+        candidate = base
+        k = 0
+        while candidate in used:
+            k += 1
+            candidate = f"{base}_{k}"
+        used.add(candidate)
+        new_names.append(candidate)
+    out.columns = new_names
+    return out
+
+
 def _run_sql_on_source(db, sql: str, search_path: List[str]) -> Tuple[pd.DataFrame, Optional[str]]:
     engine = db.source_engine
     path_clause = ", ".join(_quote_ident(s) for s in search_path if s)
@@ -106,14 +161,56 @@ def _run_sql_on_source(db, sql: str, search_path: List[str]) -> Tuple[pd.DataFra
 
 
 def render_selection_tab(db) -> None:
-    st.markdown("### 🆚 Raw vs. Anonymized Selection")
-    st.caption(
-        "Run **read-only** SQL against the **source** database. The right column shows the same "
-        "rows after applying your anonymization rules **in memory** (no export target required)."
+    _sync_destination_mode_session()
+    dm = str(st.session_state.get("destination_mode") or "memory")
+
+    source_schema = str(st.session_state.get("selected_schema") or "public")
+    table_names: List[str] = list(
+        st.session_state.get("all_tables_list")
+        or st.session_state.get("selected_tables")
+        or []
     )
-    st.info(
-        "Note: Preview generated in-memory based on current Anonymization Plan "
-        "(Mappings tab / saved plans). Column names match the query result; only values are transformed."
+
+    try:
+        head_dest, head_tbl = st.columns([2.2, 1], gap="small", vertical_alignment="center")
+    except TypeError:
+        head_dest, head_tbl = st.columns([2.2, 1], gap="small")
+
+    with head_dest:
+        if dm == "database":
+            st.success(
+                "🗄️ **Destination: Physical Database (Persistence Mode)**  \n"
+                "*Changes will be persisted to the target schema.*"
+            )
+        else:
+            st.info(
+                "📍 **Destination: In-Memory (Preview Mode)**  \n"
+                "*Changes are temporary and visible in real-time.*"
+            )
+
+    tbl_pick_key = "mirror_comparison_table_pick"
+    with head_tbl:
+        if table_names:
+            if tbl_pick_key not in st.session_state or st.session_state.get(tbl_pick_key) not in table_names:
+                st.session_state[tbl_pick_key] = table_names[0]
+            st.selectbox(
+                "Table",
+                options=table_names,
+                key=tbl_pick_key,
+                disabled=not (
+                    bool(st.session_state.get("source_confirmed"))
+                    and bool(st.session_state.get("active_plan_db_key"))
+                ),
+                on_change=_on_mirror_table_pick,
+                help="Pick a table to seed the SQL template (read-only queries on the source DB).",
+            )
+        else:
+            st.caption("No tables loaded yet.")
+
+    st.markdown("### 🆚 Source vs. Anonymized")
+    st.caption(
+        "Run read-only SQL on the **source** database; the right column applies your plan "
+        "to the same rows (preview)."
     )
 
     if not st.session_state.get("source_confirmed"):
@@ -123,12 +220,6 @@ def render_selection_tab(db) -> None:
         st.warning("Activate a **plan database** in the sidebar so plans and salts resolve correctly.")
         return
 
-    source_schema = str(st.session_state.get("selected_schema") or "public")
-    table_names: List[str] = list(
-        st.session_state.get("all_tables_list")
-        or st.session_state.get("selected_tables")
-        or []
-    )
     if not table_names:
         st.info("No tables discovered for the current source schema. Initialize the session from the Source tab.")
         return
@@ -137,7 +228,9 @@ def render_selection_tab(db) -> None:
     st.session_state.pop("mirror_sql_buffer", None)
 
     if sql_widget_key not in st.session_state:
-        t0 = table_names[0]
+        t0 = str(st.session_state.get(tbl_pick_key) or table_names[0])
+        if t0 not in table_names:
+            t0 = table_names[0]
         try:
             st.session_state[sql_widget_key] = (
                 f"SELECT * FROM {_quote_ident(source_schema)}.{_quote_ident(t0)} LIMIT 50"
@@ -189,6 +282,8 @@ def render_selection_tab(db) -> None:
         st.error(err_raw)
         return
 
+    df_raw = _dedupe_dataframe_columns(df_raw)
+
     if df_raw.empty:
         st.warning("Query returned no rows.")
         c1, c2 = st.columns(2)
@@ -215,6 +310,8 @@ def render_selection_tab(db) -> None:
         except Exception as exc:
             st.error(f"In-memory anonymization failed: {exc}")
             df_anon = df_raw.copy()
+
+    df_anon = _dedupe_dataframe_columns(df_anon)
 
     c1, c2 = st.columns(2)
     with c1:

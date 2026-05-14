@@ -81,13 +81,13 @@ def render_file_source_section(app: AppState, locked: bool = False) -> None:
             "Path",
             key="file_source_path",
             placeholder="/absolute/path/to/file.csv (or use the upload below)",
-            disabled=locked,
+            disabled=bool(m.get("source_locked", False)),
         )
         uploaded = st.file_uploader(
             "Upload file",
             type=["csv", "json", "xml", "txt"],
             key="file_source_uploader",
-            disabled=locked,
+            disabled=bool(m.get("source_locked", False)),
         )
 
         c4, c5, c6, c7 = st.columns(4)

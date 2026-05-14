@@ -8,7 +8,7 @@ import datetime
 import json
 import logging
 import os
-from typing import Any, MutableMapping
+from typing import Any, Mapping, MutableMapping
 
 import streamlit as st
 
@@ -81,6 +81,30 @@ def sync_db_config_dict_from_session(m: MutableMapping[str, Any]) -> None:
 def connection_test_and_init_disabled_for_store(locked: bool, m: MutableMapping[str, Any]) -> bool:
     """Whether Test Connection / Initialize Session should be disabled."""
     return connection_test_and_init_disabled(locked, m)
+
+
+def get_plan_destination_mode(m: Mapping[str, Any]) -> str:
+    """Return ``database`` when an active plan database exists, else ``in_memory``.
+
+    A physical plan database is the persistence target for mappings and structural
+    twin DDL; without it, previews operate in session / in-memory only.
+
+    Aligns with the main app's ``is_initialized`` guard: ``active_plan_db_key``
+    must belong to the currently selected metadata environment when that label
+    is present in session.
+    """
+    if not bool(m.get("project_initialized", False)):
+        return "in_memory"
+    key = str(m.get("active_plan_db_key") or "").strip()
+    if not key:
+        return "in_memory"
+    name = str(m.get("active_plan_db_name", "") or "").strip()
+    if not name or name.lower() == "none":
+        return "in_memory"
+    env_label = str(m.get("selected_env_label") or "").strip()
+    if env_label and ":" in key and not key.startswith(f"{env_label}:"):
+        return "in_memory"
+    return "database"
 
 
 def default_port_for_engine(engine: str | None) -> str:
@@ -251,6 +275,52 @@ def inject_source_control_bar_styles() -> None:
 }
 @media (prefers-color-scheme: light) {
     .adb-src-type { color: #64748b; }
+}
+.adb-src-conn-status-line {
+    margin: 0.15rem 0 0 0;
+    padding: 0;
+}
+.adb-src-test-ok {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #16a34a;
+    margin: 0;
+    padding-top: 0.4rem;
+    line-height: 1.3;
+}
+.adb-src-test-err {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #dc2626;
+    margin: 0;
+    padding-top: 0.4rem;
+    line-height: 1.3;
+}
+.adb-src-test-muted {
+    font-size: 0.75rem;
+    color: #64748b;
+    padding-top: 0.45rem;
+    display: inline-block;
+}
+@media (prefers-color-scheme: dark) {
+    .adb-src-test-muted { color: #94a3b8; }
+}
+.adb-src-hds-readonly-hint {
+    font-size: 0.82rem;
+    line-height: 1.35;
+    color: #475569;
+    margin: 0.1rem 0 0.55rem 0;
+    padding: 0.4rem 0.6rem;
+    border-radius: 8px;
+    background: rgba(71, 85, 105, 0.12);
+    border: 1px solid rgba(71, 85, 105, 0.28);
+}
+@media (prefers-color-scheme: dark) {
+    .adb-src-hds-readonly-hint {
+        color: #cbd5e1;
+        background: rgba(148, 163, 184, 0.12);
+        border-color: rgba(148, 163, 184, 0.28);
+    }
 }
 </style>
         """,

@@ -122,6 +122,12 @@ def seed_db_connection_fields_from_env(state: MutableMapping[str, Any]) -> None:
     Uses :func:`parse_env_database_url` and ``setdefault`` so existing user
     edits in ``state`` are never overwritten.
 
+    When the Source tab is **confirmed (locked)** and both the connection string
+    and discrete host/database fields are empty, rehydrate from ``.env`` on every
+    run so ``DATABASE_URL`` / ``SOURCE_DB_URL`` keeps session aligned with the
+    persisted confirmation (Streamlit ``setdefault`` does not replace explicit
+    empty strings from a prior session).
+
     Parameters
     ----------
     state:
@@ -136,6 +142,21 @@ def seed_db_connection_fields_from_env(state: MutableMapping[str, Any]) -> None:
         ("conn_user", "user"),
     ):
         state.setdefault(ss_key, env_defaults.get(env_key, ""))
+
+    url = str(env_defaults.get("conn_string") or "").strip()
+    locked = bool(state.get("source_confirmed"))
+    host_empty = not str(state.get("conn_host", "") or "").strip()
+    dbn_empty = not str(state.get("conn_database_name", "") or "").strip()
+    cs_empty = not str(state.get("db_source_conn_string", "") or "").strip()
+    if locked and url and host_empty and dbn_empty and cs_empty:
+        for ss_key, env_key in (
+            ("db_source_conn_string", "conn_string"),
+            ("conn_host", "host"),
+            ("conn_port", "port"),
+            ("conn_database_name", "database_name"),
+            ("conn_user", "user"),
+        ):
+            state[ss_key] = env_defaults.get(env_key, "")
 
 
 def connection_test_and_init_disabled(locked: bool, state: Mapping[str, Any]) -> bool:
@@ -161,4 +182,7 @@ def connection_test_and_init_disabled(locked: bool, state: Mapping[str, Any]) ->
     """
     if not locked:
         return False
-    return not bool(resolve_postgresql_source_url(state))
+    if bool(resolve_postgresql_source_url(state).strip()):
+        return False
+    # Extra guard: env URL present even if session keys are momentarily stale.
+    return not bool(str(parse_env_database_url().get("conn_string") or "").strip())

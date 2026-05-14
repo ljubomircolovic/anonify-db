@@ -5,16 +5,62 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, MutableMapping
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text as sqla_text
 
 from src.logic.app_state import AppState
+from src.logic.source_connection import resolve_postgresql_source_url
 from src.ui.source import source_utils as su
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_jdbc_url(url: str) -> str:
+    u = str(url or "").strip()
+    if u.startswith("postgres://"):
+        return "postgresql://" + u[len("postgres://") :]
+    return u
+
+
+def _db_connection_field_labels(m: MutableMapping[str, Any]) -> tuple[str, str, str, str]:
+    """Build Host / Port / Database / Schema widget labels from the resolved URL or session."""
+    raw = (resolve_postgresql_source_url(m) or "").strip()
+    session_schema = str(m.get("selected_schema") or m.get("source_schema") or "").strip()
+
+    if raw:
+        parsed = urlparse(_normalize_jdbc_url(raw))
+        host = (parsed.hostname or "").strip() or "—"
+        port = str(parsed.port or "").strip()
+        if not port:
+            eng = str(m.get("db_source_type", "PostgreSQL") or "PostgreSQL")
+            port = su.default_port_for_engine(eng)
+        path_part = (parsed.path or "").lstrip("/")
+        dbn = path_part.split("?")[0].strip() if path_part else ""
+        if not dbn:
+            dbn = "—"
+        q = parse_qs(parsed.query)
+        qs_schema = (
+            (q.get("schema") or q.get("currentSchema") or q.get("search_path") or [""])[0] or ""
+        ).strip()
+        schema_disp = qs_schema or session_schema or "public"
+    else:
+        host = str(m.get("conn_host", "") or "").strip() or "—"
+        port = str(m.get("conn_port", "") or "").strip() or su.default_port_for_engine(
+            str(m.get("db_source_type", "PostgreSQL"))
+        )
+        dbn = str(m.get("conn_database_name", "") or "").strip() or "—"
+        schema_disp = session_schema or "public"
+
+    return (
+        f"Host ({host})",
+        f"Port ({port})",
+        f"Database ({dbn})",
+        f"Schema ({schema_disp})",
+    )
 
 __all__ = [
     "pick_default_schema",
@@ -173,13 +219,16 @@ def render_db_source_section(db: Any, app: AppState, locked: bool = False) -> No
         with cpw:
             st.text_input("Password", type="password", key="conn_password", disabled=locked)
 
+        hds_disabled = bool(m.get("source_locked", False))
+
+        host_l, port_l, db_l, schema_l = _db_connection_field_labels(m)
         ch, cport = st.columns(2)
         with ch:
-            st.text_input("Host", key="conn_host", disabled=locked)
+            st.text_input(host_l, key="conn_host", disabled=hds_disabled)
         with cport:
-            st.text_input("Port", key="conn_port", disabled=locked)
+            st.text_input(port_l, key="conn_port", disabled=locked)
 
-        st.text_input("Database Name", key="conn_database_name", disabled=locked)
+        st.text_input(db_l, key="conn_database_name", disabled=hds_disabled)
 
         try:
             schemas = db.get_all_schemas() or []
@@ -193,20 +242,20 @@ def render_db_source_section(db: Any, app: AppState, locked: bool = False) -> No
             if current_schema not in schemas:
                 current_schema = default_schema
             schema_choice = st.selectbox(
-                "Schema",
+                schema_l,
                 options=schemas,
                 index=schemas.index(current_schema),
                 key="db_source_schema_select",
-                disabled=locked,
+                disabled=hds_disabled,
             )
             m["selected_schema"] = schema_choice
             m["source_schema"] = schema_choice
         else:
             schema_choice = st.text_input(
-                "Schema",
+                schema_l,
                 key="db_source_schema_text",
                 placeholder="public",
-                disabled=locked,
+                disabled=hds_disabled,
             )
             if schema_choice:
                 m["selected_schema"] = schema_choice

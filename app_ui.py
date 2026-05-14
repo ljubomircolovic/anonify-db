@@ -59,6 +59,31 @@ def _render_custom_name_warning_dialog():
 # --- 1. SETUP & AUTH ---
 load_dotenv()
 st.set_page_config(page_title="AnonifyDB", layout="wide", initial_sidebar_state="collapsed")
+# --- st.data_editor / BaseWeb dropdown: Azure highlight (Strategy column, etc.) ---
+st.markdown(
+    """
+<style>
+/* Target the background of the selected/hovered item in Streamlit/BaseWeb dropdowns */
+[data-baseweb="option"] {
+    background-color: transparent !important;
+}
+
+/* This targets the actual 'active' or 'hovered' state in the list */
+[data-baseweb="option"]:hover,
+[data-baseweb="option"]:focus,
+[aria-selected="true"] {
+    background-color: #007BFF !important; /* Azure Blue */
+    color: white !important;
+}
+
+/* Fix the focus border of the cell being edited */
+div[data-testid="stDataEditor"] :focus-within {
+    border-color: #007BFF !important;
+}
+</style>
+    """,
+    unsafe_allow_html=True,
+)
 st.session_state.setdefault(
     "source_confirmed",
     str(os.getenv("SOURCE_CONFIRMED", "")).strip().lower() in ("1", "true", "yes"),
@@ -89,10 +114,8 @@ st.markdown('''
         background-color: #005a9e !important;
     }
     
-    /* 5. Ensure NO red color persists in any span within the main container */
-    .st-emotion-cache-119tkyc, code {
+    code, .stMarkdown p code {
         color: #0078d4 !important;
-        background-color: #f3f2f1 !important;
     }
 
     /* 1. Force white text for table names inside primary buttons */
@@ -110,13 +133,7 @@ st.markdown('''
         -webkit-text-fill-color: #0078d4 !important;
     }
 
-    /* 3. Target code snippets or table name labels that might be red */
-    code, .stMarkdown p code {
-        color: #0078d4 !important;
-        background-color: #f3f2f1 !important;
-    }
-
-    /* 4. Kill any remaining red on labels or captions */
+    /* 3. Kill any remaining red on labels or captions */
     [data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"] p {
         color: #323130 !important;
     }
@@ -460,7 +477,7 @@ _TAB_LABELS = [
     "🔍 Comparison",
     "📤 Export",
     "📜 Audit",
-    "🆚 Data Selection",
+    "🆚 Source vs Anon",
 ]
 tab_source, tab_mappings, tab_comparison, tab_export, tab_audit, tab_data_sel = st.tabs(
     _TAB_LABELS
@@ -877,7 +894,7 @@ with tab_audit:
 
 
 # ===========================================================================
-# TAB 6 — DATA SELECTION  (placeholder)
+# TAB 6 — SOURCE VS ANON  (mirror query: raw vs anonymized preview)
 # ===========================================================================
 with tab_data_sel:
     render_selection_tab(db)

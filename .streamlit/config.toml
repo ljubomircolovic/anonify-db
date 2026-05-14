@@ -1,0 +1,12 @@
+﻿# AnonifyDB — Streamlit theme (Azure Blue primary)
+# https://docs.streamlit.io/develop/concepts/configuration/theming
+
+[theme]
+primaryColor = "#007BFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F2F1"
+textColor = "#262730"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

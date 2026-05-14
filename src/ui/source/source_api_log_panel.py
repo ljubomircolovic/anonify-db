@@ -33,6 +33,7 @@ def detect_response_language(content_type: str) -> str:
 def render_api_source_section(app: AppState, locked: bool = False) -> None:
     """Render the API Source expander (request builder + response monitor)."""
     m = app.mapping
+    api_core = bool(m.get("source_locked", False))
     with st.expander("API Source", expanded=True):
         st.caption(
             "Define an HTTP API as a data source. Provides response monitoring and a "
@@ -45,16 +46,16 @@ def render_api_source_section(app: AppState, locked: bool = False) -> None:
                 "URL",
                 key="api_source_url",
                 placeholder="https://api.example.com/customers",
-                disabled=locked,
+                disabled=locked or api_core,
             )
         with c2:
             st.selectbox("Method", options=su.HTTP_METHODS, key="api_source_method", disabled=locked)
 
         c3, c4 = st.columns(2)
         with c3:
-            st.text_input("API Key", type="password", key="api_source_api_key", disabled=locked)
+            st.text_input("API Key", type="password", key="api_source_api_key", disabled=locked or api_core)
         with c4:
-            st.text_input("Secret", type="password", key="api_source_secret", disabled=locked)
+            st.text_input("Secret", type="password", key="api_source_secret", disabled=locked or api_core)
 
         st.markdown("**Headers**")
         headers_state = m.setdefault(
@@ -66,7 +67,7 @@ def render_api_source_section(app: AppState, locked: bool = False) -> None:
             num_rows="dynamic",
             use_container_width=True,
             key="api_source_headers_editor",
-            disabled=locked,
+            disabled=locked or api_core,
         )
         m["api_source_headers"] = headers_df
 
@@ -75,7 +76,7 @@ def render_api_source_section(app: AppState, locked: bool = False) -> None:
             key="api_source_body",
             height=120,
             placeholder='{"q": "select customers"}',
-            disabled=locked,
+            disabled=locked or api_core,
         )
 
         if st.button("Send Request", key="api_source_send_btn", disabled=locked):
