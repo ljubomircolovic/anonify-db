@@ -1,0 +1,13 @@
+﻿**/.git
+**/.venv
+venv/
+**/__pycache__
+**/.pytest_cache
+*.pyc
+*.pyo
+*.pyd
+.db_data/
+postgres_data/
+logs/
+exports/
+.env
