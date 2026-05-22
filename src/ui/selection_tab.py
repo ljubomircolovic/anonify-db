@@ -5,7 +5,6 @@ in memory using the active / saved plan — no physical anonymized DB required.
 """
 from __future__ import annotations
 
-import re
 from typing import List, Optional, Set, Tuple
 
 import pandas as pd
@@ -14,22 +13,20 @@ from streamlit.errors import StreamlitAPIException
 from sqlalchemy import text as sql_text
 
 from src.logic import query_mirror
+from src.logic.audit import (
+    fetch_session_sql_audit_logs,
+    log_sql_execution,
+    resolve_anonymized_target_database,
+    resolve_target_database_name,
+    strip_mirror_sql_header,
+)
+from src.logic.security import SECURITY_POLICY_ERROR, validate_safe_select_query
 from src.ui.source import source_utils as su
 
 
 def _quote_ident(ident: str) -> str:
     safe = str(ident).replace('"', '""')
     return f'"{safe}"'
-
-
-def _is_safe_readonly_sql(sql: str) -> bool:
-    s = str(sql or "").strip()
-    if not s:
-        return False
-    if ";" in s.rstrip(";"):
-        return False
-    head = s.lstrip().lower()
-    return head.startswith("select") or head.startswith("with")
 
 
 _MIRROR_PREVIEW_ROW_CAP = 10
@@ -213,6 +210,9 @@ def _dedupe_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _run_sql_on_source(
     db, sql: str, search_path: List[str], row_limit: int = _MIRROR_PREVIEW_ROW_CAP
 ) -> Tuple[pd.DataFrame, Optional[str]]:
+    if not validate_safe_select_query(sql):
+        return pd.DataFrame(), SECURITY_POLICY_ERROR
+
     engine = db.source_engine
     path_clause = ", ".join(_quote_ident(s) for s in search_path if s)
     inner = str(sql).strip()
@@ -223,9 +223,61 @@ def _run_sql_on_source(
             if path_clause:
                 conn.execute(sql_text(f"SET LOCAL search_path TO {path_clause}, public"))
             df = pd.read_sql(stmt, conn)
+        log_sql_execution(
+            limited,
+            "ORIGINAL",
+            resolve_target_database_name(db, st.session_state),
+            db=db,
+            session_state=st.session_state,
+        )
         return df, None
     except Exception as exc:
         return pd.DataFrame(), f"Query failed (source): {exc}"
+
+
+def _log_anonymized_mirror_sql(
+    db,
+    mirrored_sql: str,
+    *,
+    source_schema: str,
+    destination_mode: str,
+) -> None:
+    body = strip_mirror_sql_header(mirrored_sql)
+    if not body:
+        return
+    log_sql_execution(
+        body,
+        "ANONYMIZED",
+        resolve_anonymized_target_database(
+            db,
+            st.session_state,
+            destination_mode=destination_mode,
+            source_schema=source_schema,
+        ),
+        db=db,
+        session_state=st.session_state,
+    )
+
+
+def _render_session_audit_log(db) -> None:
+    with st.expander("📜 Session Audit Log", expanded=False):
+        st.caption("SQL executed in this browser session (newest first).")
+        audit_df = fetch_session_sql_audit_logs(db, limit=30)
+        if audit_df.empty:
+            st.info("No SQL executions logged for this session yet.")
+            return
+
+        st.dataframe(
+            audit_df[["Time", "User", "Type", "Target DB"]],
+            width="stretch",
+            hide_index=True,
+        )
+        st.markdown("##### Query text")
+        for _, row in audit_df.iterrows():
+            st.markdown(
+                f"**{row['Time']}** · `{row['User']}` · **{row['Type']}** · `{row['Target DB']}`"
+            )
+            st.code(str(row["SQL Query"]), language="sql")
 
 
 def render_selection_tab(db) -> None:
@@ -271,19 +323,22 @@ def render_selection_tab(db) -> None:
     st.markdown("### 🆚 Source vs. Anonymized")
     st.caption(
         "Edit **Original SQL** on the left (read-only execution on the **source**). "
-        "**Mirrored SQL** on the right is built only after you click **Run Mirror Query**; "
+        "**Anonimized SQL** on the right is built only after you click **Run Original SQL**; "
         "result previews apply the active plan in memory (row fetch capped below)."
     )
 
     if not st.session_state.get("source_confirmed"):
         st.warning("Confirm the source in **Tab 1 (Source)** before using mirror queries.")
+        _render_session_audit_log(db)
         return
     if not bool(st.session_state.get("active_plan_db_key")):
         st.warning("Activate a **plan database** in the sidebar so plans and salts resolve correctly.")
+        _render_session_audit_log(db)
         return
 
     if not table_names:
         st.info("No tables discovered for the current source schema. Initialize the session from the Source tab.")
+        _render_session_audit_log(db)
         return
 
     st.session_state.setdefault("mirror_display_sql", "")
@@ -312,18 +367,18 @@ def render_selection_tab(db) -> None:
     merged_plan: List[dict] = []
 
     run = st.button(
-        "Run Mirror Query",
+        "Run Original SQL",
         type="primary",
         key="mirror_run_btn",
-        use_container_width=True,
+        width="stretch",
     )
 
     if run:
         if not sql_live:
             st.warning("Enter a SQL query.")
             st.session_state["mirror_display_sql"] = ""
-        elif not _is_safe_readonly_sql(sql_live):
-            st.error("Only a single SELECT or WITH statement is allowed (no semicolons, no writes).")
+        elif not validate_safe_select_query(sql_live):
+            st.error(SECURITY_POLICY_ERROR)
             st.session_state["mirror_display_sql"] = ""
         else:
             with st.spinner("Running on source and applying plan in memory…"):
@@ -351,6 +406,12 @@ def render_selection_tab(db) -> None:
                     )
                     st.session_state["mirror_display_sql"] = mirrored_display
                     st.session_state["mirror_last_transform_applied"] = bool(any_mirror_transform)
+                    _log_anonymized_mirror_sql(
+                        db,
+                        mirrored_display,
+                        source_schema=source_schema,
+                        destination_mode=dm,
+                    )
                     mirror_ok = True
                     df_raw = df_try
                     df_anon = df_try
@@ -384,6 +445,12 @@ def render_selection_tab(db) -> None:
                     )
                     st.session_state["mirror_display_sql"] = mirrored_display
                     st.session_state["mirror_last_transform_applied"] = bool(any_mirror_transform)
+                    _log_anonymized_mirror_sql(
+                        db,
+                        mirrored_display,
+                        source_schema=source_schema,
+                        destination_mode=dm,
+                    )
                     mirror_ok = True
                     df_raw = df_try
                     df_anon = df_anon_try
@@ -405,7 +472,7 @@ def render_selection_tab(db) -> None:
         )
 
     with col_sql_r:
-        st.markdown("##### 🛡️ Mirrored SQL")
+        st.markdown("##### 🛡️ Anonimized SQL")
         try:
             mirrored_body = str(st.session_state.get("mirror_display_sql", "") or "")
         except (StreamlitAPIException, KeyError, TypeError):
@@ -414,12 +481,17 @@ def render_selection_tab(db) -> None:
         if run and mirror_ok and not st.session_state.get("mirror_last_transform_applied", True):
             st.caption("📍 Running against: [Anonymized Target Mode]")
 
-    st.caption("Only read-only `SELECT` / `WITH` queries are executed on the **source** connection.")
+    st.caption(
+        "Only a single read-only `SELECT` (including `WITH` / `UNION`) is executed on the **source**; "
+        "queries are validated with sqlglot before execution."
+    )
 
     if not run:
+        _render_session_audit_log(db)
         return
 
     if not mirror_ok:
+        _render_session_audit_log(db)
         return
 
     try:
@@ -439,6 +511,7 @@ def render_selection_tab(db) -> None:
         st.divider()
         st.markdown("#### 🛡️ Anonymized Target Output")
         st.info("No data.")
+        _render_session_audit_log(db)
         return
 
     n_total = len(df_raw)
@@ -453,13 +526,13 @@ def render_selection_tab(db) -> None:
 
     st.markdown("#### 📂 Raw Source Output")
     st.caption(f"Source engine · `search_path`: `{source_schema}`")
-    st.dataframe(df_raw_view, use_container_width=True, height=400)
+    st.dataframe(df_raw_view, width="stretch", height=400)
 
     st.divider()
 
     st.markdown("#### 🛡️ Anonymized Target Output")
     st.caption("In-memory preview · `db.apply_anonymization_rules`")
-    st.dataframe(df_anon_view, use_container_width=True, height=400)
+    st.dataframe(df_anon_view, width="stretch", height=400)
 
     st.success(f"**{n_total}** row(s); same shape as source, values transformed per plan.")
 
@@ -468,3 +541,5 @@ def render_selection_tab(db) -> None:
     if merged_plan:
         with st.expander("Plan rows applied to this result (by column)", expanded=False):
             st.json(merged_plan)
+
+    _render_session_audit_log(db)

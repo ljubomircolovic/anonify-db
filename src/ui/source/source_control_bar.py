@@ -169,7 +169,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                     "Test Connection",
                     key="db_source_test_btn",
                     disabled=conn_btn_disabled or db is None,
-                    use_container_width=True,
+                    width="stretch",
                     help="Verify reachability with the current source settings.",
                     on_click=lambda: ssi.handle_test_connection(db),
                 )
@@ -178,7 +178,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                     "Initialize Session",
                     key="db_source_initialize_btn",
                     disabled=conn_btn_disabled or db is None,
-                    use_container_width=True,
+                    width="stretch",
                     help=(
                         "Connect using the current settings, index schema/tables, and wire them "
                         "into the rest of the workflow. A separate **Test Connection** is optional."
@@ -190,7 +190,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                     "Change",
                     key="source_control_change_btn",
                     disabled=not locked,
-                    use_container_width=True,
+                    width="stretch",
                     help="Unlock source fields to edit configuration.",
                     on_click=lambda: unlock_confirmed_source(app),
                 )
@@ -199,7 +199,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                     "Confirm",
                     key="source_confirm_btn",
                     disabled=confirm_disabled,
-                    use_container_width=True,
+                    width="stretch",
                     help="Save settings to session and `.env`, then lock inputs.",
                     on_click=lambda: handle_confirm_source_click(app),
                 )
@@ -227,7 +227,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                     "Change",
                     key="source_control_change_btn",
                     disabled=not locked,
-                    use_container_width=True,
+                    width="stretch",
                     help="Unlock source fields to edit configuration.",
                     on_click=unlock_confirmed_source,
                     args=(app,),
@@ -237,7 +237,7 @@ def render_source_action_toolbar(db: Any | None, app: AppState, locked: bool) ->
                     "Confirm",
                     key="source_confirm_btn",
                     disabled=locked,
-                    use_container_width=True,
+                    width="stretch",
                     help="Save settings to session and `.env`, then lock inputs.",
                     on_click=handle_confirm_source_click,
                     args=(app,),

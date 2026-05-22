@@ -250,7 +250,7 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
             unified_scan_clicked = st.button(
                 "⭐ 🤖 Suggest with AI (Unified Scan)",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 disabled=not m.get('planning_initialized', False),
                 key="explicit_unified_ai_scan_btn",
                 help=(
@@ -267,7 +267,7 @@ def render_planner_tab(db, app: AppState | None = None) -> None:
             parallel_scan_clicked = st.button(
                 "⭐ 🪄 Parallel AI Scan",
                 type="secondary",
-                use_container_width=True,
+                width="stretch",
                 disabled=not selected_multi_tables,
                 key="parallel_ai_scan_btn_row",
                 help=(

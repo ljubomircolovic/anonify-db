@@ -65,7 +65,7 @@ def render_api_source_section(app: AppState, locked: bool = False) -> None:
         headers_df = st.data_editor(
             headers_state,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             key="api_source_headers_editor",
             disabled=locked or api_core,
         )
@@ -178,7 +178,7 @@ def render_api_source_section(app: AppState, locked: bool = False) -> None:
                             "value": list(headers_dict.values()),
                         }
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -221,4 +221,4 @@ def render_source_log_section(app: AppState, locked: bool = False) -> None:
             return
 
         df_log = pd.DataFrame(log).iloc[::-1].reset_index(drop=True)
-        st.dataframe(df_log, use_container_width=True, hide_index=True)
+        st.dataframe(df_log, width="stretch", hide_index=True)

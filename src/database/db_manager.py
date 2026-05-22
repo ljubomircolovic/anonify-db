@@ -46,7 +46,10 @@ class DBManager:
 
         # Source engine: reads schema/tables from the original database
         self.source_engine = create_pooled_engine(self.source_db_url)
-        # Target engine: metadata + anonymized writes
+        # Canonical metadata brain DB (DATABASE_URL) — stable across plan target switches
+        self.metadata_db_url = self.source_db_url
+        self.metadata_engine = self.source_engine
+        # Target engine: metadata + anonymized writes (may switch to plan DB)
         self.target_engine = create_pooled_engine(self.target_db_url)
         # Backward compatibility for modules still using db.engine directly
         self.engine = self.target_engine

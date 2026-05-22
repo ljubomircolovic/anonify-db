@@ -194,6 +194,17 @@ class PlanPersistence:
             catalog_id INTEGER REFERENCES _anon_metadata.mapping_catalog(id) ON DELETE CASCADE,
             fake_value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS metadata.sql_audit_logs (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            username VARCHAR(255) NOT NULL DEFAULT 'anonymous_user',
+            session_id VARCHAR(255) NOT NULL,
+            query_type VARCHAR(32) NOT NULL,
+            target_database VARCHAR(255) NOT NULL,
+            sql_text TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sql_audit_logs_session_ts
+            ON metadata.sql_audit_logs (session_id, timestamp DESC);
         """
         try:
             with self._m.target_engine.connect() as conn:

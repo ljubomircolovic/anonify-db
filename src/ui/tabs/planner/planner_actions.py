@@ -282,7 +282,7 @@ def render_planner_actions_block(
         if st.button(
             "🚀 Execute Anonymization Pipeline",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="global_run_all_tables_bottom",
             disabled=execute_disabled,
         ):
@@ -311,7 +311,7 @@ def render_planner_actions_block(
         if st.button(
             "🏁 Finalize & Close Project",
             type="primary" if run_completed else "secondary",
-            use_container_width=True,
+            width="stretch",
             key="finalize_close_project_btn",
             disabled=bool(unsaved_tables) or (not run_completed),
         ):

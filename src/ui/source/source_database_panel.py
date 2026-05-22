@@ -119,7 +119,7 @@ def render_technical_metadata(db: Any, schema: str, table: str) -> None:
             st.warning(f"FK fetch failed: {exc}")
         table_fks = [fk for fk in fks_raw if isinstance(fk, (tuple, list)) and table in fk]
         if table_fks:
-            st.dataframe(pd.DataFrame(table_fks), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(table_fks), width="stretch", hide_index=True)
         else:
             st.caption("None")
 
@@ -131,7 +131,7 @@ def render_technical_metadata(db: Any, schema: str, table: str) -> None:
     )
     st.caption("Indexes")
     if idx_rows:
-        st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(idx_rows), width="stretch", hide_index=True)
     else:
         st.caption("None")
 
@@ -143,7 +143,7 @@ def render_technical_metadata(db: Any, schema: str, table: str) -> None:
     )
     st.caption("Constraints")
     if cons_rows:
-        st.dataframe(pd.DataFrame(cons_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(cons_rows), width="stretch", hide_index=True)
     else:
         st.caption("None")
 
@@ -156,7 +156,7 @@ def render_technical_metadata(db: Any, schema: str, table: str) -> None:
     )
     st.caption("Triggers")
     if trig_rows:
-        st.dataframe(pd.DataFrame(trig_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(trig_rows), width="stretch", hide_index=True)
     else:
         st.caption("None")
 
@@ -167,7 +167,7 @@ def render_technical_metadata(db: Any, schema: str, table: str) -> None:
     )
     st.caption(f"Views in `{schema}`")
     if view_rows:
-        st.dataframe(pd.DataFrame(view_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(view_rows), width="stretch", hide_index=True)
     else:
         st.caption("None")
 
@@ -356,7 +356,7 @@ def render_db_source_section(db: Any, app: AppState, locked: bool = False) -> No
                         keep = [c for c in selected_cols if c in preview_df.columns]
                         if keep:
                             preview_df = preview_df[keep]
-                    st.dataframe(preview_df, use_container_width=True)
+                    st.dataframe(preview_df, width="stretch")
                     su.log_source_event(
                         m,
                         "database",

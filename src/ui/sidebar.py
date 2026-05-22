@@ -191,7 +191,7 @@ def render_metadata_storage_section(db):
             if st.button(
                 "⚡ Test Metadata Connection",
                 key="test_metadata_connection_btn",
-                use_container_width=True,
+                width="stretch",
                 help="Validates connectivity using the same pool as the Source / Mappings workflow.",
             ):
                 success, message = db.test_metadata_connection()
@@ -260,7 +260,7 @@ def render_data_source_section(db):
         st.button(
             "🚀 Initialize Session",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="sidebar_initialize_session_btn",
             help="Test the source connection and index its schema. No plan required.",
             on_click=lambda: handle_initialization(db),

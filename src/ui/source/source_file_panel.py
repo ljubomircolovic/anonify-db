@@ -212,7 +212,7 @@ def render_file_source_section(app: AppState, locked: bool = False) -> None:
             edited_map = st.data_editor(
                 mapping_df,
                 num_rows="fixed",
-                use_container_width=True,
+                width="stretch",
                 disabled=True if locked else ["source"],
                 key="file_source_column_map_editor",
             )
@@ -238,6 +238,6 @@ def render_file_source_section(app: AppState, locked: bool = False) -> None:
 
                 st.divider()
                 st.markdown("**Preview** (first 20 records after filter/mapping)")
-                st.dataframe(preview, use_container_width=True)
+                st.dataframe(preview, width="stretch")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Preview failed: {exc}")

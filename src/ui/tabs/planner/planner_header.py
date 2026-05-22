@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Planner header: target/metadata context banner."""
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def render_target_context_banner(db, context="default"):
     with cols[2]:
         st.caption(f"**🖥️ Host:** `{target_host}`")
     with cols[3]:
-        if st.button("⚡ Test", key=f"{context}_target_conn_test_btn", use_container_width=True):
+        if st.button("⚡ Test", key=f"{context}_target_conn_test_btn", width="stretch"):
             try:
                 if db is None:
                     raise RuntimeError("No active DB manager found")
