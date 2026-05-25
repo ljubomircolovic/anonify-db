@@ -64,6 +64,17 @@ def initialize_metadata():
         catalog_id INTEGER REFERENCES metadata.mapping_catalog(id) ON DELETE CASCADE,
         fake_value VARCHAR(255) NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS metadata.sql_audit_logs (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        username VARCHAR(255) NOT NULL DEFAULT 'anonymous_user',
+        session_id VARCHAR(255) NOT NULL,
+        query_type VARCHAR(32) NOT NULL,
+        target_database VARCHAR(255) NOT NULL,
+        sql_text TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sql_audit_logs_session_ts
+        ON metadata.sql_audit_logs (session_id, timestamp DESC);
     """
 
     category_map = {

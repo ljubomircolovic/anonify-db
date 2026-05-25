@@ -557,7 +557,7 @@ with tab_mappings:
         # decoupled and either can be completed first.
         activate_plan_clicked = st.button(
             "✨ Activate Plan",
-            use_container_width=True,
+            width="stretch",
             disabled=(not plan_name) or existing_selected_now,
             help="Create the plan database and activate it for rule definition.",
             key="mappings_activate_plan_btn",
@@ -591,7 +591,7 @@ with tab_mappings:
     with row2_right:
         continue_existing_clicked = st.button(
             "🔁 Continue with Existing",
-            use_container_width=True,
+            width="stretch",
             disabled=bool(plan_name) or (not bool(selected_existing_plan)) or selected_existing_plan == "None"
         )
 

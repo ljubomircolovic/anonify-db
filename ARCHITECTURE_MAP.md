@@ -9,7 +9,7 @@ This document describes the modular layout of the application after the refactor
 ```
 Streamlit UI (src/ui/**)
     │
-    ├─► AppState & workflow (src/logic/**) — session façade, URL/sync helpers, plan↔source binding
+    ├─► AppState & workflow (src/logic/**) — session facade, URL/sync helpers, plan↔source binding
     │
     ├─► DBManager (src/database/db_manager.py) — orchestrates engines, delegates to services
     │
