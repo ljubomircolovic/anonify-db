@@ -56,7 +56,6 @@ _VALIDATION_VIEW_NAME = "this_view"
 _VALIDATION_DEFAULT_QUERY = f"SELECT * FROM {_VALIDATION_VIEW_NAME} LIMIT 50;"
 _MIRROR_PREVIEW_STATE_KEYS = (
     "mirror_display_sql",
-    "anonymized_rewritten_sql",
     "mirror_last_transform_applied",
     "mirror_last_mode",
     "mirror_last_preview_ready",
@@ -72,6 +71,13 @@ _MIRROR_PREVIEW_STATE_KEYS = (
     "mirror_validation_exec_result_df",
     "mirror_validation_exec_rewritten_sql",
     "mirror_validation_exec_error",
+    "bottom_anonymized_query_result_df",
+    "bottom_anonymized_query_sql",
+    "bottom_anonymized_query_error",
+    "anonymized_query_result_df",
+    "anonymized_query_result_sql",
+    "anonymized_query_result_error",
+    "anonymized_query_result_ran",
 )
 
 
@@ -613,21 +619,124 @@ def _execute_validation_view_sql(
     return result_df, final_sql, None
 
 
+def _clear_legacy_validation_exec_state() -> None:
+    for key in (
+        "mirror_validation_exec_result_df",
+        "mirror_validation_exec_rewritten_sql",
+        "mirror_validation_exec_error",
+    ):
+        try:
+            st.session_state.pop(key, None)
+        except StreamlitAPIException:
+            pass
+
+
+def _set_anonymized_query_result_state(
+    sql_text: str,
+    result_df: Optional[pd.DataFrame],
+    error: Optional[str],
+    *,
+    ran: bool = True,
+) -> None:
+    normalized_sql = str(sql_text or "").strip()
+    normalized_error = str(error or "").strip()
+    safe_df = result_df if isinstance(result_df, pd.DataFrame) else pd.DataFrame()
+    if isinstance(safe_df, pd.DataFrame) and not safe_df.empty:
+        safe_df = _dedupe_dataframe_columns(safe_df)
+    try:
+        st.session_state["anonymized_query_result_sql"] = normalized_sql
+        st.session_state["anonymized_query_result_error"] = normalized_error
+        st.session_state["anonymized_query_result_df"] = safe_df
+        st.session_state["anonymized_query_result_ran"] = bool(ran)
+        # Keep the existing bottom keys in sync for compatibility with current readers.
+        st.session_state["bottom_anonymized_query_sql"] = normalized_sql
+        st.session_state["bottom_anonymized_query_error"] = normalized_error
+        st.session_state["bottom_anonymized_query_result_df"] = safe_df
+    except StreamlitAPIException:
+        pass
+
+
+def _execute_bottom_anonymized_sql(
+    db,
+    query_sql: str,
+    validation_df: pd.DataFrame,
+    *,
+    validation_error: Optional[str],
+    table_name: str,
+    source_schema: str,
+    destination_mode: str,
+) -> Tuple[pd.DataFrame, str, Optional[str]]:
+    raw_sql = str(query_sql or "").strip()
+    if validation_error:
+        return pd.DataFrame(), raw_sql, f"Anonymized SQL failed: {validation_error}"
+    result_df, executed_sql, exec_error = _execute_validation_view_sql(
+        db,
+        raw_sql,
+        validation_df,
+        table_name=table_name,
+        source_schema=source_schema,
+        destination_mode=destination_mode,
+    )
+    if isinstance(result_df, pd.DataFrame) and not result_df.empty:
+        result_df = _dedupe_dataframe_columns(result_df)
+    return result_df, executed_sql, exec_error
+
+
+def _render_anonymized_query_result_grid() -> None:
+    st.markdown("#### 🧪 Bottom Query Result")
+    st.caption("Rows returned by the SQL entered in the bottom `🔒 Anonymized SQL` editor.")
+
+    if not bool(st.session_state.get("anonymized_query_result_ran")):
+        st.info("Execute anonymized SQL to render rows here.")
+        return
+
+    query_error = str(st.session_state.get("anonymized_query_result_error", "") or "").strip()
+    query_result = st.session_state.get("anonymized_query_result_df")
+    if query_error:
+        st.error(query_error)
+        return
+
+    if isinstance(query_result, pd.DataFrame):
+        if query_result.empty:
+            st.info("Query returned no rows.")
+        else:
+            st.dataframe(query_result, width="stretch", height=320, hide_index=True)
+        return
+
+    st.info("No data.")
+
+
 def _sync_anonymized_rewritten_sql(
     sql_text: str,
     *,
     table_name: str,
     join_columns: List[str],
     validation_columns: Optional[List[str]] = None,
+    force: bool = False,
 ) -> Optional[str]:
+    source_sql = str(sql_text or "").strip()
+    if not source_sql:
+        try:
+            st.session_state["anonymized_rewritten_sql"] = ""
+            st.session_state["anonymized_rewritten_sql_source"] = ""
+        except StreamlitAPIException:
+            pass
+        return None
+
+    current_source = str(st.session_state.get("anonymized_rewritten_sql_source", "") or "")
+    current_sql = str(st.session_state.get("anonymized_rewritten_sql", "") or "")
+    if not force and current_source == source_sql and current_sql:
+        return None
+
     rewritten_sql, rewrite_error = _rewrite_validation_view_sql(
-        sql_text,
+        source_sql,
         validation_columns,
         table_name=table_name,
         join_columns=join_columns,
     )
     try:
         st.session_state["anonymized_rewritten_sql"] = rewritten_sql if not rewrite_error else ""
+        st.session_state["anonymized_rewritten_sql_source"] = source_sql if not rewrite_error else ""
     except StreamlitAPIException:
         pass
     return rewrite_error
@@ -747,11 +856,6 @@ def render_selection_tab(db) -> None:
         st.caption("No tables loaded yet.")
 
     st.markdown("### 🆚 Source vs. Anonymized")
-    st.caption(
-        "Edit **Original SQL** on the left (read-only execution on the **source**). "
-        "**Anonimized SQL** on the right is built only after you click **Run Original SQL**; "
-        "result previews apply the active plan in memory (row fetch capped below)."
-    )
 
     if not st.session_state.get("source_confirmed"):
         st.warning("Confirm the source in **Tab 1 (Source)** before using mirror queries.")
@@ -770,6 +874,13 @@ def render_selection_tab(db) -> None:
     active_table_name = str(st.session_state.get(tbl_pick_key) or table_names[0])
     st.session_state.setdefault("mirror_display_sql", "")
     st.session_state.setdefault("anonymized_rewritten_sql", "")
+    st.session_state.setdefault("bottom_anonymized_query_sql", "")
+    st.session_state.setdefault("bottom_anonymized_query_error", "")
+    st.session_state.setdefault("bottom_anonymized_query_result_df", pd.DataFrame())
+    st.session_state.setdefault("anonymized_query_result_sql", "")
+    st.session_state.setdefault("anonymized_query_result_error", "")
+    st.session_state.setdefault("anonymized_query_result_df", pd.DataFrame())
+    st.session_state.setdefault("anonymized_query_result_ran", False)
 
     sql_widget_key = "mirror_sql_text_widget"
 
@@ -804,6 +915,36 @@ def render_selection_tab(db) -> None:
     merged_plan: List[dict] = []
     sql_raw_display = sql_live
 
+    preview_ready = bool(st.session_state.get("mirror_last_preview_ready"))
+    preview_table = str(st.session_state.get("mirror_last_active_table") or "")
+    preview_schema = str(st.session_state.get("mirror_last_source_schema") or "")
+    if preview_ready and preview_table == active_table_name and preview_schema == source_schema:
+        stored_raw = st.session_state.get("mirror_last_raw_df")
+        stored_anon = st.session_state.get("mirror_last_anon_df")
+        if isinstance(stored_raw, pd.DataFrame) and isinstance(stored_anon, pd.DataFrame):
+            df_raw = stored_raw
+            df_anon = stored_anon
+            merged_plan = list(st.session_state.get("mirror_last_merged_plan") or [])
+            sql_raw_display = str(st.session_state.get("mirror_last_sql_raw") or sql_live).strip()
+            mirror_ok = True
+
+    source_db_label = resolve_target_database_name(db, st.session_state)
+    anonymized_db_label = resolve_anonymized_target_database(
+        db,
+        st.session_state,
+        destination_mode=dm,
+        source_schema=source_schema,
+    )
+
+    _render_sql_box_title("📄", "Original SQL", source_db_label)
+    st.text_area(
+        "Original SQL Query",
+        height=220,
+        key=sql_widget_key,
+        label_visibility="collapsed",
+        help="Executed on the source database (read-only).",
+        on_change=_on_mirror_sql_edit,
+    )
     run = st.button(
         "Run Original SQL",
         type="primary",
@@ -906,69 +1047,6 @@ def render_selection_tab(db) -> None:
                         st.session_state["mirror_last_source_schema"] = source_schema
                     except StreamlitAPIException:
                         pass
-    else:
-        preview_ready = bool(st.session_state.get("mirror_last_preview_ready"))
-        preview_table = str(st.session_state.get("mirror_last_active_table") or "")
-        preview_schema = str(st.session_state.get("mirror_last_source_schema") or "")
-        if preview_ready and preview_table == active_table_name and preview_schema == source_schema:
-            stored_raw = st.session_state.get("mirror_last_raw_df")
-            stored_anon = st.session_state.get("mirror_last_anon_df")
-            if isinstance(stored_raw, pd.DataFrame) and isinstance(stored_anon, pd.DataFrame):
-                df_raw = stored_raw
-                df_anon = stored_anon
-                merged_plan = list(st.session_state.get("mirror_last_merged_plan") or [])
-                sql_raw_display = str(st.session_state.get("mirror_last_sql_raw") or sql_live).strip()
-                mirror_ok = True
-
-    _sync_anonymized_rewritten_sql(
-        sql_live,
-        table_name=active_table_name,
-        join_columns=auto_join_columns,
-    )
-
-    try:
-        col_sql_l, col_sql_r = st.columns([1, 1], gap="small")
-    except TypeError:
-        col_sql_l, col_sql_r = st.columns([1, 1])
-
-    source_db_label = resolve_target_database_name(db, st.session_state)
-    anonymized_db_label = resolve_anonymized_target_database(
-        db,
-        st.session_state,
-        destination_mode=dm,
-        source_schema=source_schema,
-    )
-
-    with col_sql_l:
-        _render_sql_box_title("📄", "Original SQL", source_db_label)
-        st.text_area(
-            "Original SQL Query",
-            height=220,
-            key=sql_widget_key,
-            label_visibility="collapsed",
-            help="Executed on the source database (read-only).",
-            on_change=_on_mirror_sql_edit,
-        )
-
-    with col_sql_r:
-        _render_sql_box_title("🔒", "Anonymized SQL", anonymized_db_label)
-        try:
-            mirrored_body = str(st.session_state.get("anonymized_rewritten_sql", "") or "")
-        except (StreamlitAPIException, KeyError, TypeError):
-            mirrored_body = ""
-        st.text_area(
-            "Anonymized SQL Query",
-            value=mirrored_body,
-            height=220,
-            label_visibility="collapsed",
-            help="Displayed anonymized SQL, persisted across reruns.",
-            disabled=True,
-        )
-
-    st.caption(
-        "Only a single read-only `SELECT` (including `WITH` / `UNION`) is executed on the **source**; "
-        "queries are validated with sqlglot before execution."
-    )
 
     if not mirror_ok:
         _render_session_audit_log(db)
@@ -988,34 +1066,9 @@ def render_selection_tab(db) -> None:
     preview_n = n_total
     df_raw_view = df_raw
     df_anon_view = df_anon
+    anonymized_output_df = df_anon_view
+    anonymized_output_caption = "In-memory preview · `db.apply_anonymization_rules`"
 
-    st.caption(
-        f"Preview: **{preview_n}** row(s) shown (queries are executed with a hard cap of "
-        f"**{_MIRROR_PREVIEW_ROW_CAP}** rows)."
-    )
-
-    st.markdown("#### 📂 Raw Source Output")
-    st.caption(f"Source engine · `search_path`: `{source_schema}`")
-    st.dataframe(df_raw_view, width="stretch", height=400)
-
-    st.divider()
-
-    st.markdown("#### 🛡️ Anonymized Target Output")
-    st.caption("In-memory preview · `db.apply_anonymization_rules`")
-    st.dataframe(df_anon_view, width="stretch", height=400)
-
-    st.success(f"**{n_total}** row(s); same shape as source, values transformed per plan.")
-
-    with st.expander("SQL executed (source)", expanded=False):
-        st.code(sql_raw_display, language="sql")
-    if merged_plan:
-        with st.expander("Plan rows applied to this result (by column)", expanded=False):
-            st.json(merged_plan)
-
-    _render_session_audit_log(db)
-
-    st.divider()
-    st.markdown("### 📊 Side-by-Side Data Validation View")
     validation_df, validation_join_cols, validation_error = _build_side_by_side_validation_view(
         db,
         source_schema,
@@ -1029,71 +1082,108 @@ def render_selection_tab(db) -> None:
         st.session_state["mirror_last_validation_error"] = validation_error
     except StreamlitAPIException:
         pass
-    if validation_error:
-        st.info(validation_error)
-    else:
-        _sync_anonymized_rewritten_sql(
-            sql_live,
-            table_name=active_table_name,
-            join_columns=validation_join_cols,
-            validation_columns=list(validation_df.columns),
-        )
-        st.caption(
-            "In-memory DuckDB join for active table "
-            f"`{active_table_name}` on primary key / identity column(s): "
-            + ", ".join(f"`{col}`" for col in validation_join_cols)
-        )
-        st.dataframe(validation_df, width="stretch", height=400)
 
-        st.markdown("#### 🔒 Execute Anonymized SQL")
-        st.caption(
-            "Auto-generated from the **Original SQL** editor. This query is rewritten against "
-            f"`{_VALIDATION_VIEW_NAME}` and executed as-is when you click the button below."
-        )
-        st.text_area(
-            "Execute Anonymized SQL Query",
-            value=str(st.session_state.get("anonymized_rewritten_sql", "") or ""),
-            height=160,
-            label_visibility="collapsed",
-            help="Auto-generated anonymized SQL; editing is intentionally disabled.",
-            disabled=True,
-        )
-        run_anonymized_sql = st.button(
-            "Execute Anonymized SQL",
-            key="mirror_run_validation_sql_btn",
-            width="stretch",
-        )
-        if run_anonymized_sql:
-            validation_sql = str(st.session_state.get("anonymized_rewritten_sql", "") or "").strip()
-            result_df, rewritten_sql, exec_error = _execute_validation_view_sql(
-                db,
-                validation_sql,
-                validation_df,
-                table_name=active_table_name,
-                source_schema=source_schema,
-                destination_mode=dm,
+    st.caption(
+        f"Preview: **{preview_n}** row(s) shown (queries are executed with a hard cap of "
+        f"**{_MIRROR_PREVIEW_ROW_CAP}** rows)."
+    )
+
+    st.markdown("#### 📂 Raw Source Output")
+    st.caption(f"Source engine · `search_path`: `{source_schema}`")
+    st.dataframe(df_raw_view, width="stretch", height=400)
+
+    anon_output_slot = st.container()
+
+    st.success(f"**{n_total}** row(s); same shape as source, values transformed per plan.")
+
+    with st.expander("SQL executed (source)", expanded=False):
+        st.code(sql_raw_display, language="sql")
+    if merged_plan:
+        with st.expander("Plan rows applied to this result (by column)", expanded=False):
+            st.json(merged_plan)
+
+    _render_session_audit_log(db)
+
+    validation_slot = st.container()
+    validation_result_slot = st.container()
+
+    bottom_sql_section = st.container()
+    with bottom_sql_section:
+        st.divider()
+        _render_sql_box_title("🔒", "Anonymized SQL", anonymized_db_label)
+        with st.form("mirror_bottom_anonymized_sql_form", clear_on_submit=False):
+            anonymized_sql_live = st.text_area(
+                "Anonymized SQL Query",
+                height=220,
+                key="anonymized_rewritten_sql",
+                label_visibility="collapsed",
+                help="Auto-generated from the source query and fully editable before execution.",
             )
+            run_anonymized_sql = st.form_submit_button(
+                "Execute Anonymized SQL",
+                key="mirror_run_validation_sql_btn",
+                width="stretch",
+                disabled=not mirror_ok,
+            )
+
+        anonymized_sql_live = str(anonymized_sql_live or "").strip()
+        if run_anonymized_sql:
+            try:
+                result_df, rewritten_sql, exec_error = _execute_bottom_anonymized_sql(
+                    db,
+                    anonymized_sql_live,
+                    validation_df,
+                    validation_error=validation_error,
+                    table_name=active_table_name,
+                    source_schema=source_schema,
+                    destination_mode=dm,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result_df = pd.DataFrame()
+                rewritten_sql = anonymized_sql_live
+                exec_error = f"Anonymized SQL failed: {exc}"
+
+            _clear_legacy_validation_exec_state()
             try:
                 st.session_state["anonymized_rewritten_sql"] = rewritten_sql
-                st.session_state["mirror_validation_exec_result_df"] = result_df
-                st.session_state["mirror_validation_exec_rewritten_sql"] = rewritten_sql
-                st.session_state["mirror_validation_exec_error"] = exec_error
             except StreamlitAPIException:
                 pass
+            _set_anonymized_query_result_state(rewritten_sql or anonymized_sql_live, result_df, exec_error)
 
-        stored_exec_sql = str(st.session_state.get("mirror_validation_exec_rewritten_sql", "") or "").strip()
-        stored_exec_error = str(st.session_state.get("mirror_validation_exec_error", "") or "").strip()
-        stored_exec_result = st.session_state.get("mirror_validation_exec_result_df")
+        _render_anonymized_query_result_grid()
 
-        if stored_exec_sql:
-            with st.expander("Rewritten anonymized SQL", expanded=False):
-                st.code(stored_exec_sql, language="sql")
+    stored_exec_sql = str(st.session_state.get("mirror_validation_exec_rewritten_sql", "") or "").strip()
+    stored_exec_error = str(st.session_state.get("mirror_validation_exec_error", "") or "").strip()
+    stored_exec_result = st.session_state.get("mirror_validation_exec_result_df")
 
+    if not stored_exec_error and isinstance(stored_exec_result, pd.DataFrame):
+        anonymized_output_df = stored_exec_result
+        anonymized_output_caption = "DuckDB validation view result from `🔒 Anonymized SQL`"
+
+    with anon_output_slot:
+        st.divider()
+        st.markdown("#### 🛡️ Anonymized Target Output")
+        st.caption(anonymized_output_caption)
         if stored_exec_error:
             st.error(stored_exec_error)
-        elif isinstance(stored_exec_result, pd.DataFrame):
-            st.markdown("#### 🧪 Anonymized SQL Result")
-            if stored_exec_result.empty:
-                st.info("Query returned no rows.")
-            else:
-                st.dataframe(stored_exec_result, width="stretch", height=400)
+        else:
+            st.dataframe(anonymized_output_df, width="stretch", height=400)
+
+    with validation_slot:
+        st.divider()
+        st.markdown("### 📊 Side-by-Side Data Validation View")
+        if validation_error:
+            st.info(validation_error)
+        else:
+            st.dataframe(validation_df, width="stretch", height=400)
+
+    with validation_result_slot:
+        if stored_exec_sql:
+            if stored_exec_error:
+                st.error(stored_exec_error)
+            elif isinstance(stored_exec_result, pd.DataFrame):
+                st.markdown("#### 🧪 Anonymized SQL Result")
+                if stored_exec_result.empty:
+                    st.info("Query returned no rows.")
+                else:
+                    st.dataframe(stored_exec_result, width="stretch", height=400)
