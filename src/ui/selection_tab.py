@@ -5,6 +5,7 @@ in memory using the active / saved plan — no physical anonymized DB required.
 """
 from __future__ import annotations
 
+from html import escape
 from typing import List, Optional, Set, Tuple
 
 import pandas as pd
@@ -27,6 +28,19 @@ from src.ui.source import source_utils as su
 def _quote_ident(ident: str) -> str:
     safe = str(ident).replace('"', '""')
     return f'"{safe}"'
+
+
+def _render_sql_box_title(icon: str, title: str, database_name: str) -> None:
+    db_label = escape(str(database_name or "unknown-db"))
+    st.markdown(
+        (
+            "<div style='display:flex; align-items:baseline; gap:0.5rem; margin-bottom:0.35rem;'>"
+            f"<span style='font-weight:600;'>{icon} {escape(title)}</span>"
+            f"<span style='color:#6b7280; font-size:0.85rem;'>[{db_label}]</span>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 _MIRROR_PREVIEW_ROW_CAP = 10
@@ -207,6 +221,102 @@ def _dedupe_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _resolve_validation_join_columns(
+    db,
+    schema_name: str,
+    table_name: str,
+    df_raw: pd.DataFrame,
+    df_anon: pd.DataFrame,
+) -> List[str]:
+    raw_cols = {str(c) for c in df_raw.columns}
+    anon_cols = {str(c) for c in df_anon.columns}
+    common_cols = raw_cols & anon_cols
+    if not common_cols:
+        return []
+
+    real_pks = [str(c) for c in (db.get_primary_keys(schema_name, table_name) or []) if str(c)]
+    join_cols = [col for col in real_pks if col in common_cols]
+    if join_cols:
+        return join_cols
+
+    identity_candidates = [
+        col
+        for col in df_raw.columns
+        if str(col) in common_cols
+        and str(col).lower() in {"id", f"{table_name}_id"}
+    ]
+    if len(identity_candidates) == 1:
+        return [str(identity_candidates[0])]
+    return []
+
+
+def _build_side_by_side_validation_view(
+    db,
+    schema_name: str,
+    table_name: str,
+    df_raw: pd.DataFrame,
+    df_anon: pd.DataFrame,
+) -> Tuple[pd.DataFrame, List[str], Optional[str]]:
+    if df_raw is None or df_anon is None or df_raw.empty or df_anon.empty:
+        return pd.DataFrame(), [], "Run a preview with rows to build the validation view."
+
+    raw_view = _dedupe_dataframe_columns(df_raw)
+    anon_view = _dedupe_dataframe_columns(df_anon)
+    join_cols = _resolve_validation_join_columns(
+        db,
+        schema_name,
+        table_name,
+        raw_view,
+        anon_view,
+    )
+    if not join_cols:
+        return (
+            pd.DataFrame(),
+            [],
+            "The active table primary key (or identity column) is not present in the current result set, so the side-by-side join cannot be built.",
+        )
+
+    try:
+        import duckdb
+    except ImportError:
+        return (
+            pd.DataFrame(),
+            join_cols,
+            "Install the `duckdb` package to enable the side-by-side validation view.",
+        )
+
+    conn = duckdb.connect(database=":memory:")
+    try:
+        conn.register("source_preview", raw_view)
+        conn.register("anon_preview", anon_view)
+
+        select_raw = [f"s.{_quote_ident(str(col))}" for col in raw_view.columns]
+        select_anon = [
+            f"a.{_quote_ident(str(col))} AS {_quote_ident(f'anon_{col}')}"
+            for col in anon_view.columns
+        ]
+        join_predicates = [
+            f"s.{_quote_ident(col)} = a.{_quote_ident(col)}"
+            for col in join_cols
+        ]
+        order_expr = ", ".join(f"s.{_quote_ident(col)}" for col in join_cols)
+        query = (
+            "SELECT "
+            + ", ".join(select_raw + select_anon)
+            + " FROM source_preview AS s"
+            + " LEFT JOIN anon_preview AS a ON "
+            + " AND ".join(join_predicates)
+        )
+        if order_expr:
+            query += f" ORDER BY {order_expr}"
+
+        return conn.execute(query).df(), join_cols, None
+    except Exception as exc:  # noqa: BLE001
+        return pd.DataFrame(), join_cols, f"Could not build side-by-side validation view: {exc}"
+    finally:
+        conn.close()
+
+
 def _run_sql_on_source(
     db, sql: str, search_path: List[str], row_limit: int = _MIRROR_PREVIEW_ROW_CAP
 ) -> Tuple[pd.DataFrame, Optional[str]]:
@@ -341,6 +451,7 @@ def render_selection_tab(db) -> None:
         _render_session_audit_log(db)
         return
 
+    active_table_name = str(st.session_state.get(tbl_pick_key) or table_names[0])
     st.session_state.setdefault("mirror_display_sql", "")
 
     sql_widget_key = "mirror_sql_text_widget"
@@ -460,10 +571,18 @@ def render_selection_tab(db) -> None:
     except TypeError:
         col_sql_l, col_sql_r = st.columns([1, 1])
 
+    source_db_label = resolve_target_database_name(db, st.session_state)
+    anonymized_db_label = resolve_anonymized_target_database(
+        db,
+        st.session_state,
+        destination_mode=dm,
+        source_schema=source_schema,
+    )
+
     with col_sql_l:
-        st.markdown("##### 📄 Original SQL")
+        _render_sql_box_title("📄", "Original SQL", source_db_label)
         st.text_area(
-            "SQL query",
+            "Original SQL Query",
             height=220,
             key=sql_widget_key,
             label_visibility="collapsed",
@@ -472,14 +591,14 @@ def render_selection_tab(db) -> None:
         )
 
     with col_sql_r:
-        st.markdown("##### 🛡️ Anonimized SQL")
+        _render_sql_box_title("🔒", "Anonymized SQL", anonymized_db_label)
         try:
-            mirrored_body = str(st.session_state.get("mirror_display_sql", "") or "")
+            mirrored_body = strip_mirror_sql_header(
+                str(st.session_state.get("mirror_display_sql", "") or "")
+            )
         except (StreamlitAPIException, KeyError, TypeError):
             mirrored_body = ""
         st.code(mirrored_body, language="sql")
-        if run and mirror_ok and not st.session_state.get("mirror_last_transform_applied", True):
-            st.caption("📍 Running against: [Anonymized Target Mode]")
 
     st.caption(
         "Only a single read-only `SELECT` (including `WITH` / `UNION`) is executed on the **source**; "
@@ -543,3 +662,22 @@ def render_selection_tab(db) -> None:
             st.json(merged_plan)
 
     _render_session_audit_log(db)
+
+    st.divider()
+    st.markdown("### 📊 Side-by-Side Data Validation View")
+    validation_df, validation_join_cols, validation_error = _build_side_by_side_validation_view(
+        db,
+        source_schema,
+        active_table_name,
+        df_raw_view,
+        df_anon_view,
+    )
+    if validation_error:
+        st.info(validation_error)
+    else:
+        st.caption(
+            "In-memory DuckDB join for active table "
+            f"`{active_table_name}` on primary key / identity column(s): "
+            + ", ".join(f"`{col}`" for col in validation_join_cols)
+        )
+        st.dataframe(validation_df, width="stretch", height=400)
