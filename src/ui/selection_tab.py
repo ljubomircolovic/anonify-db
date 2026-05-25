@@ -52,8 +52,8 @@ def _render_sql_box_title(icon: str, title: str, database_name: str) -> None:
 
 
 _MIRROR_PREVIEW_ROW_CAP = 10
-_VALIDATION_VIEW_NAME = "this_view"
-_VALIDATION_DEFAULT_QUERY = f"SELECT * FROM {_VALIDATION_VIEW_NAME} LIMIT 50;"
+_MASKED_TARGET_VIEW_NAME = "masked_target_view"
+_VALIDATION_DEFAULT_QUERY = f"SELECT * FROM {_MASKED_TARGET_VIEW_NAME} LIMIT 50;"
 _MIRROR_PREVIEW_STATE_KEYS = (
     "mirror_display_sql",
     "mirror_last_transform_applied",
@@ -465,10 +465,10 @@ def _rewrite_validation_view_sql(
         return "", f"Could not parse anonymized SQL: {exc}"
 
     if not isinstance(parsed, exp.Select):
-        return "", "Only direct SELECT statements against the validation view are supported."
+        return "", f"Only direct SELECT statements against `{_MASKED_TARGET_VIEW_NAME}` are supported."
 
     validation_colset = {str(col) for col in (validation_columns or [])}
-    outer_view_name = _VALIDATION_VIEW_NAME
+    outer_view_name = _MASKED_TARGET_VIEW_NAME
 
     where = parsed.args.get("where")
     rewritten_where_sql = ""
@@ -587,13 +587,18 @@ def _execute_validation_view_sql(
         return (
             pd.DataFrame(),
             final_sql,
-            "Install the `duckdb` package to execute anonymized SQL against the validation view.",
+            f"Install the `duckdb` package to execute anonymized SQL against `{_MASKED_TARGET_VIEW_NAME}`.",
         )
 
     conn = duckdb.connect(database=":memory:")
     try:
         deduped_validation_df = _dedupe_dataframe_columns(validation_df)
-        conn.register(_VALIDATION_VIEW_NAME, deduped_validation_df)
+        staging_view_name = f"{_MASKED_TARGET_VIEW_NAME}__df"
+        conn.register(staging_view_name, deduped_validation_df)
+        conn.execute(
+            f"CREATE OR REPLACE TEMP VIEW {_quote_ident(_MASKED_TARGET_VIEW_NAME)} AS "
+            f"SELECT * FROM {_quote_ident(staging_view_name)}"
+        )
         result_df = conn.execute(final_sql).df()
         try:
             conn.commit()
