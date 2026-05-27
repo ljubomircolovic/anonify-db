@@ -20,7 +20,7 @@ from src.ui.sidebar import (
 )
 from src.ui.source.source_tab import render_source_tab
 from src.ui.tabs.planner.planner_table_config import render_planner_tab
-from src.ui.tabs_content import render_comparison_tab
+from src.ui.tabs.target_database_transfer_tab import render_target_database_transfer_tab
 from src.ui.selection_tab import render_selection_tab
 from src.ui.main_menu import render_main_menu
 from init_db import initialize_metadata
@@ -466,20 +466,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- 5b. SIX-TAB NAVIGATION ------------------------------------------------
+# --- 5b. FOUR-TAB NAVIGATION -----------------------------------------------
 # Tabs are created up-front so the strip's visual order is stable. Each tab's
 # content is populated below in script order; tabs are populated out of order
 # so the workflow-critical Mappings block runs first (it sets the variables
 # the init handlers need).
+#
+# Preview (step 2) is intentionally placed before Transfer (step 3): users
+# validate anonymization in RAM first, then commit to the target database.
 _TAB_LABELS = [
     "📂 Source",
     "🛠️ Mappings",
-    "🔍 Comparison",
-    "📤 Export",
-    "📜 Audit",
-    "🆚 Source vs Anon",
+    "2. In-Memory Preview (Source vs Anon)",
+    "3. Target Database Transfer 🚀",
 ]
-tab_source, tab_mappings, tab_comparison, tab_export, tab_audit, tab_data_sel = st.tabs(
+tab_source, tab_mappings, tab_data_sel, tab_target_db_transfer = st.tabs(
     _TAB_LABELS
 )
 
@@ -800,7 +801,8 @@ with tab_source:
         if plan_name_disp not in (None, "None"):
             st.success(
                 f"Source connected and bound to plan `{plan_name_disp}`. "
-                "Open the **Mappings** tab to define rules, or move on to **Comparison / Export**."
+                "Open the **Mappings** tab to define rules, then use **In-Memory Preview** "
+                "before **Target Database Transfer**."
             )
         else:
             st.info(
@@ -822,79 +824,28 @@ with tab_mappings:
 
 
 # ===========================================================================
-# TAB 3 — COMPARISON
-# ===========================================================================
-with tab_comparison:
-    if render_workflow_readiness_warning(st.session_state):
-        render_comparison_tab(db)
-
-
-# ===========================================================================
-# TAB 4 — EXPORT
-# ===========================================================================
-with tab_export:
-    st.markdown("### 📤 Export Anonymized Data")
-    st.caption(
-        "Generate a full anonymized export of the active table using the current plan, "
-        "deterministic salt, and locale."
-    )
-    if not render_workflow_readiness_warning(st.session_state):
-        pass  # warning already rendered by helper
-    elif 'current_plan' not in st.session_state:
-        st.info(
-            "Define and save anonymization rules in the **Mappings** tab to enable export."
-        )
-    else:
-        from src.ui.tabs.planner.planner_secrets import resolve_active_plan_seed
-
-        export_table_name, export_schema_name = st.session_state['selected_table_info']
-        export_plan = st.session_state['current_plan']
-        export_salt = resolve_active_plan_seed(db, export_schema_name, export_table_name)
-        export_locale = st.session_state.get('selected_locale', 'de')
-
-        st.markdown(
-            f"**Active table:** `{export_schema_name}.{export_table_name}` &nbsp;·&nbsp; "
-            f"**Locale:** `{export_locale.upper()}`"
-        )
-
-        if st.button("Prepare Full Download (CSV)", key="export_tab_prepare_csv"):
-            with st.spinner("Generating CSV..."):
-                full_df = db.read_table(export_table_name, export_schema_name)
-                full_anon = db.apply_anonymization_rules(
-                    full_df,
-                    export_plan,
-                    salt=export_salt,
-                )
-                csv_bytes = full_anon.to_csv(
-                    index=False, encoding='utf-8-sig'
-                ).encode('utf-8-sig')
-                st.download_button(
-                    label="Click to Download CSV",
-                    data=csv_bytes,
-                    file_name=f"anon_{export_table_name}.csv",
-                    mime="text/csv",
-                    key="export_tab_download_csv",
-                )
-
-
-# ===========================================================================
-# TAB 5 — AUDIT
-# ===========================================================================
-with tab_audit:
-    st.markdown("### 📜 Audit Log")
-    st.caption("Most recent 50 audit events recorded by the metadata database.")
-    try:
-        log_df = db.get_audit_logs(limit=50)
-        if log_df.empty:
-            st.info("No audit logs found yet.")
-        else:
-            st.dataframe(log_df, width="stretch")
-    except Exception as exc:
-        st.error(f"Could not load audit logs: {exc}")
-
-
-# ===========================================================================
-# TAB 6 — SOURCE VS ANON  (mirror query: raw vs anonymized preview)
+# TAB 3 — IN-MEMORY PREVIEW (Source vs Anon · read-only RAM simulation)
 # ===========================================================================
 with tab_data_sel:
+    st.markdown("## 🔬 Safe In-Memory Preview")
+    st.info(
+        "**Read-only simulation — no database writes.** "
+        "This tab runs anonymization logic entirely **in RAM** for side-by-side validation. "
+        "Nothing is persisted, committed, or synchronized to any target database instance. "
+        "Use it to inspect results safely before any physical transfer."
+    )
     render_selection_tab(db)
+
+
+# ===========================================================================
+# TAB 4 — TARGET DATABASE TRANSFER (Verify / Execute / History · physical write)
+# ===========================================================================
+with tab_target_db_transfer:
+    st.markdown("## 🚀 Physical Target Database Transfer")
+    st.warning(
+        "**Physical write layer — data will be copied and committed.** "
+        "This tab performs **real** anonymized data transfer: records are written, "
+        "synchronized, and committed to the **target database instance** bound to your plan. "
+        "Verify results in **In-Memory Preview** first; actions here change persistent storage."
+    )
+    render_target_database_transfer_tab(db)
