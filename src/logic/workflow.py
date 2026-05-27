@@ -100,13 +100,18 @@ def maybe_auto_bind_plan_to_source(db: Any, state: MutableMapping[str, Any]) -> 
     )
 
 
-def render_workflow_readiness_warning(state: MutableMapping[str, Any]) -> bool:
+def render_workflow_readiness_warning(state: MutableMapping[str, Any] | None = None) -> bool:
     """Show inline warnings when Mappings-dependent tabs lack prerequisites.
+
+    Validates the shared workflow gates used by **Mappings**, **Target Database
+    Transfer** (Verify / Execute / History wizard steps), and other plan-bound
+    tabs. Callers pass ``st.session_state`` (or omit it to read the live session).
 
     Parameters
     ----------
     state:
-        Streamlit session mapping.
+        Streamlit session mapping. When omitted, the active ``st.session_state``
+        is used.
 
     Returns
     -------
@@ -116,27 +121,37 @@ def render_workflow_readiness_warning(state: MutableMapping[str, Any]) -> bool:
     """
     import streamlit as st
 
-    app = AppState(state)
-    if not app.get_source_confirmed():
+    store = state if state is not None else st.session_state
+
+    source_confirmed = bool(store.get("source_confirmed", False))
+    source_connected = bool(store.get("source_connected", False))
+    active_plan_db_key = str(store.get("active_plan_db_key", "") or "").strip()
+    project_initialized = bool(store.get("project_initialized", False))
+
+    if not source_confirmed:
         st.warning(
-            "Please click **Confirm Source** in Tab 1 (Source) before using Mappings, Comparison, or Export."
+            "Please click **Confirm Source** in the **Source** tab before using "
+            "**Mappings** or **Target Database Transfer**."
         )
         return False
 
-    missing_source = not app.get_source_connected()
-    missing_plan = not (bool(app.get_active_plan_db_key()) and app.get_project_initialized())
+    missing_source = not source_connected
+    missing_plan = not (bool(active_plan_db_key) and project_initialized)
     if not (missing_source or missing_plan):
         return True
 
     if missing_source and missing_plan:
         st.warning(
-            "Please complete **Source connection in Tab 1** (Initialize Session after confirming source) "
-            "and **Plan selection in Tab 2** to proceed."
+            "Please complete **Source connection** in the **Source** tab "
+            "(Initialize Session after confirming source) and **Plan selection** "
+            "in **Mappings** before using **Target Database Transfer**."
         )
     elif missing_source:
         st.warning(
-            "Please run **Initialize Session** in Tab 1 (Source) after confirming your source."
+            "Please run **Initialize Session** in the **Source** tab after confirming your source."
         )
     else:
-        st.warning("Please complete **Plan selection in Tab 2 (Mappings)** to proceed.")
+        st.warning(
+            "Please complete **Plan selection** in the **Mappings** tab to proceed."
+        )
     return False
