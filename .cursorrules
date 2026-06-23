@@ -1,0 +1,21 @@
+# AnonifyDB System Instructions & Coding Standards
+
+## 1. Strict Enforcement: "No Logic Deletion" Rule
+- NEVER delete or bypass existing architectural logic, functions, or specific checks unless explicitly requested to replace that exact functionality.
+- Pay critical attention to core tracking and verification points such as `real_pks` and `render_ai_audit_log`. These must remain intact through any refactoring.
+
+## 2. Full Context Diff & UI Protection
+- When refactoring or modifying components, inspect the original file line-by-line.
+- Ensure every single UI element (buttons, sliders, markers, text inputs) and safety validation remains present in the final output. No missing elements allowed.
+
+## 3. Atomic Changes & Complete Output
+- Propose modifications in logical, structured blocks.
+- ALWAYS provide the final, complete method, class, or file. Never use placeholders like `// TODO`, `... rest of the code ...`, or assume the user knows where to paste a snippet. Refuse to hallucinate partial implementations.
+
+## 4. Language & Documentation Policy
+- All code comments, docstrings, system logs, and technical documentation MUST be written strictly in English, even if the user prompts in Serbian.
+- Keep variables typed and ensure explicit exception handling for database connections.
+
+## 5. Security & Constraints
+- Prioritize Least Privilege principle for database scripts.
+- Data protection and deterministic anonymization logic must always take precedence over code brevity.
