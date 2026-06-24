@@ -39,9 +39,19 @@ def render_connection_dashboard(
     metadata_env_url: str = "",
     metadata_message: str = "",
     *,
-    source_tooltip: str = "Source: Reading from DATABASE_URL in .env",
-    mappings_tooltip: str = "Mappings: Reading from DATABASE_URL in .env",
-    export_tooltip: str = "Export: Plan target uses the active metadata connection from DATABASE_URL in .env",
+    source_tooltip: str = (
+        "To change the Source database connection, edit the `DATABASE_URL` or `SOURCE_DB_URL` "
+        "variable inside your local `.env` file, or set it as a system Environment Variable."
+    ),
+    mappings_tooltip: str = (
+        "To change or switch the Mappings database, use the active configuration plan dropdown "
+        "inside the '2. 🗺️ Mappings' tab. The configuration is stored internally per plan."
+    ),
+    export_tooltip: str = (
+        "The Export target database is automatically derived from your Source credentials. "
+        "To isolate or redirect the export database, activate or switch to a different migration "
+        "plan in the Mappings tab."
+    ),
 ):
     """Three-column horizontal banner showing live status of the three
     data sources the app interacts with:
