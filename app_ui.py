@@ -384,18 +384,6 @@ if "logged_in" in st.session_state and st.session_state.get("logged_in"):
         db,
         metadata_env_url=DB_CONFIGS.get(selected_env, ""),
         metadata_message=metadata_message,
-        source_tooltip=(
-            "Source: Reading from SOURCE_DB_URL in .env"
-            if st.session_state.get("source_confirmed")
-            else "Source: Defaults read from DATABASE_URL in .env until you confirm Source (saved to SOURCE_DB_URL in .env)"
-        ),
-        mappings_tooltip=(
-            f"Mappings: Reading from {DB_ENV_KEY_BY_LABEL.get(selected_env, 'DATABASE_URL')} in .env"
-        ),
-        export_tooltip=(
-            f"Export: Reading from {DB_ENV_KEY_BY_LABEL.get(selected_env, 'DATABASE_URL')} in .env "
-            "(plan target database name comes from the active plan in Mappings)"
-        ),
     )
 
 # --- 3. INICIJALIZACIJA (State Management) ---
