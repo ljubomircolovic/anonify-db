@@ -484,6 +484,20 @@ tab_source, tab_mappings, tab_data_sel, tab_target_db_transfer = st.tabs(
     _TAB_LABELS
 )
 
+_source_session_ready = bool(st.session_state.get("source_connected"))
+_TAB_LOCKED_MESSAGE = (
+    "Please connect to a data source and initialize your session in the "
+    "'1. 🔌 Source' tab to unlock this section."
+)
+
+# Defaults for plan handlers when the Mappings UI is locked (no widgets rendered).
+initialize_clicked = False
+continue_existing_clicked = False
+plan_name = str(
+    st.session_state.get("plan_name_input", "") or st.session_state.get("plan_name", "")
+).strip()
+selected_existing_plan = str(st.session_state.get("selected_existing_plan", "")).strip()
+
 # ===========================================================================
 # TAB 2 — MAPPINGS  (Plan Selection + Rule Definition / Planner)
 # ===========================================================================
@@ -493,118 +507,121 @@ tab_source, tab_mappings, tab_data_sel, tab_target_db_transfer = st.tabs(
 # script scope, so `plan_name`, `initialize_clicked`, etc. remain accessible
 # to the top-level handlers that follow.
 with tab_mappings:
-    with st.expander("🛠️ Plan Selection & Rule Definition", expanded=False):
-        st.caption(
-            "Enter a descriptive name (e.g., 'GDPR Production Prep') or continue with an existing plan database. "
-            "Plan selection is independent from the source connection — configure them in any order."
-        )
-        # Plan activation is now driven exclusively by an explicit button inside
-        # this tab. The Source tab's "🚀 Initialize Session" button no longer
-        # implicitly creates a plan; the two flows are fully decoupled.
-        initialize_clicked = False
-    
-        if "existing_plan_selection" not in st.session_state:
-            st.session_state["existing_plan_selection"] = st.session_state.get("selected_existing_plan", "None")
-        if "selected_existing_plan" not in st.session_state:
-            st.session_state["selected_existing_plan"] = st.session_state.get("existing_plan_selection", "None")
-        if "allow_custom_naming" not in st.session_state:
-            st.session_state["allow_custom_naming"] = False
-        if "custom_name_warning_confirmed" not in st.session_state:
-            st.session_state["custom_name_warning_confirmed"] = False
-        if "pending_initialize_after_warning" not in st.session_state:
-            st.session_state["pending_initialize_after_warning"] = False
-        if "plan_name" not in st.session_state:
-            st.session_state["plan_name"] = ""
-        if "plan_name_input" not in st.session_state:
-            st.session_state["plan_name_input"] = st.session_state.get("plan_name", "")
-        existing_selected_now = (
-            st.session_state.get("existing_plan_selection") is not None
-            and st.session_state.get("existing_plan_selection") != "None"
-            and str(st.session_state.get("existing_plan_selection", "")).strip() != ""
-        )
-    
-        def on_plan_name_change():
-            st.session_state["plan_name"] = str(st.session_state.get("plan_name_input", ""))
-            if str(st.session_state.get("plan_name_input", "")).strip():
+    if not _source_session_ready:
+        st.info(_TAB_LOCKED_MESSAGE)
+    else:
+        with st.expander("🛠️ Plan Selection & Rule Definition", expanded=False):
+            st.caption(
+                "Enter a descriptive name (e.g., 'GDPR Production Prep') or continue with an existing plan database. "
+                "Plan selection is independent from the source connection — configure them in any order."
+            )
+            # Plan activation is now driven exclusively by an explicit button inside
+            # this tab. The Source tab's "🚀 Initialize Session" button no longer
+            # implicitly creates a plan; the two flows are fully decoupled.
+            initialize_clicked = False
+        
+            if "existing_plan_selection" not in st.session_state:
+                st.session_state["existing_plan_selection"] = st.session_state.get("selected_existing_plan", "None")
+            if "selected_existing_plan" not in st.session_state:
+                st.session_state["selected_existing_plan"] = st.session_state.get("existing_plan_selection", "None")
+            if "allow_custom_naming" not in st.session_state:
+                st.session_state["allow_custom_naming"] = False
+            if "custom_name_warning_confirmed" not in st.session_state:
+                st.session_state["custom_name_warning_confirmed"] = False
+            if "pending_initialize_after_warning" not in st.session_state:
+                st.session_state["pending_initialize_after_warning"] = False
+            if "plan_name" not in st.session_state:
+                st.session_state["plan_name"] = ""
+            if "plan_name_input" not in st.session_state:
+                st.session_state["plan_name_input"] = st.session_state.get("plan_name", "")
+            existing_selected_now = (
+                st.session_state.get("existing_plan_selection") is not None
+                and st.session_state.get("existing_plan_selection") != "None"
+                and str(st.session_state.get("existing_plan_selection", "")).strip() != ""
+            )
+        
+            def on_plan_name_change():
+                st.session_state["plan_name"] = str(st.session_state.get("plan_name_input", ""))
+                if str(st.session_state.get("plan_name_input", "")).strip():
+                    st.session_state["existing_plan_selection"] = "None"
+                    st.session_state["selected_existing_plan"] = "None"
+        
+            def _on_existing_plan_change():
+                selected_existing = str(st.session_state.get("existing_plan_selection", "")).strip()
+                if selected_existing and selected_existing != "None":
+                    st.session_state["selected_existing_plan"] = selected_existing
+                    st.session_state["plan_name"] = ""
+                    st.session_state["plan_name_input"] = ""
+                else:
+                    st.session_state["selected_existing_plan"] = "None"
+        
+            row1_left, row1_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
+            with row1_left:
+                st.text_input(
+                    "Create New Plan",
+                    key="plan_name_input",
+                    placeholder="Enter plan name...",
+                    on_change=on_plan_name_change,
+                    label_visibility="visible",
+                )
+            plan_name = str(st.session_state.get("plan_name_input", "")).strip()
+            if plan_name:
                 st.session_state["existing_plan_selection"] = "None"
                 st.session_state["selected_existing_plan"] = "None"
-    
-        def _on_existing_plan_change():
-            selected_existing = str(st.session_state.get("existing_plan_selection", "")).strip()
-            if selected_existing and selected_existing != "None":
-                st.session_state["selected_existing_plan"] = selected_existing
-                st.session_state["plan_name"] = ""
-                st.session_state["plan_name_input"] = ""
+            st.session_state["plan_name"] = plan_name
+            with row1_right:
+                # Dedicated, in-tab plan activation. The Source tab's Initialize
+                # Session button no longer triggers this — the workflows are
+                # decoupled and either can be completed first.
+                activate_plan_clicked = st.button(
+                    "✨ Activate Plan",
+                    width="stretch",
+                    disabled=(not plan_name) or existing_selected_now,
+                    help="Create the plan database and activate it for rule definition.",
+                    key="mappings_activate_plan_btn",
+                )
+                if activate_plan_clicked:
+                    initialize_clicked = True
+            allow_custom_naming = st.checkbox(
+                "Allow custom name (skip default anon_ safety prefix)",
+                key="allow_custom_naming",
+            )
+            custom_db_name = st.text_input(
+                "Custom Target Database Name (optional)",
+                key="custom_target_db_name",
+                placeholder="anon_project_clone",
+                disabled=existing_selected_now or (not allow_custom_naming),
+            )
+            existing_plan_dbs = db.list_existing_plan_databases()
+        
+            row2_left, row2_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
+            with row2_left:
+                st.selectbox(
+                    "Or Select Existing Plan",
+                    options=["None"] + existing_plan_dbs,
+                    key="existing_plan_selection",
+                    help="Reuse an existing plan database instead of creating a new one.",
+                    on_change=_on_existing_plan_change,
+                    label_visibility="visible",
+                )
+                selected_existing_plan = str(st.session_state.get("existing_plan_selection", "")).strip()
+                st.session_state["selected_existing_plan"] = selected_existing_plan if selected_existing_plan else "None"
+            with row2_right:
+                continue_existing_clicked = st.button(
+                    "🔁 Continue with Existing",
+                    width="stretch",
+                    disabled=bool(plan_name) or (not bool(selected_existing_plan)) or selected_existing_plan == "None"
+                )
+        
+            # Inline status hint so users know the plan half is configured (or not)
+            # without needing to leave this tab.
+            if st.session_state.get("active_plan_db_name", "None") not in (None, "None"):
+                st.success(
+                    f"Plan active: `{st.session_state.get('active_plan_db_name')}` — "
+                    "you can now configure the Source tab (or refine rules below)."
+                )
             else:
-                st.session_state["selected_existing_plan"] = "None"
-    
-        row1_left, row1_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
-        with row1_left:
-            st.text_input(
-                "Create New Plan",
-                key="plan_name_input",
-                placeholder="Enter plan name...",
-                on_change=on_plan_name_change,
-                label_visibility="visible",
-            )
-        plan_name = str(st.session_state.get("plan_name_input", "")).strip()
-        if plan_name:
-            st.session_state["existing_plan_selection"] = "None"
-            st.session_state["selected_existing_plan"] = "None"
-        st.session_state["plan_name"] = plan_name
-        with row1_right:
-            # Dedicated, in-tab plan activation. The Source tab's Initialize
-            # Session button no longer triggers this — the workflows are
-            # decoupled and either can be completed first.
-            activate_plan_clicked = st.button(
-                "✨ Activate Plan",
-                width="stretch",
-                disabled=(not plan_name) or existing_selected_now,
-                help="Create the plan database and activate it for rule definition.",
-                key="mappings_activate_plan_btn",
-            )
-            if activate_plan_clicked:
-                initialize_clicked = True
-        allow_custom_naming = st.checkbox(
-            "Allow custom name (skip default anon_ safety prefix)",
-            key="allow_custom_naming",
-        )
-        custom_db_name = st.text_input(
-            "Custom Target Database Name (optional)",
-            key="custom_target_db_name",
-            placeholder="anon_project_clone",
-            disabled=existing_selected_now or (not allow_custom_naming),
-        )
-        existing_plan_dbs = db.list_existing_plan_databases()
-    
-        row2_left, row2_right = st.columns([3, 1], gap="small", vertical_alignment="bottom")
-        with row2_left:
-            st.selectbox(
-                "Or Select Existing Plan",
-                options=["None"] + existing_plan_dbs,
-                key="existing_plan_selection",
-                help="Reuse an existing plan database instead of creating a new one.",
-                on_change=_on_existing_plan_change,
-                label_visibility="visible",
-            )
-            selected_existing_plan = str(st.session_state.get("existing_plan_selection", "")).strip()
-            st.session_state["selected_existing_plan"] = selected_existing_plan if selected_existing_plan else "None"
-        with row2_right:
-            continue_existing_clicked = st.button(
-                "🔁 Continue with Existing",
-                width="stretch",
-                disabled=bool(plan_name) or (not bool(selected_existing_plan)) or selected_existing_plan == "None"
-            )
-    
-        # Inline status hint so users know the plan half is configured (or not)
-        # without needing to leave this tab.
-        if st.session_state.get("active_plan_db_name", "None") not in (None, "None"):
-            st.success(
-                f"Plan active: `{st.session_state.get('active_plan_db_name')}` — "
-                "you can now configure the Source tab (or refine rules below)."
-            )
-        else:
-            st.info("No plan activated yet. Activate or continue a plan above to start defining rules.")
+                st.info("No plan activated yet. Activate or continue a plan above to start defining rules.")
 
 if st.session_state.get("pending_initialize_after_warning") and st.session_state.get("custom_name_warning_confirmed"):
     initialize_clicked = True
@@ -813,12 +830,11 @@ with tab_source:
 # ===========================================================================
 # TAB 2 (continued) — MAPPINGS  (Rule Definition / Planner)
 # ===========================================================================
-# Plan Selection above is always available. Rule definition (the planner)
-# additionally needs the Source half: it operates on real columns from the
-# scanned schema, so we gate it on workflow_ready and surface a precise
-# warning if either half is missing.
+# Plan selection and the planner render only after ``source_connected`` is set
+# (Initialize Session in Source). The planner additionally needs plan readiness
+# via ``render_workflow_readiness_warning``.
 with tab_mappings:
-    if render_workflow_readiness_warning(st.session_state):
+    if _source_session_ready and render_workflow_readiness_warning(st.session_state):
         render_planner_tab(db)
 
 
@@ -826,25 +842,31 @@ with tab_mappings:
 # TAB 3 — IN-MEMORY PREVIEW (Source vs Anon · read-only RAM simulation)
 # ===========================================================================
 with tab_data_sel:
-    st.markdown("## 🔬 Safe In-Memory Preview")
-    st.info(
-        "**Read-only simulation — no database writes.** "
-        "This tab runs anonymization logic entirely **in RAM** for side-by-side validation. "
-        "Nothing is persisted, committed, or synchronized to any target database instance. "
-        "Use it to inspect results safely before any physical transfer."
-    )
-    render_selection_tab(db)
+    if not _source_session_ready:
+        st.info(_TAB_LOCKED_MESSAGE)
+    else:
+        st.markdown("## 🔬 Safe In-Memory Preview")
+        st.info(
+            "**Read-only simulation — no database writes.** "
+            "This tab runs anonymization logic entirely **in RAM** for side-by-side validation. "
+            "Nothing is persisted, committed, or synchronized to any target database instance. "
+            "Use it to inspect results safely before any physical transfer."
+        )
+        render_selection_tab(db)
 
 
 # ===========================================================================
 # TAB 4 — TARGET DATABASE TRANSFER (Verify / Execute / History · physical write)
 # ===========================================================================
 with tab_target_db_transfer:
-    st.markdown("## 🚀 Physical Target Database Transfer")
-    st.warning(
-        "**Physical write layer — data will be copied and committed.** "
-        "This tab performs **real** anonymized data transfer: records are written, "
-        "synchronized, and committed to the **target database instance** bound to your plan. "
-        "Verify results in **In-Memory Preview** first; actions here change persistent storage."
-    )
-    render_target_database_transfer_tab(db)
+    if not _source_session_ready:
+        st.info(_TAB_LOCKED_MESSAGE)
+    else:
+        st.markdown("## 🚀 Physical Target Database Transfer")
+        st.warning(
+            "**Physical write layer — data will be copied and committed.** "
+            "This tab performs **real** anonymized data transfer: records are written, "
+            "synchronized, and committed to the **target database instance** bound to your plan. "
+            "Verify results in **In-Memory Preview** first; actions here change persistent storage."
+        )
+        render_target_database_transfer_tab(db)
